@@ -1,0 +1,25 @@
+# Container layer for the hybrid setup.
+#
+# Inference does NOT run here — Docker on macOS has no Metal access. These
+# containers reach the host's llama-server via host.docker.internal, which
+# Docker Desktop maps to the macOS host.
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: bonsai-webui
+    ports:
+      - "9090:8080"
+    environment:
+      # The trailing /v1 matters — llama-server serves the OpenAI-compatible API there.
+      OPENAI_API_BASE_URL: "http://host.docker.internal:8080/v1"
+      OPENAI_API_KEY: "${BONSAI_API_KEY:?set BONSAI_API_KEY in ../.env}"
+      WEBUI_AUTH: "false"          # single-user local box; flip to true to require login
+      ENABLE_OLLAMA_API: "false"   # we are not running Ollama
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # explicit; Desktop provides it, this keeps it portable
+    volumes:
+      - open-webui-data:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:

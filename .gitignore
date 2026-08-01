@@ -1,0 +1,14 @@
+# secrets
+.env
+.webui_secret_key
+
+# large artifacts — 7.3G of weights, a 2.1G venv, a source checkout
+models/
+.venv/
+src/
+bin/
+
+# runtime state
+run/
+.webui-data/
+.playwright-mcp/
