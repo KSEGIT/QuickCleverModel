@@ -67,10 +67,45 @@ Measured with `llama-bench -p 128 -n 128 -ngl 99 -r 2` on Apple M5 / 24 GB.
 
 ## Usage
 
+One command starts everything:
+
 ```bash
-./start-server.sh    # native Metal inference server on 0.0.0.0:8080
-./start-webui.sh     # Open WebUI (native) on http://127.0.0.1:9090
+make up        # or: ./stack.sh up
 ```
+
+```
+  SERVICE     PORT   STATE     PID
+  llama       8080   up        43261     Bonsai 27B on Metal
+  playwright  8931   up        43431     browser tools over MCP
+  webui       9090   up        43469     chat UI
+
+  chat UI -> http://127.0.0.1:9090
+```
+
+| command | does |
+|---|---|
+| `make up` | start all three, waiting until each port actually accepts connections |
+| `make down` | stop everything (reverse order) |
+| `make restart` | down then up |
+| `make status` | what's running, with PIDs |
+| `make logs` | tail all logs — `make logs SVC=llama` for one |
+| `make open` | open the chat UI |
+| `make bench` | measure tok/s against the running server |
+
+Logs land in `run/logs/<service>.log` (gitignored). `stack.sh` waits on port
+readiness rather than process start, because llama-server maps 6.7 GB of weights
+and Open WebUI runs DB migrations — both are alive well before they can serve.
+
+Individual services, if you need them separately:
+
+```bash
+./start-server.sh          # inference      :8080
+./start-playwright-mcp.sh  # browser tools  :8931
+./start-webui.sh           # chat UI        :9090
+```
+
+Nothing survives a reboot — these are plain user processes, not launchd services.
+Run `make up` again.
 
 Once the Docker registry proxy is working again, `cd docker && docker compose up -d`
 runs the same UI in a container instead — it points at `host.docker.internal:8080`.
