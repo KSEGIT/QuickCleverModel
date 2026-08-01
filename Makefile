@@ -1,5 +1,5 @@
 # Thin wrapper over stack.sh so `make up` works alongside `./stack.sh up`.
-.PHONY: help up down restart status logs open bench
+.PHONY: help up down restart status logs open bench reap
 
 help:           ## Show this help
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-9s\033[0m %s\n",$$1,$$2}'
@@ -18,6 +18,9 @@ status:         ## Show what is running
 
 logs:           ## Tail all logs (make logs SVC=llama for one)
 	@./stack.sh logs $(SVC)
+
+reap:           ## Kill stale/orphaned service processes after a crash
+	@./stack.sh reap
 
 open:           ## Open the chat UI
 	@./stack.sh open

@@ -179,6 +179,37 @@ open-ended ones: a 1.58-bit 27B is far weaker at multi-step agentic work than a
 frontier model, and at 10–13 tok/s with a thinking block per step each hop is
 slow.
 
+## Tuning — measured on this machine
+
+Generation on a 27B is **memory-bandwidth-bound**: every token streams the
+6.7 GB working set, so flag-tuning has a hard ceiling. The only way past it is
+speculative decoding, which amortises one weight read over several tokens.
+
+`llama-bench`-style comparison, `-c 8192 --parallel 1 -fa on -ctk/-ctv q8_0`,
+two workloads — "generic" prose vs output that reuses input tokens:
+
+| `--spec-type` | generic | repetitive | verdict |
+|---|---|---|---|
+| none (baseline) | 12.9 | 12.9 | |
+| **ngram-simple** | 12.7 | **19.6** | **default** — free, 1.5x when it hits |
+| ngram-map-k | 11.3 | **26.5** | 2.05x repetitive, −12% generic |
+| ngram-mod | 9.9 | 14.0 | worse at both |
+| draft-dspark | **7.8** | 7.6 | **−38%, do not use** |
+| draft-dspark + ngram | 4.1 | 3.2 | −67% |
+
+Override with `BONSAI_SPEC=ngram-map-k ./start-server.sh` if your workload is
+mostly summarising/rewriting/code-editing.
+
+**Draft-model speculation loses badly here.** The repo ships an undocumented
+`Ternary-Bonsai-27B-dspark-Q4_1.gguf` (1.95 GB) and the fork has a matching
+`--spec-type draft-dspark`. It needs `--spec-draft-n-max 4` to load at all
+(the drafter's `block_size` is 4; the default 3 is a hard error). Even then, at
+**87% draft acceptance** it still ran 38% slower — evaluating the drafter on
+Metal costs more than it saves, the same root cause as
+[llama.cpp#23752](https://github.com/ggml-org/llama.cpp/issues/23752). That
+issue is written about MTP, but the result generalises to draft models here.
+The dspark file is unused; delete it to reclaim 1.8 GB.
+
 ## Verified
 
 | Check | Result |

@@ -42,6 +42,18 @@ echo "listen : http://$HOST:$PORT  (ctx=$CTX, all layers on Metal)"
 #   -ctk/-ctv q8_0: halves KV cache memory, negligible quality loss. Only safe
 #                   WITH flash attention — without it llama.cpp dequantizes the
 #                   cache every attention step and ends up slower.
+#   --spec-type ngram-simple : n-gram speculative decoding. Model-free, so no
+#                   second model and no extra RAM — which matters because this
+#                   box is memory-bandwidth-bound. Measured 12.7 t/s on generic
+#                   prose (baseline 12.9, i.e. free) and 19.6 t/s when output
+#                   reuses input tokens (baseline 12.9, a 1.5x win).
+#                   BONSAI_SPEC=ngram-map-k gives 2.05x on repetitive work but
+#                   costs 12% on generic prose; ngram-mod was worse at both.
+#                   Do NOT use draft-model speculation here: --spec-type
+#                   draft-dspark with the repo's 1.95 GB drafter measured 7.8 t/s
+#                   (-38%) despite 87% draft acceptance — evaluating the drafter
+#                   on Metal costs more than it saves. Same root cause as
+#                   github.com/ggml-org/llama.cpp/issues/23752.
 exec "$SERVER" \
   -m "$MODEL_DIR/Ternary-Bonsai-27B-Q2_0.gguf" \
   --mmproj "$MODEL_DIR/Ternary-Bonsai-27B-mmproj-Q8_0.gguf" \
@@ -50,6 +62,7 @@ exec "$SERVER" \
   --parallel "${BONSAI_PARALLEL:-1}" \
   -fa on \
   -ctk q8_0 -ctv q8_0 \
+  --spec-type "${BONSAI_SPEC:-ngram-simple}" \
   --host "$HOST" --port "$PORT" \
   --api-key "$BONSAI_API_KEY" \
   --jinja \
