@@ -12,3 +12,6 @@ bin/
 run/
 .webui-data/
 .playwright-mcp/
+
+# screenshots
+cache-viz*.png

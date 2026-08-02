@@ -1,5 +1,5 @@
 # Thin wrapper over stack.sh so `make up` works alongside `./stack.sh up`.
-.PHONY: help up down restart status logs open bench reap
+.PHONY: help up down restart status logs open bench reap cache-viz
 
 help:           ## Show this help
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-9s\033[0m %s\n",$$1,$$2}'
@@ -21,6 +21,11 @@ logs:           ## Tail all logs (make logs SVC=llama for one)
 
 reap:           ## Kill stale/orphaned service processes after a crash
 	@./stack.sh reap
+
+cache-viz:      ## Live prompt-cache dashboard on :8090
+	@pkill -f cache-viz.py 2>/dev/null || true
+	@mkdir -p run/logs && nohup python3 cache-viz.py > run/logs/cacheviz.log 2>&1 & sleep 2; \
+	  echo "  cache visualiser -> http://127.0.0.1:8090"; open http://127.0.0.1:8090
 
 open:           ## Open the chat UI
 	@./stack.sh open

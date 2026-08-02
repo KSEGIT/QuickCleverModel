@@ -63,6 +63,8 @@ exec "$SERVER" \
   -fa on \
   -ctk q8_0 -ctv q8_0 \
   --spec-type "${BONSAI_SPEC:-ngram-simple}" \
+  --metrics \
+  --cache-reuse "${BONSAI_CACHE_REUSE:-256}" \
   --host "$HOST" --port "$PORT" \
   --api-key "$BONSAI_API_KEY" \
   --jinja \
