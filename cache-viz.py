@@ -27,25 +27,54 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(ROOT, "run", "logs", "llama.log")
 PORT = int(os.environ.get("CACHE_VIZ_PORT", "8090"))
 
+# "task -1" marks slot initialisation rather than a real request, and the
+# leading '-' is deliberately not matched so those lines create no record.
 RE_TASK = re.compile(r"task\s+(\d+)")
 RE_RESTORED = re.compile(r"restored context checkpoint .*?n_tokens = (\d+)")
 RE_PROMPT = re.compile(r"prompt eval time =\s*([\d.]+) ms /\s*(\d+) tokens")
 RE_EVAL = re.compile(r"\beval time =\s*([\d.]+) ms /\s*(\d+) tokens .*?([\d.]+) tokens per second")
 RE_FULL = re.compile(r"forcing full prompt re-processing")
+# Router mode: the router forwards each child's output prefixed with that
+# child's port (server-models.cpp:816 -> LOG("[%5d] %s", port, buffer)), and
+# announces the mapping once when it spawns the child. %5d right-aligns, so a
+# 4-digit port arrives as "[ 8081]".
+RE_CHILD = re.compile(r"^\[\s*(\d+)\]")
+RE_SPAWN = re.compile(r"spawning server instance with name=(\S+) on port (\d+)")
 
 _lock = threading.Lock()
 _requests = []          # completed request records, oldest first
-_pending = {}           # task id -> partial record
+_pending = {}           # (port, task id) -> partial record
+_ports = {}             # child port -> model name
+
+
+def _model_of(port):
+    """Label a record by model. Falls back to the bare port when the spawn line
+    is not in the log (rotated away, or attached mid-run), so two unknown
+    children are still told apart. Single-model runs have no port at all."""
+    if port is None:
+        return "single"
+    return _ports.get(port, ":" + port)
 
 
 def _parse_line(line: str) -> None:
+    s = RE_SPAWN.search(line)
+    if s:
+        _ports[s.group(2)] = s.group(1)
+        return
     m = RE_TASK.search(line)
     if not m:
         return
+    # Each child numbers its tasks from 0 independently, so the task id alone is
+    # NOT unique once the router has two children logging into the same file.
+    # Observed: both 27B quantizations logged "task 0" for their first request.
+    c = RE_CHILD.match(line)
+    port = c.group(1) if c else None
     task = m.group(1)
-    rec = _pending.setdefault(task, {"task": int(task), "reused": 0, "new": 0,
-                                     "prefill_ms": 0.0, "gen_tok_s": 0.0,
-                                     "gen_tokens": 0, "full_reprocess": False})
+    key = (port, task)
+    rec = _pending.setdefault(key, {"task": int(task), "port": port,
+                                    "reused": 0, "new": 0,
+                                    "prefill_ms": 0.0, "gen_tok_s": 0.0,
+                                    "gen_tokens": 0, "full_reprocess": False})
     if RE_FULL.search(line):
         rec["full_reprocess"] = True
     r = RE_RESTORED.search(line)
@@ -61,7 +90,8 @@ def _parse_line(line: str) -> None:
         rec["gen_tok_s"] = float(e.group(3))
         # generation timing is the last line of a request -> it is complete
         with _lock:
-            _requests.append(_pending.pop(task))
+            rec["model"] = _model_of(port)
+            _requests.append(_pending.pop(key))
             del _requests[:-200]        # keep the last 200
 
 
@@ -79,6 +109,7 @@ def tail_log() -> None:
                 with _lock:
                     _requests.clear()
                 _pending.clear()
+                _ports.clear()          # new run -> new child ports
             with open(LOG, "r", errors="replace") as fh:
                 fh.seek(pos)
                 for line in fh:
@@ -188,7 +219,7 @@ PAGE = r"""<!doctype html>
   .empty{color:var(--text-muted);font-size:13px;padding:22px 0;text-align:center}
 </style></head><body>
 <h1>Prompt cache</h1>
-<div class="sub">Prompt tokens reused from the KV cache vs processed from scratch · llama-server :8080 · refreshes every 2s</div>
+<div class="sub">Prompt tokens reused from the KV cache vs processed from scratch · llama-server router :8080 · refreshes every 2s</div>
 
 <div class="tiles">
   <div class="tile"><div class="label">Cache hit rate</div><div class="value" id="hit">—</div>
@@ -217,7 +248,7 @@ PAGE = r"""<!doctype html>
   <div class="desc">The payoff. Turn 1 pays full price; later turns ride the cache.</div>
   <div class="scroll"><svg id="line" height="180"></svg></div>
   <details><summary>Table view</summary>
-    <table id="tbl"><thead><tr><th>Req</th><th>Reused</th><th>Fresh</th><th>Prefill ms</th><th>Gen t/s</th></tr></thead>
+    <table id="tbl"><thead><tr><th>Req</th><th>Model</th><th>Reused</th><th>Fresh</th><th>Prefill ms</th><th>Gen t/s</th></tr></thead>
     <tbody></tbody></table></details>
 </div>
 
@@ -297,7 +328,7 @@ async function tick(){
   $("#barsEmpty").style.display=reqs.length?"none":"block";
   if(reqs.length){ drawBars(reqs); drawLine(reqs); }
   $("#tbl tbody").innerHTML=reqs.map((r,i)=>
-    `<tr><td>${i+1}</td><td>${r.reused}</td><td>${r.new}</td><td>${r.prefill_ms.toFixed(0)}</td><td>${r.gen_tok_s.toFixed(1)}</td></tr>`).join("");
+    `<tr><td>${i+1}</td><td>${r.model||"—"}</td><td>${r.reused}</td><td>${r.new}</td><td>${r.prefill_ms.toFixed(0)}</td><td>${r.gen_tok_s.toFixed(1)}</td></tr>`).join("");
 }
 tick(); setInterval(tick,2000);
 addEventListener("resize",()=>tick());
