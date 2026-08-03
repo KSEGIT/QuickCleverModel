@@ -30,11 +30,16 @@ HOST="${BONSAI_HOST:-0.0.0.0}"
 PORT="${BONSAI_PORT:-8080}"
 CTX="${BONSAI_CTX:-32768}"   # model trains to 262144; that KV cache will not fit in 24 GB
 
-# Metal's working set on this box is 17.8 GB, not 24 (llama.log: "MTL0 : Apple
-# M5 (18186 MiB free)"). Two 27B models resident is 10.5 GB of weights plus up
-# to two ~873 MiB mmproj allocations, leaving too little for two KV caches at
-# c=32768. So: keep ONE model loaded and swap on selection. Raise to 2 to keep
-# both hot if you have lowered BONSAI_CTX.
+# Keep ONE model resident and swap on selection. Switching in the UI unloads
+# the current child and loads the other from disk, measured at +4-5s because the
+# mmap'ed weights stay warm in the page cache.
+#
+# BONSAI_MODELS_MAX=2 keeps both hot and makes switching instant. That was
+# tested and WORKS -- both children loaded, served six alternating requests and
+# logged no allocation failures, even with the machine already 12 GB into swap.
+# One-at-a-time is the default only because it leaves more of the 17.8 GB Metal
+# working set (llama.log: "MTL0 : Apple M5 (18186 MiB free)") for everything
+# else on the box, not because two do not fit.
 MODELS_MAX="${BONSAI_MODELS_MAX:-1}"
 
 [[ -f "$ROOT/.env" ]] && set -a && . "$ROOT/.env" && set +a

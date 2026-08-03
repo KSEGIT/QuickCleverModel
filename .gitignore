@@ -15,3 +15,6 @@ run/
 
 # screenshots
 cache-viz*.png
+
+# python bytecode from the test suite
+__pycache__/
