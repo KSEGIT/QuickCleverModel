@@ -17,8 +17,12 @@ see "Docker registry proxy" below.
 ```
 ┌─────────────────────────── macOS host (Apple M5) ───────────────────────────┐
 │                                                                             │
-│   llama-server  ──  Metal / MTLGPUFamilyApple10  ──  0.0.0.0:8080           │
+│   llama-server ROUTER  ──────────────────────────────  0.0.0.0:8080         │
 │   (prism fork, source-built)                       ▲        ▲               │
+│     ├─ child: bonsai-27b-ternary  Q2_0  6.7 GB  ─┐ │        │               │
+│     └─ child: bonsai-27b-1bit     Q1_0  3.8 GB  ─┤ │        │               │
+│          both on Metal / MTLGPUFamilyApple10     │ │        │               │
+│          one resident at a time (--models-max 1) ┘ │        │               │
 │                                                    │        │               │
 │   open-webui (native, :9090) ──────────────────────┘        │ host.docker.internal
 │                                                             │               │
@@ -28,6 +32,10 @@ see "Docker registry proxy" below.
 │   └───────────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+The router loads no model itself. It spawns one child `llama-server` per model in
+`models.ini` and proxies each request to the right child, so both quantizations
+appear in the Open WebUI dropdown and you switch between them without a restart.
 
 ## Docker registry proxy (known issue on this machine)
 
@@ -67,15 +75,16 @@ Measured with `llama-bench -p 128 -n 128 -ngl 99 -r 2` on Apple M5 / 24 GB.
 
 ## Usage
 
-One command starts everything:
+Fetch the weights once (4.4 GB), then one command starts everything:
 
 ```bash
+make models    # download GGUF weights — only needed the first time
 make up        # or: ./stack.sh up
 ```
 
 ```
   SERVICE     PORT   STATE     PID
-  llama       8080   up        43261     Bonsai 27B on Metal
+  llama       8080   up        43261     Bonsai 27B router on Metal
   playwright  8931   up        43431     browser tools over MCP
   webui       9090   up        43469     chat UI
 
@@ -84,13 +93,14 @@ make up        # or: ./stack.sh up
 
 | command | does |
 |---|---|
+| `make models` | download the GGUF weights (4.4 GB). Skips files already present, so re-running is a sub-second no-op |
 | `make up` | start all three, waiting until each port actually accepts connections |
 | `make down` | stop everything (reverse order) |
 | `make restart` | down then up |
 | `make status` | what's running, with PIDs |
 | `make logs` | tail all logs — `make logs SVC=llama` for one |
 | `make open` | open the chat UI |
-| `make bench` | measure tok/s against the running server |
+| `make bench` | measure tok/s — `make bench MODEL=bonsai-27b-1bit` for the other model |
 
 Logs land in `run/logs/<service>.log` (gitignored). `stack.sh` waits on port
 readiness rather than process start, because llama-server maps 6.7 GB of weights
@@ -110,14 +120,82 @@ Run `make up` again.
 Once the Docker registry proxy is working again, `cd docker && docker compose up -d`
 runs the same UI in a container instead — it points at `host.docker.internal:8080`.
 
-Tunables (env): `BONSAI_CTX` (default 32768), `BONSAI_PORT`, `BONSAI_HOST`.
-The model trains to 262144 context; that KV cache will not fit in 24 GB, hence
-the lower default. Extra `llama-server` flags pass straight through:
+Tunables (env): `BONSAI_CTX` (default 32768), `BONSAI_PORT`, `BONSAI_HOST`,
+`BONSAI_MODELS_MAX` (default 1 — see "Model selection"). The model trains to
+262144 context; that KV cache will not fit in 24 GB, hence the lower default.
+Extra `llama-server` flags pass straight through to the **router**:
 
 ```bash
 ./start-server.sh --reasoning off        # disable thinking mode
 ./start-server.sh --reasoning-budget 256 # cap thinking tokens
 ```
+
+## Model selection
+
+Two quantizations of the same 27B are served from one port and chosen in the
+Open WebUI dropdown:
+
+| model id | quant | file | vendor quality | vision |
+|---|---|---|---|---|
+| `bonsai-27b-ternary` | `Q2_0`, 2.125 bpw | 6.7 GB | 94.6% of FP16 | ✓ |
+| `bonsai-27b-1bit` | `Q1_0`, 1.125 bpw | 3.8 GB | 89.5% of FP16 | ✓ |
+
+Both run on Metal — `Q1_0` is a first-class type in this fork (`llama-quantize`
+lists it, and `ggml-metal.metal` carries its kernels), so the 1-bit model is GPU
+accelerated, not a CPU fallback. Note this does **not** hold for `TQ1_0`/`TQ2_0`,
+the upstream BitNet types: they have no Metal kernels here, so an upstream BitNet
+GGUF would run CPU-only. Staying in the Bonsai family avoids that.
+
+**One model is resident at a time** (`--models-max 1`). Selecting the other in
+the dropdown unloads the current child and loads the new one from disk. Measured
+cost of a switch, with the machine under other load:
+
+| | wall clock |
+|---|---|
+| request to the model already loaded | 4–7 s |
+| request that switches model | 8–12 s |
+
+So a switch costs roughly **+4–5 s**. The weights are `mmap`ed, so the OS page
+cache keeps them warm and a reload is far cheaper than a cold 3.8–6.7 GB read.
+
+`BONSAI_MODELS_MAX=2` keeps both resident and makes switching instant. This was
+tested and **works** — both children loaded, served six alternating requests, and
+logged no allocation failures, even while the machine was already 12 GB into
+swap. It is not the default only because one-at-a-time leaves more headroom for
+everything else on the box.
+
+### Adding another model
+
+`models.ini.in` is the committed template; `start-server.sh` interpolates `@ROOT@`
+and writes `run/models.ini`, which is what the router reads. A new model is a new
+section — the section name becomes the model id in the dropdown, because the
+router force-sets `--alias` to it (`server-models.cpp:154`).
+
+Two traps, both of which cost time here:
+
+- **`mmproj` must be declared per-section.** On the router's own command line it
+  is silently discarded (`unset_reserved_args(base_preset, true)`,
+  `server-models.cpp:210`), and the model loses image input with no error.
+- **Do not add the `version = 1` line** that the fork's own README example shows.
+  Any key before the first `[section]` header lands in a section named `default`
+  (`preset.cpp:254`), which then inherits the `[*]` globals and appears in
+  `/v1/models` as a phantom model with no weights. Observed: with that line
+  present `/v1/models` returned three entries instead of two.
+
+### API
+
+In router mode the `"model"` field is **required** on POST — without it the
+router answers `400 model name is missing from the request`. GET endpoints
+(`/props`, `/metrics`) take a `?model=` query parameter instead.
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $BONSAI_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"bonsai-27b-1bit","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Router mode is marked experimental upstream (`server.cpp:340` prints
+`NOTE: router mode is experimental`).
 
 ## Thinking mode
 
@@ -129,25 +207,64 @@ with the text in `message.reasoning_content`. Either allow enough tokens
 
 `start-server.sh` binds `0.0.0.0` because binding `127.0.0.1` would be
 unreachable from the Docker VM — which also makes it reachable from your LAN.
-An API key in `.env` (gitignored, mode 600) is therefore required, and enforced:
+An API key in `.env` (gitignored, mode 600) is therefore required, and enforced.
+Re-verified against the router:
 
 ```
-no-key HTTP=401   bad-key HTTP=401   good-key HTTP=200
+/v1/chat/completions   no-key 401   bad-key 401   good-key 200
+/props                 no-key 401
+/models/load           no-key 401      (the load/unload control endpoint)
 ```
+
+The key is enforced once, at the router. Children bind `127.0.0.1` and are
+stripped of it (`unset_reserved_args`), so it is not duplicated per model —
+confirmed absent from the unauthenticated `/v1/models` response.
+
+Two endpoints are public by upstream design, not by regression:
+`/health` and `/v1/models` both return 200 without a key
+(`tools/server/tests/unit/test_security.py` asserts this). On a `0.0.0.0` bind
+that means anyone on your LAN can read the model list, **including each child's
+full command line and absolute weight paths**. No credentials leak, but if that
+bothers you, put the box behind a firewall rule rather than relying on the key.
 
 ## Layout
 
 ```
-start-server.sh                     native Metal inference launcher
+start-server.sh                     native Metal inference launcher (router mode)
+models.ini.in                       model preset template -> run/models.ini
+fetch-models.sh                     weight downloader (make models)
 start-webui.sh                      native Open WebUI launcher (:9090)
+cache-viz.py                        live prompt-cache dashboard (:8090)
+tests/                              stdlib unittest suite for cache-viz.py
 docker/compose.yaml                 containerised UI, parked pending Docker fix
 .env                                BONSAI_API_KEY (gitignored, 0600)
 .venv/                              python 3.11 env for open-webui
 .webui-data/                        Open WebUI database + cache
 models/Ternary-Bonsai-27B-gguf/     Q2_0 weights (6.7G) + mmproj Q8_0 (600M)
+models/Bonsai-27B-gguf/             Q1_0 weights (3.8G) + mmproj Q8_0 (629M)
 src/llama.cpp-prism/                fork source build (preferred binary)
 bin/llama-prism-b9570-0ad1dab/      prebuilt fallback
 ```
+
+Tests: `python3 -m unittest discover -s tests -v` (stdlib only, no install step).
+
+## Prompt-cache dashboard
+
+`make cache-viz` serves a live view on :8090 of how many prompt tokens each
+request reused from the KV cache versus processed fresh, parsed out of
+`run/logs/llama.log`. Under the router it labels each request with the model it
+came from, so the two quantizations can be compared side by side.
+
+**Expect a 0% hit rate as currently configured.** Every child logs:
+
+```
+srv load_model: cache_reuse is not supported by multimodal, it will be disabled
+```
+
+Both models declare an `mmproj`, so `--cache-reuse` is silently a no-op and
+nothing is ever reused. This is pre-existing behaviour, not a router regression.
+Drop the `mmproj` line from a section to get prompt-cache reuse back for that
+model — at the cost of its vision support.
 
 ## Browser tools (Playwright MCP)
 
@@ -216,7 +333,35 @@ The dspark file is unused; delete it to reclaim 1.8 GB.
 |---|---|
 | Ternary Q2_0 loads | prism source build ✓ (brew b10200 ✗) |
 | Metal | `MTLGPUFamilyApple10`, `has tensor = true` |
-| API key auth | no-key 401 · bad-key 401 · good-key 200 |
+| API key auth | completions/props/models-load: no-key 401 · bad-key 401 · good-key 200 |
 | Container → host GPU server | ✓ completion at 13.0 tok/s |
 | Vision (mmproj) | ✓ identified a red circle |
 | Open WebUI → llama-server | ✓ model listed, completion returned |
+| **Router lists exactly both models** | ✓ `bonsai-27b-ternary`, `bonsai-27b-1bit` — no phantom `default` |
+| **1-bit Q1_0 runs on Metal** | ✓ child maps `IOAccelerator` + `AGXMetalG17G`, not a CPU fallback |
+| **Vision on both models** | ✓ both answered "It is a red circle." — per-section `mmproj` works |
+| **Model switching in the UI** | ✓ both appear in the dropdown and select cleanly |
+| **`--models-max 1` swap** | ✓ exactly one child resident; switch costs +4–5 s |
+| **`--models-max 2` fits** | ✓ both resident, 6 alternating requests, 0 allocation failures |
+| **No orphaned children** | ✓ `make down` leaves no `llama-server` process behind |
+| **cache-viz under the router** | ✓ 8/8 tests; requests keyed by `(port, task)` and labelled by model |
+| Throughput: ternary vs 1-bit | **not yet measured** — see below |
+
+### Not yet measured
+
+The tok/s comparison between the two quantizations is **outstanding**. Every
+attempt during this work ran on a machine at load average 46–120 with 11–12 GB
+of swap in use (Teams at 181% CPU, Docker Desktop's VM at 113%), which pushed
+even the ternary model to 2.8–3.3 tok/s against its documented 12.9 baseline.
+Those numbers measure the machine's contention, not the models, so they are
+deliberately not recorded here.
+
+To fill this in on a quiet box:
+
+```bash
+make bench MODEL=bonsai-27b-ternary
+make bench MODEL=bonsai-27b-1bit
+```
+
+Run each twice and take the second reading — with `--models-max 1` the first
+call after a switch includes the model swap.
