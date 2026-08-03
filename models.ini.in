@@ -1,0 +1,45 @@
+; Model presets for llama-server router mode. Rendered to run/models.ini by
+; start-server.sh, which substitutes @ROOT@ for the repo path.
+;
+; Section names ARE the model IDs: server-models.cpp:154 force-sets
+; LLAMA_ARG_ALIAS to the section name, so these strings are what appears in
+; /v1/models and in the Open WebUI dropdown.
+;
+; mmproj MUST be declared per-section. On the router's own command line it is
+; silently discarded by unset_reserved_args(base_preset, true).
+;
+; Do NOT add the `version = 1` line from the fork's own README example. Any key
+; before the first [section] header lands in a section named "default"
+; (preset.cpp:254 initialises current_section to COMMON_PRESET_DEFAULT_NAME).
+; `version` is then skipped as reserved, but the empty section survives, the [*]
+; globals cascade onto it, and a phantom model with no weights appears in
+; /v1/models and in the Open WebUI dropdown.
+
+; Shared by both children. Every value here is measured — see README "Tuning".
+[*]
+ngl = 99
+c = @CTX@
+parallel = @PARALLEL@
+fa = on
+ctk = q8_0
+ctv = q8_0
+spec-type = @SPEC@
+cache-reuse = @CACHE_REUSE@
+metrics = true
+jinja = true
+temp = 0.5
+top-p = 0.85
+top-k = 20
+min-p = 0
+
+; 6.7 GB, 94.6% of FP16 per the model card. The default.
+[bonsai-27b-ternary]
+model = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-Q2_0.gguf
+mmproj = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-mmproj-Q8_0.gguf
+load-on-startup = true
+
+; 3.8 GB, 89.5% of FP16 per the model card. Loads on first request.
+[bonsai-27b-1bit]
+model = @ROOT@/models/Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf
+mmproj = @ROOT@/models/Bonsai-27B-gguf/Bonsai-27B-mmproj-Q8_0.gguf
+load-on-startup = false

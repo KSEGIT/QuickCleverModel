@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Native Metal-accelerated llama-server for Bonsai 27B.
+# Native Metal-accelerated llama-server for Bonsai 27B, in ROUTER mode.
 #
 # Docker on macOS CANNOT access Metal (Hypervisor.framework exposes no virtual
 # GPU to Linux guests), so inference runs here on the host and containers talk
 # to it over HTTP. See docker/compose.yaml for the container side.
+#
+# Router mode: launching WITHOUT -m makes this process a router that spawns one
+# child llama-server per model in models.ini (server.cpp:94). Both quantizations
+# then appear in /v1/models and in the Open WebUI dropdown, switchable without a
+# restart.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-MODEL_DIR="$ROOT/models/Ternary-Bonsai-27B-gguf"
 
 # Prefer the source build (Metal 4 tensor API enabled) over the prebuilt.
 # NOTE: Homebrew's llama.cpp is NOT usable here — upstream cannot read the
@@ -20,53 +24,42 @@ fi
 
 # 0.0.0.0 is REQUIRED: binding 127.0.0.1 makes the server unreachable from the
 # Docker VM. Everything is therefore also reachable from your LAN, so the API
-# key below is not optional hygiene.
+# key below is not optional hygiene. Children bind 127.0.0.1 and are stripped of
+# the key by the router, so it is enforced exactly once, here.
 HOST="${BONSAI_HOST:-0.0.0.0}"
 PORT="${BONSAI_PORT:-8080}"
 CTX="${BONSAI_CTX:-32768}"   # model trains to 262144; that KV cache will not fit in 24 GB
 
+# Metal's working set on this box is 17.8 GB, not 24 (llama.log: "MTL0 : Apple
+# M5 (18186 MiB free)"). Two 27B models resident is 10.5 GB of weights plus up
+# to two ~873 MiB mmproj allocations, leaving too little for two KV caches at
+# c=32768. So: keep ONE model loaded and swap on selection. Raise to 2 to keep
+# both hot if you have lowered BONSAI_CTX.
+MODELS_MAX="${BONSAI_MODELS_MAX:-1}"
+
 [[ -f "$ROOT/.env" ]] && set -a && . "$ROOT/.env" && set +a
 : "${BONSAI_API_KEY:?BONSAI_API_KEY not set — create .env with: BONSAI_API_KEY=bonsai-\$(openssl rand -hex 20)}"
 
-echo "server : $SERVER"
-echo "model  : $MODEL_DIR/Ternary-Bonsai-27B-Q2_0.gguf"
-echo "listen : http://$HOST:$PORT  (ctx=$CTX, all layers on Metal)"
+# Render the preset. Paths must be absolute: the children are spawned by the
+# router and inheriting CWD is fragile.
+PRESET="$ROOT/run/models.ini"
+mkdir -p "$ROOT/run"
+sed -e "s|@ROOT@|$ROOT|g" \
+    -e "s|@CTX@|$CTX|g" \
+    -e "s|@PARALLEL@|${BONSAI_PARALLEL:-1}|g" \
+    -e "s|@SPEC@|${BONSAI_SPEC:-ngram-simple}|g" \
+    -e "s|@CACHE_REUSE@|${BONSAI_CACHE_REUSE:-256}|g" \
+    "$ROOT/models.ini.in" > "$PRESET"
 
-# Performance flags, all measured (see README "Tuning"):
-#   --parallel 1  : n_parallel defaulted to 4, so Open WebUI's background title/tag
-#                   requests decoded CONCURRENTLY with the real chat and split
-#                   memory bandwidth 4 ways. Single-user box: give one request
-#                   everything. This was the dominant cost (4.8 t/s observed).
-#   -fa on        : explicit flash attention (default 'auto'); cheaper attention
-#                   at long context and a prerequisite for KV quantization.
-#   -ctk/-ctv q8_0: halves KV cache memory, negligible quality loss. Only safe
-#                   WITH flash attention — without it llama.cpp dequantizes the
-#                   cache every attention step and ends up slower.
-#   --spec-type ngram-simple : n-gram speculative decoding. Model-free, so no
-#                   second model and no extra RAM — which matters because this
-#                   box is memory-bandwidth-bound. Measured 12.7 t/s on generic
-#                   prose (baseline 12.9, i.e. free) and 19.6 t/s when output
-#                   reuses input tokens (baseline 12.9, a 1.5x win).
-#                   BONSAI_SPEC=ngram-map-k gives 2.05x on repetitive work but
-#                   costs 12% on generic prose; ngram-mod was worse at both.
-#                   Do NOT use draft-model speculation here: --spec-type
-#                   draft-dspark with the repo's 1.95 GB drafter measured 7.8 t/s
-#                   (-38%) despite 87% draft acceptance — evaluating the drafter
-#                   on Metal costs more than it saves. Same root cause as
-#                   github.com/ggml-org/llama.cpp/issues/23752.
+echo "server : $SERVER (router)"
+echo "preset : $PRESET"
+echo "listen : http://$HOST:$PORT  (ctx=$CTX, models-max=$MODELS_MAX)"
+
+# No -m: that is what selects router mode. No --mmproj either — it would be
+# discarded here and must live in the preset sections.
 exec "$SERVER" \
-  -m "$MODEL_DIR/Ternary-Bonsai-27B-Q2_0.gguf" \
-  --mmproj "$MODEL_DIR/Ternary-Bonsai-27B-mmproj-Q8_0.gguf" \
-  -ngl 99 \
-  -c "$CTX" \
-  --parallel "${BONSAI_PARALLEL:-1}" \
-  -fa on \
-  -ctk q8_0 -ctv q8_0 \
-  --spec-type "${BONSAI_SPEC:-ngram-simple}" \
-  --metrics \
-  --cache-reuse "${BONSAI_CACHE_REUSE:-256}" \
+  --models-preset "$PRESET" \
+  --models-max "$MODELS_MAX" \
   --host "$HOST" --port "$PORT" \
   --api-key "$BONSAI_API_KEY" \
-  --jinja \
-  --temp 0.5 --top-p 0.85 --top-k 20 --min-p 0 \
   "$@"
