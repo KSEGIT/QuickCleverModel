@@ -21,8 +21,12 @@ ngl = 99
 c = @CTX@
 parallel = @PARALLEL@
 fa = on
-ctk = q8_0
-ctv = q8_0
+; q4_0 KV, not q8_0: measured on THIS fork's Metal kernels (llama-bench, stack
+; down, r=3): Q1_0 tg128 16.14 (q4_0) vs 14.06 (q8_0) vs 13.85 (f16) -- +15%.
+; Upstream advice says quantized KV is unoptimized on Metal (llama.cpp#23011);
+; the prism fork evidently fixed that. Measurement beats citation.
+ctk = q4_0
+ctv = q4_0
 spec-type = @SPEC@
 cache-reuse = @CACHE_REUSE@
 ; llama-server defaults --cache-ram to 8192 MiB. On a 24 GB box already holding
