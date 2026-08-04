@@ -54,6 +54,7 @@ sed -e "s|@ROOT@|$ROOT|g" \
     -e "s|@PARALLEL@|${BONSAI_PARALLEL:-1}|g" \
     -e "s|@SPEC@|${BONSAI_SPEC:-ngram-simple}|g" \
     -e "s|@CACHE_REUSE@|${BONSAI_CACHE_REUSE:-256}|g" \
+    -e "s|@CACHE_RAM@|${BONSAI_CACHE_RAM:-2048}|g" \
     "$ROOT/models.ini.in" > "$PRESET"
 
 echo "server : $SERVER (router)"
