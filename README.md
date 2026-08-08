@@ -75,7 +75,7 @@ Measured with `llama-bench -p 128 -n 128 -ngl 99 -r 2` on Apple M5 / 24 GB.
 
 ## Usage
 
-Fetch the weights once (4.4 GB), then one command starts everything:
+Fetch the weights once (~11 GB, both models), then one command starts everything:
 
 ```bash
 make models    # download GGUF weights — only needed the first time
@@ -93,7 +93,7 @@ make up        # or: ./stack.sh up
 
 | command | does |
 |---|---|
-| `make models` | download the GGUF weights (4.4 GB). Skips files already present, so re-running is a sub-second no-op |
+| `make models` | download the GGUF weights (~11 GB, both models). Skips files already present, so re-running is a sub-second no-op |
 | `make up` | start all three, waiting until each port actually accepts connections |
 | `make down` | stop everything (reverse order) |
 | `make restart` | down then up |
@@ -129,6 +129,47 @@ Extra `llama-server` flags pass straight through to the **router**:
 ./start-server.sh --reasoning off        # disable thinking mode
 ./start-server.sh --reasoning-budget 256 # cap thinking tokens
 ```
+
+## Linux + NVIDIA (Docker)
+
+The same stack runs fully containerised on a Linux box with an NVIDIA GPU —
+developed against an RTX 3070 Ti (8 GB VRAM, sm_86). `docker/Dockerfile` builds
+the prism fork's `llama-server` with CUDA (the fork's Q1_0/Q2_0 kernels work on
+the standard MMQ path, sm_86 included), and `docker/compose.linux.yaml` runs it
+alongside Open WebUI.
+
+Prerequisites on the host:
+
+- NVIDIA driver **>= 525** (required by CUDA 12.4)
+- Docker + **nvidia-container-toolkit**
+- `pip install -U "huggingface_hub[cli]"` for the weight download
+
+```bash
+git clone <this repo> && cd models
+./fetch-models.sh        # ~11 GB, both models — lands in models/
+printf 'BONSAI_API_KEY=bonsai-%s\n' "$(openssl rand -hex 20)" > .env && chmod 600 .env
+# --env-file .env is REQUIRED: compose interpolation reads the shell env and
+# the project-dir .env (docker/), not the repo-root one — without this flag
+# the OPENAI_API_KEY line fails with "required variable is missing a value".
+docker compose --env-file .env -f docker/compose.linux.yaml up --build -d
+```
+
+UI on http://127.0.0.1:9090, API on :8080 — same router mode, same model ids,
+same `.env` key as the macOS stack.
+
+**8 GB VRAM caveat.** Compose defaults to `BONSAI_CTX=8192` so the KV cache
+fits next to the weights. The ternary Q2_0 (7.3 GB with mmproj) is tight at
+that ctx; the 1-bit Q1_0 is comfortable and can go much higher:
+
+```bash
+BONSAI_CTX=32768 docker compose --env-file .env -f docker/compose.linux.yaml up -d
+```
+
+**Both ports are loopback-only by default** (`127.0.0.1:8080` / `:9090`) — the
+webui runs with `WEBUI_AUTH=false`, so publishing it would give your whole LAN
+an unauthenticated chat UI. The API key on :8080 is enforced either way. To
+expose a port deliberately, drop the `127.0.0.1:` prefix in the compose
+mapping.
 
 ## Model selection
 
@@ -237,6 +278,8 @@ start-webui.sh                      native Open WebUI launcher (:9090)
 cache-viz.py                        live prompt-cache dashboard (:8090)
 tests/                              stdlib unittest suite for cache-viz.py
 docker/compose.yaml                 containerised UI, parked pending Docker fix
+docker/Dockerfile                   CUDA llama-server build (Linux + NVIDIA)
+docker/compose.linux.yaml           full Linux/NVIDIA stack (llama + webui)
 .env                                BONSAI_API_KEY (gitignored, 0600)
 .venv/                              python 3.11 env for open-webui
 .webui-data/                        Open WebUI database + cache

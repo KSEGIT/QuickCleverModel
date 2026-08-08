@@ -182,6 +182,6 @@ case "${1:-}" in
   status)  cmd_status;;
   reap)    cmd_reap;;
   logs)    cmd_logs "${2:-}";;
-  open)    open http://127.0.0.1:9090;;
+  open)    (open http://127.0.0.1:9090 2>/dev/null || xdg-open http://127.0.0.1:9090 >/dev/null 2>&1 &);;
   *) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 1;;
 esac

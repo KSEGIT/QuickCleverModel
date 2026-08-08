@@ -1,0 +1,63 @@
+# Full Linux + NVIDIA stack: CUDA llama-server + Open WebUI, both in containers.
+#
+# Host needs: NVIDIA driver >= 525 (for CUDA 12.4), Docker, and
+# nvidia-container-toolkit. Fetch the weights on the host first with
+# ../fetch-models.sh — they are mounted read from ../models, not baked in.
+#
+# Run from the repo root with --env-file so compose variable interpolation
+# (OPENAI_API_KEY below) sees the key: env_file: injects into the container
+# but is NOT read by interpolation, and the project-dir .env lookup finds
+# docker/.env, not the root one:
+#   docker compose --env-file .env -f docker/compose.linux.yaml up --build -d
+name: bonsai
+services:
+  llama:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: bonsai-llama:cuda
+    gpus: all
+    ports:
+      # Loopback-only: company LAN. The API key is enforced, but there is no
+      # reason to publish at all — webui reaches llama over the compose
+      # network. Drop the 127.0.0.1: prefix to expose deliberately.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ../models:/app/models
+    env_file: ../.env
+    environment:
+      # 8 GB VRAM (RTX 3070 Ti): 8192 ctx leaves room for KV cache next to the
+      # weights. Raise for the 1-bit model — it has GBs to spare.
+      BONSAI_CTX: ${BONSAI_CTX:-8192}
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: bonsai-webui
+    ports:
+      # WEBUI_AUTH is false below — loopback-only, or the whole LAN gets an
+      # unauthenticated chat UI.
+      - "127.0.0.1:9090:8080"
+    environment:
+      # The trailing /v1 matters — llama-server serves the OpenAI-compatible API there.
+      OPENAI_API_BASE_URL: "http://llama:8080/v1"
+      OPENAI_API_KEY: "${BONSAI_API_KEY:?set BONSAI_API_KEY in ../.env}"
+      WEBUI_AUTH: "false"          # single-user local box; flip to true to require login
+      ENABLE_OLLAMA_API: "false"   # we are not running Ollama
+      # Background generations (title, tags, follow-ups...) decode concurrently
+      # with your reply and steal bandwidth on a single-GPU box — same reasoning
+      # as start-webui.sh.
+      ENABLE_TITLE_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+      ENABLE_AUTOCOMPLETE_GENERATION: "false"
+      ENABLE_RETRIEVAL_QUERY_GENERATION: "false"
+      ENABLE_SEARCH_QUERY_GENERATION: "false"
+    depends_on:
+      - llama
+    volumes:
+      - open-webui-data:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:

@@ -1,5 +1,7 @@
 # Container layer for the hybrid setup.
 #
+# On Linux + NVIDIA use docker/compose.linux.yaml instead — it is the full stack.
+#
 # Inference does NOT run here — Docker on macOS has no Metal access. These
 # containers reach the host's llama-server via host.docker.internal, which
 # Docker Desktop maps to the macOS host.
