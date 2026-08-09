@@ -18,6 +18,11 @@
 ; Shared by both children. Every value here is measured — see docs/tuning.md.
 [*]
 ngl = 99
+; KV cache on the GPU by default. Set true on a box with little VRAM but plenty
+; of RAM (e.g. RTX 3070 Ti 8 GB + 64 GB DDR4): weights stay on the GPU, the KV
+; cache lives in system RAM, and ctx can grow past what VRAM would allow.
+; Slower decode (KV is read over PCIe every token) — measure before keeping.
+no-kv-offload = @NKVO@
 c = @CTX@
 parallel = @PARALLEL@
 fa = on

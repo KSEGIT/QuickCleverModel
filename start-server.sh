@@ -28,6 +28,10 @@ else
   exit 1
 fi
 
+# .env must be sourced BEFORE the defaults below — it is the one source of
+# truth, so BONSAI_CTX and friends in .env have to win over the defaults.
+[[ -f "$ROOT/.env" ]] && set -a && . "$ROOT/.env" && set +a
+
 # 0.0.0.0 is REQUIRED: binding 127.0.0.1 makes the server unreachable from the
 # Docker VM. Everything is therefore also reachable from your LAN, so the API
 # key below is not optional hygiene. Children bind 127.0.0.1 and are stripped of
@@ -48,7 +52,6 @@ CTX="${BONSAI_CTX:-32768}"   # model trains to 262144; that KV cache will not fi
 # else on the box, not because two do not fit.
 MODELS_MAX="${BONSAI_MODELS_MAX:-1}"
 
-[[ -f "$ROOT/.env" ]] && set -a && . "$ROOT/.env" && set +a
 : "${BONSAI_API_KEY:?BONSAI_API_KEY not set — create .env with: BONSAI_API_KEY=bonsai-\$(openssl rand -hex 20)}"
 
 # Render the preset. Paths must be absolute: the children are spawned by the
@@ -57,6 +60,7 @@ PRESET="$ROOT/run/models.ini"
 mkdir -p "$ROOT/run"
 sed -e "s|@ROOT@|$ROOT|g" \
     -e "s|@CTX@|$CTX|g" \
+    -e "s|@NKVO@|${BONSAI_NO_KV_OFFLOAD:-false}|g" \
     -e "s|@PARALLEL@|${BONSAI_PARALLEL:-1}|g" \
     -e "s|@SPEC@|${BONSAI_SPEC:-ngram-simple}|g" \
     -e "s|@CACHE_REUSE@|${BONSAI_CACHE_REUSE:-256}|g" \

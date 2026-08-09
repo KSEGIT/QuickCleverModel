@@ -36,7 +36,10 @@ services:
     env_file: ../.env
     environment:
       # 8 GB VRAM (RTX 3070 Ti): 8192 ctx leaves room for KV cache next to the
-      # weights. Raise for the 1-bit model — it has GBs to spare.
+      # weights. On a box with plenty of RAM, set in .env instead:
+      #   BONSAI_CTX=32768
+      #   BONSAI_NO_KV_OFFLOAD=true   (KV cache lives in system RAM, weights on GPU)
+      # BONSAI_NO_KV_OFFLOAD reaches the container via env_file above.
       BONSAI_CTX: ${BONSAI_CTX:-8192}
     restart: unless-stopped
 
