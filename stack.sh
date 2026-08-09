@@ -4,7 +4,7 @@
 #   ./stack.sh up | down | restart | status | logs [svc] | open | reap
 #
 # Three processes, all native on the host — nothing runs in Docker, because
-# Docker on macOS cannot reach Metal (see README).
+# Docker on macOS cannot reach Metal (see docs/architecture.md).
 #
 #   llama       :8080  Bonsai 27B on Metal            start-server.sh
 #   playwright  :8931  browser tools over MCP         start-playwright-mcp.sh

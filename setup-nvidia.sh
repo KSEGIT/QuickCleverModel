@@ -239,5 +239,5 @@ cat <<'EOF'
     # --env-file .env is REQUIRED (compose interpolation reads docker/.env otherwise)
     docker compose --env-file .env -f docker/compose.linux.yaml up --build -d
 
-  UI on http://127.0.0.1:9090, API on :8080. See README "Linux + NVIDIA (Docker)".
+  UI on http://127.0.0.1:9090, API on :8080. See docs/architecture.md "Linux/NVIDIA shape".
 EOF

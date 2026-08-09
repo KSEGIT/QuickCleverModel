@@ -150,8 +150,8 @@ sequenceDiagram
 ## 7. Success metrics
 
 - Cold start to first token: `make up` readiness-gated; model swap +4–5 s warm.
-- Throughput: `make bench` (median of N reps) per platform; README records
-  measured numbers, not vendor claims.
+- Throughput: `make bench` (median of N reps) per platform; docs/tuning.md
+  records measured numbers, not vendor claims.
 - Quality: vendor ratings 94.6% (ternary) / 89.5% (1-bit) of FP16.
 - Reliability: stack survives `make down` with no orphaned children (verified).
 

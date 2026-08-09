@@ -43,7 +43,7 @@ cd "$ROOT"
 # This is the Linux path only. macOS runs inference natively on Metal with a
 # completely different setup — point those users at the right instructions.
 [[ "$(uname -s)" == "Linux" ]] || \
-  die "this installer is Linux-only. On macOS, see README.md 'First-time setup (macOS)'."
+  die "this installer is Linux-only. On macOS, see docs/macos.md 'First-time setup (macOS)'."
 
 # Installation needs root. Run through sudo rather than re-execing the whole
 # script, so the invoking user stays known — same approach as setup-nvidia.sh.
@@ -213,8 +213,9 @@ wait_for() {
   die "timed out after $((limit / 60)) minutes waiting for $label ($url) — check: $DOCKER docker ${COMPOSE[*]} logs"
 }
 
-# /health is public by upstream design (no API key needed) — see README
-# "Security". 15 minutes: model load on first request is genuinely slow.
+# /health is public by upstream design (no API key needed) — see
+# docs/architecture.md "Ports & security". 15 minutes: model load on first
+# request is genuinely slow.
 wait_for "http://127.0.0.1:8080/health" 900 "llama-server (:8080)"
 wait_for "http://127.0.0.1:9090/" 300 "Open WebUI (:9090)"
 
@@ -230,7 +231,7 @@ cat <<'EOF'
       bonsai-27b-1bit      <- start here on 8 GB VRAM (RTX 3070 Ti), comfortable
       bonsai-27b-ternary   higher quality, tight on 8 GB at the default ctx
 
-    Both ports are loopback-only — see README "Linux + NVIDIA (Docker)".
+    Both ports are loopback-only — see docs/architecture.md "Ports & security".
 EOF
 
 # Open the UI when there is a desktop session. Backgrounded and detached so

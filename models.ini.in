@@ -15,7 +15,7 @@
 ; globals cascade onto it, and a phantom model with no weights appears in
 ; /v1/models and in the Open WebUI dropdown.
 
-; Shared by both children. Every value here is measured — see README "Tuning".
+; Shared by both children. Every value here is measured — see docs/tuning.md.
 [*]
 ngl = 99
 c = @CTX@
