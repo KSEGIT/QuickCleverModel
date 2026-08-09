@@ -229,9 +229,23 @@ BONSAI_CTX=32768 docker compose --env-file .env -f docker/compose.linux.yaml up 
 
 **Both ports are loopback-only by default** (`127.0.0.1:8080` / `:9090`) — the
 webui runs with `WEBUI_AUTH=false`, so publishing it would give your whole LAN
-an unauthenticated chat UI. The API key on :8080 is enforced either way. To
-expose a port deliberately, drop the `127.0.0.1:` prefix in the compose
-mapping.
+an unauthenticated chat UI. The API key on :8080 is enforced either way.
+
+**Remote access** (e.g. you SSH into the box over Tailscale and browse from
+another machine): two options.
+
+- Preferred — an SSH tunnel from your local machine, no config change:
+
+  ```bash
+  ssh -N -L 9090:127.0.0.1:9090 -L 8080:127.0.0.1:8080 user@<tailscale-ip>
+  # then open http://127.0.0.1:9090 locally
+  ```
+
+- Or bind to the Tailscale interface: add `WEBUI_BIND=100.x.y.z` (the box's
+  Tailscale IP) to `.env`, then `docker compose --env-file .env -f docker/compose.linux.yaml up -d`
+  to recreate. This exposes the **unauthenticated** UI to your whole tailnet —
+  fine on a personal tailnet, otherwise flip `WEBUI_AUTH` to `true` first.
+  `LLAMA_BIND` does the same for :8080 (the API key is enforced there).
 
 ## Model selection
 
