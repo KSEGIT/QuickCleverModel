@@ -63,24 +63,37 @@ TARGET_USER="${SUDO_USER:-${USER}}"
 [[ $CHECK -eq 1 ]] && info "check mode — reporting only, no changes"
 
 # --- 1. NVIDIA GPU present ----------------------------------------------------
-# This script is only useful on NVIDIA boxes; if lspci sees no NVIDIA device
+# This script is only useful on NVIDIA boxes; if no NVIDIA device is visible
 # there is nothing to set up here.
+#
+# Detect by PCI vendor ID 0x10de in /sys, not by string-matching lspci: an
+# outdated/missing pci.ids database makes lspci print "10de:2482" with NO
+# "NVIDIA" string (false negative), and /sys works without pciutils at all.
 info "checking for an NVIDIA GPU"
-if ! command -v lspci >/dev/null 2>&1; then
-  if [[ $CHECK -eq 1 ]]; then
-    would "apt-get install -y pciutils (provides lspci)"
-    warn "lspci missing — cannot detect the GPU in check mode"
+nv_vendors=$(grep -l '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null || true)
+if [[ -n "$nv_vendors" ]]; then
+  nv_desc="$(for v in $nv_vendors; do
+    d=$(dirname "$v"); printf '%s device %s; ' "$(basename "$d")" "$(cat "$d/device" 2>/dev/null)"
+  done | head -c 200)"
+  ok "NVIDIA GPU present (PCI vendor 0x10de): $nv_desc"
+  # lspci -nn prints [vendor:device] IDs even with a broken pci.ids, so this
+  # line is useful diagnostics either way — best-effort only.
+  lspci -nn 2>/dev/null | grep -i '10de' | head -2 || true
+elif command -v lspci >/dev/null 2>&1 && lspci | grep -qi nvidia; then
+  # String fallback for exotic setups where /sys is restricted.
+  ok "NVIDIA GPU present: $(lspci | grep -i nvidia | head -1 | cut -d: -f3- | sed 's/^ //')"
+else
+  # Show the evidence before dying so the user can see what the OS sees.
+  warn "no PCI device with NVIDIA vendor ID 0x10de found"
+  if command -v lspci >/dev/null 2>&1; then
+    info "display devices lspci can see:"
+    lspci | grep -iE 'vga|3d|display' || echo "  (none at all)"
   else
-    $SUDO apt-get update -qq
-    $SUDO apt-get install -y pciutils
+    info "lspci not installed (would: apt-get install -y pciutils) — /sys scan found nothing either"
   fi
-fi
-if command -v lspci >/dev/null 2>&1; then
-  if lspci | grep -qi nvidia; then
-    ok "NVIDIA GPU present: $(lspci | grep -i nvidia | head -1 | cut -d: -f3- | sed 's/^ //')"
-  else
-    die "no NVIDIA device in lspci output — this script is only for NVIDIA boxes"
-  fi
+  die "no NVIDIA GPU visible to this OS. If the card is really there: check it is
+       seated/enabled in BIOS; if this is a VM, the GPU needs PCIe passthrough
+       configured on the host (the guest cannot see it otherwise)."
 fi
 
 # --- 2. NVIDIA driver >= 525 --------------------------------------------------
