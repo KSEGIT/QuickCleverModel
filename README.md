@@ -8,6 +8,37 @@ Two run modes: **native Metal on macOS** (with a Docker app layer) and a
 **full Docker stack on Linux + NVIDIA**. The models reason (thinking mode) and
 hold up surprisingly well for 1-bit/ternary weights.
 
+## Quick setup
+
+**Linux + NVIDIA** (tested on Ubuntu, RTX 3070 Ti 8 GB):
+
+```bash
+git clone https://github.com/KSEGIT/QuickCleverModel.git && cd QuickCleverModel
+./install.sh
+```
+
+That's it — it checks/installs the GPU driver, Docker, and the container
+toolkit, downloads the weights (~11 GB), generates an API key, builds the CUDA
+image (~10–20 min first time), starts everything, waits until it serves, and
+opens the UI. Safe to re-run after any failure — every step skips what's
+already done. Details: "Linux + NVIDIA (Docker)" below.
+
+Then:
+
+- UI on `http://127.0.0.1:9090` — pick **`bonsai-27b-1bit`** in the dropdown
+  first (comfortable on 8 GB VRAM); the first request takes ~10–20 s while the
+  model loads.
+- **Browsing from another machine?** Ports are loopback-only by default.
+  Either tunnel (`ssh -N -L 9090:127.0.0.1:9090 user@host`) or expose on the
+  network: add `WEBUI_BIND=0.0.0.0` to `.env`, set `WEBUI_AUTH: "true"` in
+  `docker/compose.linux.yaml` (first signup becomes admin — without it, the
+  whole LAN gets an unauthenticated UI), then
+  `docker compose --env-file .env -f docker/compose.linux.yaml up -d`.
+  Details: "Remote access" below.
+
+**macOS (Apple Silicon):** see "First-time setup (macOS)" — build the fork
+with cmake, create the venv and `.env`, then `make models && make up`.
+
 ## Why this shape
 
 Docker on macOS **cannot** use your GPU. Containers run inside a Linux VM on
