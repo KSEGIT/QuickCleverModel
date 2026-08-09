@@ -34,11 +34,5 @@ cache-viz:      ## Live prompt-cache dashboard on :8090
 open:           ## Open the chat UI
 	@./stack.sh open
 
-bench:          ## Measure throughput — make bench MODEL=bonsai-27b-1bit
-	@set -a; . ./.env; set +a; \
-	m="$(or $(MODEL),bonsai-27b-ternary)"; \
-	echo "  model: $$m"; \
-	curl -s --max-time 600 http://127.0.0.1:8080/v1/chat/completions \
-	  -H "Content-Type: application/json" -H "Authorization: Bearer $$BONSAI_API_KEY" \
-	  -d "{\"model\":\"$$m\",\"messages\":[{\"role\":\"user\",\"content\":\"Count to twenty.\"}],\"max_tokens\":150}" \
-	| python3 -c "import json,sys;t=json.load(sys.stdin)['timings'];print('  %.1f tok/s generation, %.1f t/s prompt'%(t['predicted_per_second'],t['prompt_per_second']))"
+bench:          ## Median throughput over N reps — make bench MODEL=bonsai-27b-1bit REPS=9
+	@./bench.sh -n "$(or $(REPS),5)" -m "$(or $(MODEL),bonsai-27b-ternary)"

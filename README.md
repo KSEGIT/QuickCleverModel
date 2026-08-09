@@ -1,4 +1,12 @@
-# Bonsai 27B on macOS — native Metal inference + Docker app layer
+<p align="center">
+  <img src="assets/hero.svg" alt="QuickCleverModel — Bonsai 27B thinking models on Apple Metal and CUDA" width="100%">
+</p>
+
+# QuickCleverModel — Bonsai 27B, fast on consumer GPUs
+
+Two run modes: **native Metal on macOS** (with a Docker app layer) and a
+**full Docker stack on Linux + NVIDIA**. The models reason (thinking mode) and
+hold up surprisingly well for 1-bit/ternary weights.
 
 ## Why this shape
 
@@ -73,6 +81,28 @@ upstream prebuilt binary could not (it shipped with AppleClang 15):
 
 Measured with `llama-bench -p 128 -n 128 -ngl 99 -r 2` on Apple M5 / 24 GB.
 
+## First-time setup (macOS)
+
+A fresh clone is missing four things the repo deliberately does not track —
+weights, the fork source, the Python env, and the API key. Prerequisites:
+cmake (`brew install cmake`), Python 3.11, `hf` (`brew install huggingface-cli`),
+and node/npx (for the Playwright MCP, optional).
+
+```bash
+# 1. Build the prism fork's llama-server (Metal is enabled by default on macOS).
+#    brew's llama.cpp cannot load the ternary Q2_0 layout — see "Runtime choice".
+git clone https://github.com/PrismML-Eng/llama.cpp src/llama.cpp-prism
+git -C src/llama.cpp-prism checkout 4dd165625bb6c020285eec8b342af25cf60233dd
+cmake -S src/llama.cpp-prism -B src/llama.cpp-prism/build -DCMAKE_BUILD_TYPE=Release
+cmake --build src/llama.cpp-prism/build --target llama-server -j
+
+# 2. Python env for Open WebUI
+python3.11 -m venv .venv && .venv/bin/pip install open-webui
+
+# 3. API key (enforced by the router — the server binds 0.0.0.0)
+printf 'BONSAI_API_KEY=bonsai-%s\n' "$(openssl rand -hex 20)" > .env && chmod 600 .env
+```
+
 ## Usage
 
 Fetch the weights once (~11 GB, both models), then one command starts everything:
@@ -117,8 +147,14 @@ Individual services, if you need them separately:
 Nothing survives a reboot — these are plain user processes, not launchd services.
 Run `make up` again.
 
-Once the Docker registry proxy is working again, `cd docker && docker compose up -d`
-runs the same UI in a container instead — it points at `host.docker.internal:8080`.
+Once the Docker registry proxy is working again, the same UI runs in a
+container instead — from the repo root, so interpolation finds the key:
+
+```bash
+docker compose --env-file .env -f docker/compose.yaml up -d
+```
+
+It points at `host.docker.internal:8080`.
 
 Tunables (env): `BONSAI_CTX` (default 32768), `BONSAI_PORT`, `BONSAI_HOST`,
 `BONSAI_MODELS_MAX` (default 1 — see "Model selection"). The model trains to
@@ -138,15 +174,23 @@ the prism fork's `llama-server` with CUDA (the fork's Q1_0/Q2_0 kernels work on
 the standard MMQ path, sm_86 included), and `docker/compose.linux.yaml` runs it
 alongside Open WebUI.
 
-Prerequisites on the host:
+Prerequisites on the host — either run `./setup-nvidia.sh` (auto-detects and
+installs driver/Docker/nvidia-container-toolkit, `--check` to dry-run), or set
+up manually:
 
 - NVIDIA driver **>= 525** (required by CUDA 12.4)
-- Docker + **nvidia-container-toolkit**
-- `pip install -U "huggingface_hub[cli]"` for the weight download
+- Docker (with the Compose plugin) + **nvidia-container-toolkit**, then
+  `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`
+- the `hf` CLI for the weight download — on Ubuntu >= 23.04 use
+  `pipx install huggingface_hub[cli]` (a bare `pip install` hits PEP 668's
+  externally-managed error); older releases can use `pip install -U "huggingface_hub[cli]"`
 
 ```bash
-git clone <this repo> && cd models
-./fetch-models.sh        # ~11 GB, both models — lands in models/
+git clone https://github.com/KSEGIT/QuickCleverModel.git && cd QuickCleverModel
+./fetch-models.sh        # ~11 GB, both models — lands in models/.
+                         # Run this BEFORE first compose up: it creates models/
+                         # itself; if docker creates the bind-mount source
+                         # first, it is root-owned and the download fails.
 printf 'BONSAI_API_KEY=bonsai-%s\n' "$(openssl rand -hex 20)" > .env && chmod 600 .env
 # --env-file .env is REQUIRED: compose interpolation reads the shell env and
 # the project-dir .env (docker/), not the repo-root one — without this flag
@@ -271,6 +315,7 @@ bothers you, put the box behind a firewall rule rather than relying on the key.
 ## Layout
 
 ```
+setup-nvidia.sh                     Ubuntu NVIDIA driver/Docker/toolkit installer (--check to dry-run)
 start-server.sh                     native Metal inference launcher (router mode)
 models.ini.in                       model preset template -> run/models.ini
 fetch-models.sh                     weight downloader (make models)
@@ -283,10 +328,10 @@ docker/compose.linux.yaml           full Linux/NVIDIA stack (llama + webui)
 .env                                BONSAI_API_KEY (gitignored, 0600)
 .venv/                              python 3.11 env for open-webui
 .webui-data/                        Open WebUI database + cache
-models/Ternary-Bonsai-27B-gguf/     Q2_0 weights (6.7G) + mmproj Q8_0 (600M)
+models/Ternary-Bonsai-27B-gguf/     Q2_0 weights (6.7G) + mmproj Q8_0 (629M)
 models/Bonsai-27B-gguf/             Q1_0 weights (3.8G) + mmproj Q8_0 (629M)
-src/llama.cpp-prism/                fork source build (preferred binary)
-bin/llama-prism-b9570-0ad1dab/      prebuilt fallback
+src/llama.cpp-prism/                fork source build (preferred binary, gitignored)
+bin/llama-prism-b9570-0ad1dab/      prebuilt fallback (gitignored)
 ```
 
 Tests: `python3 -m unittest discover -s tests -v` (stdlib only, no install step).

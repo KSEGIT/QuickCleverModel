@@ -116,8 +116,10 @@ stop_one() {
   # playwright runs as `npx` -> `npm exec` -> `node playwright-mcp`. Only the node
   # child holds the port, so killing just that orphans the npm wrapper — they
   # accumulate one per up/down cycle. Take the parent too when it is the wrapper.
+  # The wrapper's cmdline is `npm exec @playwright/mcp@latest` — the node
+  # signature "playwright-mcp" does NOT match it, so match both spellings.
   ppid="$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')"
-  if [[ -n "$ppid" && "$ppid" != 1 ]] && ps -p "$ppid" -o command= 2>/dev/null | grep -q "$(sig_of "$svc")"; then
+  if [[ -n "$ppid" && "$ppid" != 1 ]] && ps -p "$ppid" -o command= 2>/dev/null | grep -qE "$(sig_of "$svc")|@playwright/mcp"; then
     kill "$ppid" 2>/dev/null
   fi
   kill "$pid" 2>/dev/null
@@ -172,7 +174,11 @@ cmd_status() {
 
 cmd_logs() {
   local svc="${1:-}"
-  if [[ -z "$svc" ]]; then tail -n 40 -f "$LOGS"/*.log; else tail -n 60 -f "$LOGS/$svc.log"; fi
+  if [[ -n "$svc" ]]; then tail -n 60 -f "$LOGS/$svc.log"; return; fi
+  # Fresh clone: no logs yet — the unexpanded glob would make tail error out.
+  local logs=("$LOGS"/*.log)
+  [[ -e "${logs[0]}" ]] || { echo "no logs yet — run: ./stack.sh up"; return 1; }
+  tail -n 40 -f "${logs[@]}"
 }
 
 case "${1:-}" in

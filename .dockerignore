@@ -12,3 +12,7 @@ bin/
 run/
 __pycache__/
 docker/.env
+
+# secrets — never shipped to the daemon, even unused
+.env
+.webui_secret_key

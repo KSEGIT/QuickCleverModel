@@ -16,14 +16,22 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     image: bonsai-llama:cuda
-    gpus: all
+    # deploy.devices is the long-supported GPU form; `gpus: all` shorthand
+    # needs Docker Compose >= v2.30, newer than Ubuntu's distro package.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     ports:
-      # Loopback-only: company LAN. The API key is enforced, but there is no
-      # reason to publish at all — webui reaches llama over the compose
-      # network. Drop the 127.0.0.1: prefix to expose deliberately.
+      # Loopback-only. The API key is enforced, but there is no reason to
+      # publish at all — webui reaches llama over the compose network.
+      # Drop the 127.0.0.1: prefix to expose deliberately.
       - "127.0.0.1:8080:8080"
     volumes:
-      - ../models:/app/models
+      - ../models:/app/models:ro
     env_file: ../.env
     environment:
       # 8 GB VRAM (RTX 3070 Ti): 8192 ctx leaves room for KV cache next to the

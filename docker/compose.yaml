@@ -10,13 +10,24 @@ services:
     image: ghcr.io/open-webui/open-webui:main
     container_name: bonsai-webui
     ports:
-      - "9090:8080"
+      # WEBUI_AUTH is false below — loopback-only, or the whole LAN gets an
+      # unauthenticated chat UI.
+      - "127.0.0.1:9090:8080"
     environment:
       # The trailing /v1 matters — llama-server serves the OpenAI-compatible API there.
       OPENAI_API_BASE_URL: "http://host.docker.internal:8080/v1"
       OPENAI_API_KEY: "${BONSAI_API_KEY:?set BONSAI_API_KEY in ../.env}"
       WEBUI_AUTH: "false"          # single-user local box; flip to true to require login
       ENABLE_OLLAMA_API: "false"   # we are not running Ollama
+      # Background generations (title, tags, follow-ups...) decode concurrently
+      # with your reply and steal bandwidth on a single-GPU box — same reasoning
+      # as start-webui.sh.
+      ENABLE_TITLE_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+      ENABLE_AUTOCOMPLETE_GENERATION: "false"
+      ENABLE_RETRIEVAL_QUERY_GENERATION: "false"
+      ENABLE_SEARCH_QUERY_GENERATION: "false"
     extra_hosts:
       - "host.docker.internal:host-gateway"   # explicit; Desktop provides it, this keeps it portable
     volumes:

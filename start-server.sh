@@ -18,8 +18,14 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 # fork's ternary Q2_0 block layout ("tensor 'output_norm.weight' has offset ...").
 if [[ -x "$ROOT/src/llama.cpp-prism/build/bin/llama-server" ]]; then
   SERVER="$ROOT/src/llama.cpp-prism/build/bin/llama-server"
-else
+elif [[ -x "$ROOT/bin/llama-prism-b9570-0ad1dab/llama-server" ]]; then
   SERVER="$ROOT/bin/llama-prism-b9570-0ad1dab/llama-server"
+else
+  echo "no llama-server binary found. Build the fork:" >&2
+  echo "  git clone https://github.com/PrismML-Eng/llama.cpp src/llama.cpp-prism" >&2
+  echo "  cmake -S src/llama.cpp-prism -B src/llama.cpp-prism/build -DCMAKE_BUILD_TYPE=Release" >&2
+  echo "  cmake --build src/llama.cpp-prism/build --target llama-server -j" >&2
+  exit 1
 fi
 
 # 0.0.0.0 is REQUIRED: binding 127.0.0.1 makes the server unreachable from the
