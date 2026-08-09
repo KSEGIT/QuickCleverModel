@@ -61,6 +61,8 @@ generation with the shipped tuning. An RTX 4060 Laptop (256 GB/s) runs the same
 | F9 | Prompt-cache dashboard (`cache-viz.py`) + unittest suite | ✅ |
 | F10 | Thinking mode on by default; `--reasoning off` / `--reasoning-budget` passthrough | ✅ |
 
+`install.sh` is the one-command installer for the Linux+NVIDIA path — it orchestrates F6–F8 (weights, host setup, CUDA build) end to end.
+
 ## 5. Non-functional requirements
 
 | # | Requirement | Measured |

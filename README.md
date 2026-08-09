@@ -174,6 +174,23 @@ the prism fork's `llama-server` with CUDA (the fork's Q1_0/Q2_0 kernels work on
 the standard MMQ path, sm_86 included), and `docker/compose.linux.yaml` runs it
 alongside Open WebUI.
 
+Quick start — one command installs the prerequisites (driver/Docker/toolkit
+via `setup-nvidia.sh`), the `hf` CLI, downloads the weights (~11 GB),
+generates `.env`, builds and starts the stack, and waits until the UI
+answers:
+
+```bash
+git clone https://github.com/KSEGIT/QuickCleverModel.git && cd QuickCleverModel
+./install.sh             # --check to dry-run; safe to re-run, every step idempotent
+```
+
+After a fresh driver install it will tell you to reboot and re-run — it
+resumes where it left off. The first build takes 10–20 minutes (CUDA
+compile).
+
+<details>
+<summary>Manual steps (exactly what install.sh runs, if you prefer to drive it yourself)</summary>
+
 Prerequisites on the host — either run `./setup-nvidia.sh` (auto-detects and
 installs driver/Docker/nvidia-container-toolkit, `--check` to dry-run), or set
 up manually:
@@ -186,7 +203,6 @@ up manually:
   externally-managed error); older releases can use `pip install -U "huggingface_hub[cli]"`
 
 ```bash
-git clone https://github.com/KSEGIT/QuickCleverModel.git && cd QuickCleverModel
 ./fetch-models.sh        # ~11 GB, both models — lands in models/.
                          # Run this BEFORE first compose up: it creates models/
                          # itself; if docker creates the bind-mount source
@@ -197,6 +213,8 @@ printf 'BONSAI_API_KEY=bonsai-%s\n' "$(openssl rand -hex 20)" > .env && chmod 60
 # the OPENAI_API_KEY line fails with "required variable is missing a value".
 docker compose --env-file .env -f docker/compose.linux.yaml up --build -d
 ```
+
+</details>
 
 UI on http://127.0.0.1:9090, API on :8080 — same router mode, same model ids,
 same `.env` key as the macOS stack.
@@ -315,6 +333,7 @@ bothers you, put the box behind a firewall rule rather than relying on the key.
 ## Layout
 
 ```
+install.sh                          one-command Linux+NVIDIA installer (setup -> weights -> .env -> compose up)
 setup-nvidia.sh                     Ubuntu NVIDIA driver/Docker/toolkit installer (--check to dry-run)
 start-server.sh                     native Metal inference launcher (router mode)
 models.ini.in                       model preset template -> run/models.ini
