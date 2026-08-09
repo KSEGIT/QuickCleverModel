@@ -30,11 +30,39 @@ dropdown. The first answer takes 10–20 seconds while the model loads.
 **macOS (Apple Silicon):** the setup is a few steps more — see
 [docs/macos.md](docs/macos.md#first-time-setup-macos).
 
-**Browsing from another machine?** Ports are loopback-only by default. Use an
-SSH tunnel (`ssh -N -L 9090:127.0.0.1:9090 user@host`), or set
-`WEBUI_BIND=0.0.0.0` in `.env` and `WEBUI_AUTH: "true"` in
-`docker/compose.linux.yaml`, then re-run compose up. Details:
-[docs/architecture.md](docs/architecture.md#ports--security).
+## Remote access
+
+Ports listen on loopback only. Nothing outside the box can reach them until
+you choose one of these.
+
+**Option 1 — SSH tunnel (safest, no config change).** Run this on your laptop,
+then open `http://127.0.0.1:9090` as usual:
+
+```bash
+ssh -N -L 9090:127.0.0.1:9090 -L 8080:127.0.0.1:8080 user@<box-ip>
+```
+
+**Option 2 — Tailscale bind (good for daily use).** The box keeps the ports
+open on its Tailscale address, so any machine on your tailnet can connect. On
+the box, add this to `.env` (use the box's own Tailscale IP, from
+`tailscale ip -4`):
+
+```bash
+WEBUI_BIND=100.x.y.z
+LLAMA_BIND=100.x.y.z
+```
+
+Then restart: `docker compose --env-file .env -f docker/compose.linux.yaml up -d`.
+
+Warning: the chat UI has no login by default. Binding it opens the UI to your
+whole tailnet. On a shared tailnet, set `WEBUI_AUTH: "true"` in
+`docker/compose.linux.yaml` first. The API on :8080 always asks for the key.
+
+Never use `0.0.0.0` unless you mean to share with the whole office LAN.
+
+From another machine, the API is now at `http://100.x.y.z:8080/v1` — point any
+OpenAI-compatible tool there (OpenCode, Aider, scripts) with your
+`BONSAI_API_KEY`. More detail: [docs/architecture.md](docs/architecture.md#ports--security).
 
 ## Using it
 
