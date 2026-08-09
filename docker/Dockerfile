@@ -19,6 +19,14 @@ RUN git clone https://github.com/PrismML-Eng/llama.cpp /app/src/llama.cpp-prism 
  && git -C /app/src/llama.cpp-prism checkout "$PRISM_SHA"
 
 WORKDIR /app/src/llama.cpp-prism
+
+# The devel image ships only the driver STUB (lib64/stubs/libcuda.so); the
+# fork's ggml-cuda calls driver-API symbols (cuMemCreate & co.), so the final
+# llama-server link fails with "libcuda.so.1 not found" without this on the
+# linker path. Linking against the stub is correct: at runtime the real
+# libcuda.so.1 is injected into the container by nvidia-container-toolkit.
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs
+
 RUN cmake -B build \
       -DGGML_CUDA=ON \
       -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
