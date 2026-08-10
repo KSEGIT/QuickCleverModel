@@ -31,6 +31,12 @@ services:
       # Remote access: set LLAMA_BIND to the machine's Tailscale/LAN IP in
       # .env, or prefer an ssh -L tunnel and leave this alone.
       - "${LLAMA_BIND:-127.0.0.1}:8080:8080"
+      # Second listener for a second interface, e.g. a second tailscaled
+      # (two tailnets, two 100.x IPs): set LLAMA_BIND2 to that IP in .env.
+      # 127.0.0.2 keeps the default loopback-only without colliding with
+      # the first mapping. Note Docker fails to bind if the IP does not
+      # exist yet -- start tailscaled before compose at boot.
+      - "${LLAMA_BIND2:-127.0.0.2}:8080:8080"
     volumes:
       - ../models:/app/models:ro
     env_file: ../.env
@@ -59,6 +65,10 @@ services:
       # machine's Tailscale IP in .env (tailnet-only exposure), or prefer an
       # ssh -L tunnel and leave this alone.
       - "${WEBUI_BIND:-127.0.0.1}:9090:8080"
+      # Second listener, same idea as LLAMA_BIND2 above. Set WEBUI_BIND2 to
+      # the second tailscaled's IP in .env. Flip WEBUI_AUTH to true before
+      # exposing this beyond your own machines.
+      - "${WEBUI_BIND2:-127.0.0.2}:9090:8080"
     environment:
       # The trailing /v1 matters — llama-server serves the OpenAI-compatible API there.
       OPENAI_API_BASE_URL: "http://llama:8080/v1"
