@@ -23,6 +23,8 @@ git clone https://github.com/KSEGIT/QuickCleverModel.git && cd QuickCleverModel
 
 The first run takes 10–20 minutes (it builds the CUDA image) and downloads
 about 11 GB of model weights. It is safe to re-run after any failure.
+Every setting the stack understands is documented in
+[.env.example](.env.example).
 
 Then open `http://127.0.0.1:9090` and pick **`bonsai-27b-1bit`** in the
 dropdown. The first answer takes 10–20 seconds while the model loads.
