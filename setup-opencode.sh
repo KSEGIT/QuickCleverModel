@@ -92,11 +92,13 @@ cat > "$CONFIG" <<JSON
         "bonsai-27b-1bit":    { "name": "bonsai-27b-1bit",
                                 "limit": { "context": $CTX, "output": 4096 } },
         "bonsai-27b-ternary": { "name": "bonsai-27b-ternary",
+                                "limit": { "context": $CTX, "output": 4096 } },
+        "bonsai-27b-ternary-text": { "name": "bonsai-27b-ternary-text",
                                 "limit": { "context": $CTX, "output": 4096 } }
       }
     }
   },
-  "model": "bonsai/bonsai-27b-ternary"
+  "model": "bonsai/bonsai-27b-ternary-text"
 }
 JSON
 chmod 600 "$CONFIG"

@@ -65,6 +65,13 @@ sed -e "s|@ROOT@|$ROOT|g" \
     -e "s|@SPEC@|${BONSAI_SPEC:-ngram-simple}|g" \
     -e "s|@CACHE_REUSE@|${BONSAI_CACHE_REUSE:-256}|g" \
     -e "s|@CACHE_RAM@|${BONSAI_CACHE_RAM:-2048}|g" \
+    -e "s|@CTK@|${BONSAI_CTK:-q4_0}|g" \
+    -e "s|@CTV@|${BONSAI_CTV:-q4_0}|g" \
+    -e "s|@UBATCH@|${BONSAI_UBATCH:-512}|g" \
+    -e "s|@REASONING_BUDGET@|${BONSAI_REASONING_BUDGET:-4096}|g" \
+    -e "s|@NGRAM_MOD_N_MATCH@|${BONSAI_NGRAM_MOD_N_MATCH:-24}|g" \
+    -e "s|@NGRAM_MOD_N_MIN@|${BONSAI_NGRAM_MOD_N_MIN:-48}|g" \
+    -e "s|@NGRAM_MOD_N_MAX@|${BONSAI_NGRAM_MOD_N_MAX:-64}|g" \
     "$ROOT/models.ini.in" > "$PRESET"
 
 echo "server : $SERVER (router)"

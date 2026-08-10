@@ -40,6 +40,13 @@ services:
       #   BONSAI_CTX=32768
       #   BONSAI_NO_KV_OFFLOAD=true   (KV cache lives in system RAM, weights on GPU)
       # BONSAI_NO_KV_OFFLOAD reaches the container via env_file above.
+      # More .env knobs, all via env_file:
+      #   BONSAI_CTK=q8_0 BONSAI_CTV=q8_0   KV type; with host-side KV q8_0 can
+      #     beat q4_0 -- the CPU KV fast path is gated on non-q4 types.
+      #   BONSAI_UBATCH=256   fixes cudaMalloc OOM on 8 GB cards, ~25% slower prefill
+      #   BONSAI_REASONING_BUDGET=4096   caps thinking tokens; -1 = unlimited
+      #   BONSAI_SPEC=ngram-mod   speculative decoding; better than the
+      #   ngram-simple default on repetitive code/tool-call output
       BONSAI_CTX: ${BONSAI_CTX:-8192}
     restart: unless-stopped
 
