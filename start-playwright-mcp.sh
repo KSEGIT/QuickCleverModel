@@ -28,14 +28,17 @@ BROWSER="${PW_MCP_BROWSER:-chrome}"
 # The model can still call browser_snapshot explicitly when it needs the tree,
 # and browser_find gives targeted results.
 #
-# --output-mode file sends snapshot/console/network dumps to disk instead of
-# into the model's context, for the same reason.
+# --output-dir is where snapshot/console/network dumps land. Upstream dropped
+# the old --output-mode flag (gone as of @playwright/mcp 0.0.79 — passing it
+# aborts the server with "unknown option '--output-mode'"); large tool outputs
+# now spill to this directory on their own, with --output-max-size governing
+# eviction. Keep it inside the repo so it stays gitignored.
 exec npx -y @playwright/mcp@latest \
   --port "$PORT" \
   --host 127.0.0.1 \
   --browser "$BROWSER" \
   --isolated \
   --snapshot-mode "${PW_MCP_SNAPSHOT:-none}" \
-  --output-mode file \
+  --output-dir "${PW_MCP_OUTPUT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.playwright-mcp}" \
   --image-responses omit \
   "$@"
