@@ -10,6 +10,8 @@
 #   playwright  :8931  browser tools over MCP         start-playwright-mcp.sh
 #   webui       :9090  Open WebUI chat interface      start-webui.sh
 #
+# Ports shown are defaults; BONSAI_PORT / PW_MCP_PORT / WEBUI_PORT in .env win.
+#
 # Start order matters: llama first (webui probes it for the model list),
 # playwright before webui so the tool server is live when the UI connects.
 set -uo pipefail
@@ -19,9 +21,23 @@ RUN="$ROOT/run"
 LOGS="$RUN/logs"
 mkdir -p "$LOGS"
 
+# Source .env for the same reason the launchers do: each of them honours a port
+# variable (BONSAI_PORT, WEBUI_PORT, PW_MCP_PORT), so if this file hardcoded the
+# ports instead, setting one in .env would start a service on the new port while
+# every probe here — listening, ready, status, stop_one — still watched the old
+# one. `up` would then report the service down and start a duplicate, and `down`
+# would fail to stop it. cmd_up still requires .env to exist; this only reads it.
+[[ -f "$ROOT/.env" ]] && set -a && . "$ROOT/.env" && set +a
+
 SERVICES=(llama playwright webui)
 
-port_of() { case "$1" in llama) echo 8080;; webui) echo 9090;; playwright) echo 8931;; esac; }
+port_of() {
+  case "$1" in
+    llama)      echo "${BONSAI_PORT:-8080}";;
+    webui)      echo "${WEBUI_PORT:-9090}";;
+    playwright) echo "${PW_MCP_PORT:-8931}";;
+  esac
+}
 script_of() {
   case "$1" in
     llama)      echo "$ROOT/start-server.sh";;
@@ -159,7 +175,7 @@ cmd_up() {
   echo
   cmd_status
   echo
-  echo "  chat UI -> http://127.0.0.1:9090"
+  echo "  chat UI -> http://127.0.0.1:$(port_of webui)"
 }
 
 cmd_down() { echo "stopping stack..."; for i in 2 1 0; do stop_one "${SERVICES[$i]}"; done; }
@@ -188,6 +204,6 @@ case "${1:-}" in
   status)  cmd_status;;
   reap)    cmd_reap;;
   logs)    cmd_logs "${2:-}";;
-  open)    (open http://127.0.0.1:9090 2>/dev/null || xdg-open http://127.0.0.1:9090 >/dev/null 2>&1 &);;
+  open)    U="http://127.0.0.1:$(port_of webui)"; (open "$U" 2>/dev/null || xdg-open "$U" >/dev/null 2>&1 &);;
   *) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 1;;
 esac

@@ -12,8 +12,16 @@
 # mismatch — 127.0.0.1 is rejected even though it resolves to the same machine.
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+# .env must be sourced BEFORE the defaults below — it is the one source of
+# truth, so PW_MCP_* in .env wins over them. Every sibling launcher does this
+# (start-server.sh, start-webui.sh, bench.sh); without it the PW_MCP_* entries
+# in .env.example are dead config that silently does nothing.
+[[ -f "$ROOT/.env" ]] && set -a && . "$ROOT/.env" && set +a
+
 PORT="${PW_MCP_PORT:-8931}"
 BROWSER="${PW_MCP_BROWSER:-chrome}"
+OUTPUT_DIR="${PW_MCP_OUTPUT_DIR:-$ROOT/.playwright-mcp}"
 
 # --isolated keeps the profile in memory so runs don't accumulate cookies or
 # touch your real Chrome profile. Drop it to reuse a logged-in profile.
@@ -28,17 +36,26 @@ BROWSER="${PW_MCP_BROWSER:-chrome}"
 # The model can still call browser_snapshot explicitly when it needs the tree,
 # and browser_find gives targeted results.
 #
-# --output-dir is where snapshot/console/network dumps land. Upstream dropped
-# the old --output-mode flag (gone as of @playwright/mcp 0.0.79 — passing it
-# aborts the server with "unknown option '--output-mode'"); large tool outputs
-# now spill to this directory on their own, with --output-max-size governing
-# eviction. Keep it inside the repo so it stays gitignored.
+# --output-dir is where the tools that write files (screenshots, saved
+# sessions, console/network dumps a tool chooses to persist) put them. It
+# replaces the old --output-mode flag, which upstream removed — passing it to
+# @playwright/mcp 0.0.79 aborts the server with "unknown option
+# '--output-mode'". Note this is only a LOCATION, not a routing switch: 0.0.79
+# has no size threshold that diverts a tool response to disk, so response text
+# still reaches the model inline. The context saving here comes entirely from
+# --snapshot-mode above, which is untouched.
+#
+# Not passed: --output-max-size. It caps the directory's total bytes and
+# evicts oldest-first, but the implementation opens with `if (!maxSize)
+# return`, so leaving it unset means no eviction at all and this directory
+# grows without bound. Set PW_MCP_OUTPUT_MAX_SIZE-style pruning here if that
+# ever matters; it is deliberately off because eviction deletes files.
 exec npx -y @playwright/mcp@latest \
   --port "$PORT" \
   --host 127.0.0.1 \
   --browser "$BROWSER" \
   --isolated \
   --snapshot-mode "${PW_MCP_SNAPSHOT:-none}" \
-  --output-dir "${PW_MCP_OUTPUT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.playwright-mcp}" \
+  --output-dir "$OUTPUT_DIR" \
   --image-responses omit \
   "$@"
