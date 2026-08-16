@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command control for the whole local Bonsai stack.
 #
-#   ./stack.sh up | down | restart | status | logs [svc] | open | reap
+#   ./stack.sh up | down | restart | status [--json] | logs [svc] | open | reap
 #
 # Three processes, all native on the host — nothing runs in Docker, because
 # Docker on macOS cannot reach Metal (see docs/architecture.md).
@@ -188,6 +188,22 @@ cmd_status() {
   done
 }
 
+# Machine-readable status. The menu bar app consumes this; the table above is
+# for humans. Keep them separate — the app must never depend on printf layout.
+cmd_status_json() {
+  local first=1 s port pid state
+  printf '['
+  for s in "${SERVICES[@]}"; do
+    port="$(port_of "$s")"; pid="$(listening "$s")"
+    if [[ -n "$pid" ]]; then state=up; else state=down; fi
+    [[ $first -eq 0 ]] && printf ','
+    first=0
+    printf '\n  {"service":"%s","port":%s,"state":"%s","pid":%s}' \
+      "$s" "$port" "$state" "${pid:-null}"
+  done
+  printf '\n]\n'
+}
+
 cmd_logs() {
   local svc="${1:-}"
   if [[ -n "$svc" ]]; then tail -n 60 -f "$LOGS/$svc.log"; return; fi
@@ -201,7 +217,7 @@ case "${1:-}" in
   up)      cmd_up;;
   down)    cmd_down;;
   restart) cmd_down; echo; cmd_up;;
-  status)  cmd_status;;
+  status)  if [[ "${2:-}" == "--json" ]]; then cmd_status_json; else cmd_status; fi;;
   reap)    cmd_reap;;
   logs)    cmd_logs "${2:-}";;
   open)    U="http://127.0.0.1:$(port_of webui)"; (open "$U" 2>/dev/null || xdg-open "$U" >/dev/null 2>&1 &);;
