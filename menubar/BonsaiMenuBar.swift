@@ -133,7 +133,14 @@ final class StackModel: ObservableObject {
     }
 
     /// Runs `path args` to completion. Returns (exit code, stdout).
-    static func capture(_ path: String, _ args: [String]) -> (Int32, String) {
+    ///
+    /// Bounded by `timeout`: a wedged child (e.g. a hung stack.sh) must never
+    /// block the caller forever — `perform()`'s completion block, and with it
+    /// `busy`, must always eventually run so the action buttons re-enable.
+    /// 600s sits comfortably above stack.sh's own ~240s readiness loop and
+    /// the minutes a cold `up` can legitimately take mapping the model, so a
+    /// normal slow restart never trips it.
+    static func capture(_ path: String, _ args: [String], timeout: TimeInterval = 600) -> (Int32, String) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
         // The app is launched by LaunchServices with cwd "/", not the repo
@@ -148,8 +155,27 @@ final class StackModel: ObservableObject {
         proc.standardOutput = pipe
         proc.standardError = Pipe()
         do { try proc.run() } catch { return (-1, "") }
+
+        // Force-terminate if `proc` is still running once `timeout` elapses.
+        // Killing it closes its inherited pipe fds, which is what unblocks
+        // the read below if the child has wedged without exiting.
+        let watchdog = DispatchWorkItem {
+            if proc.isRunning { proc.terminate() }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
+
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
+        watchdog.cancel()
+
+        // A process we killed via the watchdog exits via uncaught SIGTERM,
+        // not a normal exit — treat that (and any other signal death) as
+        // failure regardless of the raw status number, so perform() always
+        // takes its failure path and resets `busy` rather than trusting a
+        // signal number that happens to be zero mod 256.
+        if proc.terminationReason == .uncaughtSignal {
+            return (-1, String(data: data, encoding: .utf8) ?? "")
+        }
         return (proc.terminationStatus, String(data: data, encoding: .utf8) ?? "")
     }
 }
