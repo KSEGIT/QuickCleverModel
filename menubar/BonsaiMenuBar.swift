@@ -90,6 +90,12 @@ final class StackModel: ObservableObject {
     }
 
     func refresh() {
+        // Hold the icon/title during an action — the 15s timer must not
+        // interleave a status poll (and its icon recompute) with an
+        // in-flight Restart/Stop. See docs/superpowers/specs/2026-08-16-
+        // menubar-design.md: the symbol is held for the duration of an
+        // action; only the title row conveys progress.
+        guard busy == nil else { return }
         let path = scriptPath
         guard FileManager.default.isExecutableFile(atPath: path) else {
             scriptMissing = true
@@ -105,6 +111,12 @@ final class StackModel: ObservableObject {
             DispatchQueue.main.async {
                 self.services = parsed
                 self.hasLoaded = true
+                // Clear a stale failure only on genuine recovery (fully up),
+                // not on every poll — the user may have fixed things from a
+                // terminal instead of clicking an action here.
+                if self.state == .allUp {
+                    self.failure = nil
+                }
             }
         }
     }
@@ -116,11 +128,16 @@ final class StackModel: ObservableObject {
         failure = nil
         let path = scriptPath
         DispatchQueue.global(qos: .userInitiated).async {
-            let (code, _) = StackModel.capture(path, [verb])
+            let (code, out) = StackModel.capture(path, [verb])
             DispatchQueue.main.async {
                 self.busy = nil
                 if code != 0 {
-                    self.failure = "⚠ \(label) failed — see logs"
+                    self.logFailure(verb: verb, output: out)
+                    if let last = StackModel.lastNonEmptyLine(out) {
+                        self.failure = "⚠ \(label) failed — \(last)"
+                    } else {
+                        self.failure = "⚠ \(label) failed — see logs"
+                    }
                 }
                 self.refresh()
             }
@@ -132,7 +149,40 @@ final class StackModel: ObservableObject {
             inFileViewerRootedAtPath: root + "/run/logs")
     }
 
-    /// Runs `path args` to completion. Returns (exit code, stdout).
+    /// Appends a FAILED action's captured output to run/logs/menubar.log.
+    /// stack.sh's own diagnostics (e.g. "missing .env — create it with: ...")
+    /// print to stdout/stderr and are otherwise captured then discarded —
+    /// they never reach any of the per-service files under run/logs/, so
+    /// openLogs() pointed at an empty story. Only failures are logged: a
+    /// successful action writes nothing here.
+    private func logFailure(verb: String, output: String) {
+        let dir = root + "/run/logs"
+        let path = dir + "/menubar.log"
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let body = output.isEmpty ? "(no output captured)" : output
+        let entry = "=== \(verb) failed ===\n\(body)\(body.hasSuffix("\n") ? "" : "\n")"
+        guard let data = entry.data(using: .utf8) else { return }
+        if !fm.fileExists(atPath: path) {
+            fm.createFile(atPath: path, contents: nil)
+        }
+        if let handle = FileHandle(forWritingAtPath: path) {
+            defer { try? handle.close() }
+            handle.seekToEndOfFile()
+            handle.write(data)
+        }
+    }
+
+    /// Last non-empty, trimmed line of captured output — a short hint to put
+    /// next to "failed" in the title row. `output` is optional here; when
+    /// there is nothing usable, callers fall back to "see logs".
+    private static func lastNonEmptyLine(_ output: String) -> String? {
+        output.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .last { !$0.isEmpty }
+    }
+
+    /// Runs `path args` to completion. Returns (exit code, combined stdout+stderr).
     ///
     /// Bounded by `timeout`: a wedged child (e.g. a hung stack.sh) must never
     /// block the caller forever — `perform()`'s completion block, and with it
@@ -151,9 +201,16 @@ final class StackModel: ObservableObject {
         // behave the same launched from the app as from a repo-root shell.
         proc.currentDirectoryURL = URL(fileURLWithPath: path).deletingLastPathComponent()
         proc.arguments = args
+        // stderr shares stdout's pipe rather than getting its own unread
+        // Pipe(): an unread pipe fills its ~64 KB kernel buffer and then the
+        // writing child blocks forever on the next write(2) — measured with
+        // a 200 KB-to-stderr child, which deadlocked until the 600s watchdog
+        // fired below. Merging also means a failed action's diagnostics
+        // (e.g. a missing binary's "command not found", which shells write
+        // to stderr) are captured for logFailure() instead of silently lost.
         let pipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = Pipe()
+        proc.standardError = pipe
         do { try proc.run() } catch { return (-1, "") }
 
         // Force-terminate if `proc` is still running once `timeout` elapses.

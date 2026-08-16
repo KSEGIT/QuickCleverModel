@@ -88,3 +88,39 @@ class StatusJsonTest(unittest.TestCase):
         out = run_stack(["status"]).stdout
         self.assertIn("SERVICE", out)
         self.assertIn("llama", out)
+
+
+@unittest.skipIf(env_defines("BONSAI_PORT") or env_defines("PW_MCP_PORT")
+                  or env_defines("WEBUI_PORT"),
+                 ".env pins a port var, which would override the process env "
+                 "below and defeat the port-blackholing this class relies on")
+class StatusJsonDownBranchTest(unittest.TestCase):
+    """Every assertion in StatusJsonTest runs against a live, all-up stack,
+    so cmd_status_json's `down` branch (state="down", pid=null) was never
+    exercised — `test_pid_present_exactly_when_up` passed vacuously for it.
+    Proof of the gap this closes: changing `${pid:-null}` to `${pid:-}` in
+    stack.sh emits `"pid":}` (invalid JSON) for a down service, and every
+    test in this file still passed before this class was added.
+
+    No process faking needed: pointing every port var at a port nothing
+    listens on makes `listening()` return empty for all three services,
+    which is exactly the `down` path.
+    """
+
+    DEAD_PORTS = {"BONSAI_PORT": "19999", "PW_MCP_PORT": "19998",
+                  "WEBUI_PORT": "19997"}
+
+    def setUp(self):
+        proc = run_stack(["status", "--json"], self.DEAD_PORTS)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.raw = proc.stdout
+
+    def test_emits_valid_json_when_all_down(self):
+        json.loads(self.raw)  # the crux of the gap: this must not raise
+
+    def test_every_service_reports_down_with_null_pid(self):
+        entries = json.loads(self.raw)
+        self.assertEqual([e["service"] for e in entries], SERVICES)
+        for entry in entries:
+            self.assertEqual(entry["state"], "down", entry)
+            self.assertIsNone(entry["pid"], entry)
