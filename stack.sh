@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command control for the whole local Bonsai stack.
 #
-#   ./stack.sh up | down | restart | status | logs [svc] | open | reap
+#   ./stack.sh up | down | restart | status [--json] | logs [svc] | open | reap
 #
 # Three processes, all native on the host — nothing runs in Docker, because
 # Docker on macOS cannot reach Metal (see docs/architecture.md).
@@ -17,6 +17,19 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+
+# The menu bar app runs this from a launchd LaunchAgent (see
+# menubar/com.bonsai.menubar.plist.in), and launchd gives every agent a
+# minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin — verified via `launchctl print
+# gui/$(id -u)/com.bonsai.menubar`) that does not include Homebrew. Without
+# this, `npx` (start-playwright-mcp.sh) is unresolvable when launched from the
+# installed app, even though every command here works fine from an
+# interactive shell. Prepend (not replace) so this only adds Homebrew's
+# directories — an existing PATH (e.g. a login shell invoking this directly)
+# is preserved in full, just with lower priority than Homebrew, matching what
+# Homebrew's own shell-profile setup does.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 RUN="$ROOT/run"
 LOGS="$RUN/logs"
 mkdir -p "$LOGS"
@@ -115,7 +128,7 @@ start_one() {
       printf "\r  %-11s ready on :%s (pid %s)\n" "$svc" "$port" "$pid"; return 0
     fi
     # bail out early if the process died rather than waiting the full 4 minutes
-    if grep -qaiE "Traceback|error loading model|failed to load|Address already in use" "$LOGS/$svc.log" 2>/dev/null; then
+    if grep -qaiE "Traceback|error loading model|failed to load|Address already in use|command not found|No such file or directory" "$LOGS/$svc.log" 2>/dev/null; then
       printf "\r  %-11s FAILED — see %s\n" "$svc" "$LOGS/$svc.log"; return 1
     fi
     printf "."; sleep 2
@@ -188,6 +201,22 @@ cmd_status() {
   done
 }
 
+# Machine-readable status. The menu bar app consumes this; the table above is
+# for humans. Keep them separate — the app must never depend on printf layout.
+cmd_status_json() {
+  local first=1 s port pid state
+  printf '['
+  for s in "${SERVICES[@]}"; do
+    port="$(port_of "$s")"; pid="$(listening "$s")"
+    if [[ -n "$pid" ]]; then state=up; else state=down; fi
+    [[ $first -eq 0 ]] && printf ','
+    first=0
+    printf '\n  {"service":"%s","port":%s,"state":"%s","pid":%s}' \
+      "$s" "$port" "$state" "${pid:-null}"
+  done
+  printf '\n]\n'
+}
+
 cmd_logs() {
   local svc="${1:-}"
   if [[ -n "$svc" ]]; then tail -n 60 -f "$LOGS/$svc.log"; return; fi
@@ -201,9 +230,9 @@ case "${1:-}" in
   up)      cmd_up;;
   down)    cmd_down;;
   restart) cmd_down; echo; cmd_up;;
-  status)  cmd_status;;
+  status)  if [[ "${2:-}" == "--json" ]]; then cmd_status_json; else cmd_status; fi;;
   reap)    cmd_reap;;
   logs)    cmd_logs "${2:-}";;
-  open)    U="http://127.0.0.1:$(port_of webui)"; (open "$U" 2>/dev/null || xdg-open "$U" >/dev/null 2>&1 &);;
+  open)    U="http://127.0.0.1:$(port_of webui)"; ( { open "$U" || xdg-open "$U"; } >/dev/null 2>&1 & );;
   *) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 1;;
 esac
