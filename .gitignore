@@ -21,3 +21,6 @@ __pycache__/
 
 # internal agent planning docs — not for publication
 docs/superpowers/
+
+# subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/
