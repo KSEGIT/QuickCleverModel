@@ -261,8 +261,13 @@ struct MenuContent: View {
     var body: some View {
         Text(model.summary)
         Divider()
+        // Emoji, not a coloured Text. SwiftUI's foregroundStyle is ignored on
+        // menu items in MenuBarExtra's .menu style — AppKit draws them with the
+        // system menu colour — so ● would stay grey however it is tinted.
+        // Colouring it for real would mean an NSAttributedString title via a
+        // hand-built NSStatusItem, which is the whole rewrite this app avoids.
         ForEach(model.services) { svc in
-            Text("\(svc.isUp ? "●" : "○")  \(svc.service)  :\(String(svc.port))")
+            Text("\(svc.isUp ? "🟢" : "🔴")  \(svc.service)  :\(String(svc.port))")
         }
         Divider()
         Button("Open chat UI") { model.perform("open", label: "Opening…") }
