@@ -176,10 +176,26 @@ final class StackModel: ObservableObject {
     /// Last non-empty, trimmed line of captured output — a short hint to put
     /// next to "failed" in the title row. `output` is optional here; when
     /// there is nothing usable, callers fall back to "see logs".
+    ///
+    /// stack.sh's start_one() rewrites its progress line with `\r` (a run of
+    /// "." dots followed by the verdict), so progress and verdict share one
+    /// physical line. Splitting on "\n" alone leaves that `\r` and the dots
+    /// embedded in the "last line", and CharacterSet.whitespaces does not
+    /// treat `\r` as whitespace to trim — a timed-out restart would then
+    /// produce a ~290-character menu title with a raw carriage return and
+    /// ~120 progress dots in it. Split on both `\n` and `\r` so only the
+    /// text after the final rewrite survives, and cap the result so a
+    /// pathologically long line still fits an NSMenuItem title.
     private static func lastNonEmptyLine(_ output: String) -> String? {
-        output.split(separator: "\n", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .last { !$0.isEmpty }
+        guard let line = output.split(whereSeparator: { $0 == "\n" || $0 == "\r" })
+            .map({ $0.trimmingCharacters(in: .whitespaces) })
+            .last(where: { !$0.isEmpty })
+        else { return nil }
+        let limit = 80
+        if line.count > limit {
+            return String(line.prefix(limit)) + "…"
+        }
+        return line
     }
 
     /// Runs `path args` to completion. Returns (exit code, combined stdout+stderr).

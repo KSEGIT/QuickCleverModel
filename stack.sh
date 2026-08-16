@@ -233,6 +233,6 @@ case "${1:-}" in
   status)  if [[ "${2:-}" == "--json" ]]; then cmd_status_json; else cmd_status; fi;;
   reap)    cmd_reap;;
   logs)    cmd_logs "${2:-}";;
-  open)    U="http://127.0.0.1:$(port_of webui)"; (open "$U" >/dev/null 2>&1 || xdg-open "$U" >/dev/null 2>&1 &);;
+  open)    U="http://127.0.0.1:$(port_of webui)"; ( { open "$U" || xdg-open "$U"; } >/dev/null 2>&1 & );;
   *) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 1;;
 esac

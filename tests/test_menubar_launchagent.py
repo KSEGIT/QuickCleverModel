@@ -39,3 +39,18 @@ class LaunchAgentTemplateTest(unittest.TestCase):
             target,
             os.path.join(ROOT, "build", "BonsaiMenuBar.app",
                          "Contents", "MacOS", "BonsaiMenuBar"))
+
+    def test_environment_path_includes_homebrew(self):
+        """Regression test for C1: launchd starts this LaunchAgent with a bare
+        PATH (/usr/bin:/bin:/usr/sbin:/sbin — no Homebrew), so stack.sh's own
+        `export PATH=...` normalization (see tests/test_launchd_path.py) is
+        the only thing standing between the app and an unresolvable `npx`
+        when it shells out. That normalization only helps once the process is
+        launched with an environment it can prepend to — if this plist's own
+        EnvironmentVariables/PATH entry regressed (e.g. the key were deleted
+        from the template), the rest of the suite would not catch it, since
+        no other test here inspects EnvironmentVariables at all."""
+        env = self.plist["EnvironmentVariables"]
+        path_entries = env["PATH"].split(":")
+        self.assertIn("/opt/homebrew/bin", path_entries)
+        self.assertIn("/usr/bin", path_entries)

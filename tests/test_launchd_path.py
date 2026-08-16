@@ -22,6 +22,7 @@ regression test for C1, not just a description of it.
 """
 import os
 import subprocess
+import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -60,6 +61,8 @@ def _path_export_line():
     return None
 
 
+@unittest.skipUnless(sys.platform == "darwin",
+                      "launchd PATH behaviour is macOS-specific")
 class LaunchdPathTest(unittest.TestCase):
     def test_stack_sh_exports_a_path_normalization(self):
         self.assertIsNotNone(
