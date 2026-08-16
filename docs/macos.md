@@ -68,7 +68,10 @@ Individual services, if you need them separately:
 ```
 
 Nothing survives a reboot — these are plain user processes, not launchd services.
-Run `make up` again.
+Run `make up` again. (This is about the *stack* — llama/playwright/webui. If
+you've installed the menu bar app below as a LaunchAgent, the app itself does
+survive a reboot and starts at login; its **Restart** item then starts the
+stack for you without needing a terminal.)
 
 Once the Docker registry proxy is working again, the same UI runs in a
 container instead — from the repo root, so interpolation finds the key:
@@ -101,9 +104,14 @@ make menubar-uninstall  # remove the login item
 ```
 
 The icon is a leaf: filled when all three services are up, outline when all
-are down, a warning triangle when only some are. Status refreshes every 15
-seconds; opening the menu does not trigger an immediate refresh (`MenuBarExtra`
-in `.menu` style has no reliable hook for that).
+are down (also shown briefly before the very first status refresh has landed,
+so app launch doesn't flash a warning), and a warning triangle when only some
+services are up — or when `stack.sh` is missing, or a completed refresh
+returned status that couldn't be read. Status refreshes every 15 seconds;
+opening the menu does not trigger an immediate refresh (`MenuBarExtra` in
+`.menu` style has no reliable hook for that). The icon is held for the
+duration of a Restart/Stop action — progress during an action is shown in the
+title row, not by the icon changing.
 
 With the stack down, **Restart** is what starts it — `stack.sh restart` is
 `down` then `up`, so there is no separate Start item.
@@ -111,6 +119,14 @@ With the stack down, **Restart** is what starts it — `stack.sh restart` is
 The app is a thin client over `stack.sh`; it reads `./stack.sh status --json`
 and shells out for actions. Ports come from `port_of`, so `BONSAI_PORT`,
 `PW_MCP_PORT` and `WEBUI_PORT` in `.env` are honored.
+
+Moving or renaming the repo directory breaks both the built app's `BonsaiRoot`
+(baked into `Info.plist` at build time — the path it runs `stack.sh` from)
+and the installed LaunchAgent's `ProgramArguments` (baked into
+`~/Library/LaunchAgents/com.bonsai.menubar.plist` at install time — the path
+launchd runs the app binary from): both are absolute paths pointing at the
+old location. Run `make menubar-install` again after moving the repo to
+regenerate both.
 
 ## Thinking mode
 
@@ -211,7 +227,8 @@ models.ini.in                       model preset template -> run/models.ini
 fetch-models.sh                     weight downloader (make models)
 start-webui.sh                      native Open WebUI launcher (:9090)
 cache-viz.py                        live prompt-cache dashboard (:8090)
-tests/                              stdlib unittest suite for cache-viz.py
+menubar/                            native SwiftUI menu bar app (make menubar / menubar-install)
+tests/                              stdlib unittest suite: cache-viz.py, stack.sh, and the menu bar app
 docs/PRD.md                         product requirements document
 docs/architecture.md                system architecture (both platforms, request flow, ports & security)
 docs/decisions.md                   design decisions and why

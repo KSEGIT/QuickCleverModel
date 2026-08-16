@@ -86,9 +86,9 @@ constraints, and `brew install --cask swiftbar` becomes a prerequisite for a
 repo that otherwise needs only what macOS ships.
 
 Xcode is already present on this machine, and a single-file SwiftUI
-`MenuBarExtra` has no runtime dependencies at all. The cost is ~150 lines of
-Swift instead of ~30 lines of bash, plus a build step — `make menubar` needs
-Xcode, while `make up` does not.
+`MenuBarExtra` has no runtime dependencies at all. The cost is a few hundred
+lines of Swift instead of ~30 lines of bash, plus a build step — `make
+menubar` needs Xcode, while `make up` does not.
 
 Compiled with `-swift-version 5`: Swift 6 strict concurrency rejects the
 `DispatchQueue` hand-off between the status poller and the UI, and adopting
