@@ -27,6 +27,14 @@ enum StackState {
 final class StackModel: ObservableObject {
     @Published private(set) var services: [ServiceStatus] = []
     @Published private(set) var scriptMissing = false
+    /// True once the first `status --json` round-trip has completed (or been
+    /// short-circuited by a missing script), so the brief window before the
+    /// very first refresh lands doesn't masquerade as a real warning.
+    @Published private(set) var hasLoaded = false
+    /// Non-nil while an action is running, e.g. "Restarting…".
+    @Published private(set) var busy: String?
+    /// Non-nil after an action exits non-zero. Cleared when the next starts.
+    @Published private(set) var failure: String?
 
     let root: String
     private var timer: Timer?
@@ -35,9 +43,15 @@ final class StackModel: ObservableObject {
         self.root = root
         refresh()
         // 15s, not 1s: each status shells out to lsof once per service.
-        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+        // Scheduled manually (not via .scheduledTimer) and added in .common
+        // modes: while the MenuBarExtra dropdown is open, AppKit runs the
+        // run loop in .eventTracking mode, and .default-mode timers (what
+        // .scheduledTimer uses) simply don't fire during that window.
+        let t = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     var scriptPath: String { root + "/stack.sh" }
@@ -54,11 +68,18 @@ final class StackModel: ObservableObject {
         switch state {
         case .allUp:   return "leaf.fill"
         case .allDown: return "leaf"
-        default:       return "exclamationmark.triangle"
+        case .partial: return "exclamationmark.triangle"
+        // Warn for a real problem (missing script, or a completed refresh
+        // that still came back empty/undecodable) — not for the brief
+        // window before the very first refresh has landed.
+        case .unknown: return (scriptMissing || hasLoaded) ? "exclamationmark.triangle"
+                                                            : "leaf"
         }
     }
 
     var summary: String {
+        if let busy { return busy }
+        if let failure { return failure }
         switch state {
         case .allUp:   return "Bonsai stack — running"
         case .allDown: return "Bonsai stack — stopped"
@@ -73,6 +94,7 @@ final class StackModel: ObservableObject {
         guard FileManager.default.isExecutableFile(atPath: path) else {
             scriptMissing = true
             services = []
+            hasLoaded = true
             return
         }
         scriptMissing = false
@@ -80,14 +102,47 @@ final class StackModel: ObservableObject {
             let (_, out) = StackModel.capture(path, ["status", "--json"])
             let parsed = (try? JSONDecoder().decode([ServiceStatus].self,
                                                     from: Data(out.utf8))) ?? []
-            DispatchQueue.main.async { self.services = parsed }
+            DispatchQueue.main.async {
+                self.services = parsed
+                self.hasLoaded = true
+            }
         }
+    }
+
+    /// Runs a stack.sh verb off the main thread. Never blocks the UI.
+    func perform(_ verb: String, label: String) {
+        guard busy == nil else { return }   // one action at a time
+        busy = label
+        failure = nil
+        let path = scriptPath
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (code, _) = StackModel.capture(path, [verb])
+            DispatchQueue.main.async {
+                self.busy = nil
+                if code != 0 {
+                    self.failure = "⚠ \(label) failed — see logs"
+                }
+                self.refresh()
+            }
+        }
+    }
+
+    func openLogs() {
+        NSWorkspace.shared.selectFile(nil,
+            inFileViewerRootedAtPath: root + "/run/logs")
     }
 
     /// Runs `path args` to completion. Returns (exit code, stdout).
     static func capture(_ path: String, _ args: [String]) -> (Int32, String) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
+        // The app is launched by LaunchServices with cwd "/", not the repo
+        // root. stack.sh itself resolves paths via dirname($0) so that's
+        // fine, but children it execs (e.g. open-webui, whose secret-key
+        // file defaults to Path.cwd()/.webui_secret_key) inherit our cwd
+        // verbatim. Pin it to the script's directory so `up`/`restart`
+        // behave the same launched from the app as from a repo-root shell.
+        proc.currentDirectoryURL = URL(fileURLWithPath: path).deletingLastPathComponent()
         proc.arguments = args
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -109,6 +164,16 @@ struct MenuContent: View {
         Divider()
         ForEach(model.services) { svc in
             Text("\(svc.isUp ? "●" : "○")  \(svc.service)  :\(String(svc.port))")
+        }
+        Divider()
+        Button("Open chat UI") { model.perform("open", label: "Opening…") }
+            .disabled(model.busy != nil || model.scriptMissing)
+        Button("Restart") { model.perform("restart", label: "Restarting…") }
+            .disabled(model.busy != nil || model.scriptMissing)
+        Button("Stop") { model.perform("down", label: "Stopping…") }
+            .disabled(model.busy != nil || model.scriptMissing)
+        if model.failure != nil {
+            Button("Open logs") { model.openLogs() }
         }
         Divider()
         Button("Quit") { NSApplication.shared.terminate(nil) }
