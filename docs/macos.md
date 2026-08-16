@@ -68,6 +68,27 @@ Individual services, if you need them separately:
 ```
 
 Nothing survives a reboot — these are plain user processes, not launchd services.
+
+## Menu bar control
+
+A small native app shows stack state and offers whole-stack Restart and Stop.
+
+```bash
+make menubar            # build it (needs Xcode)
+make menubar-install    # build + start at login
+make menubar-uninstall  # remove the login item
+```
+
+The icon is a leaf: filled when all three services are up, outline when all
+are down, a warning triangle when only some are. Status refreshes every 15
+seconds.
+
+With the stack down, **Restart** is what starts it — `stack.sh restart` is
+`down` then `up`, so there is no separate Start item.
+
+The app is a thin client over `stack.sh`; it reads `./stack.sh status --json`
+and shells out for actions. Ports come from `port_of`, so `BONSAI_PORT`,
+`PW_MCP_PORT` and `WEBUI_PORT` in `.env` are honored.
 Run `make up` again.
 
 Once the Docker registry proxy is working again, the same UI runs in a
