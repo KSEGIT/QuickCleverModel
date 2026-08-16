@@ -272,10 +272,19 @@ struct MenuContent: View {
         Divider()
         Button("Open chat UI") { model.perform("open", label: "Opening…") }
             .disabled(model.busy != nil || model.scriptMissing)
-        Button("Restart") { model.perform("restart", label: "Restarting…") }
-            .disabled(model.busy != nil || model.scriptMissing)
-        Button("Stop") { model.perform("down", label: "Stopping…") }
-            .disabled(model.busy != nil || model.scriptMissing)
+        // The actions track the stack's state: Stop on a stopped stack is a
+        // no-op, and asking for Restart to mean "start" is a riddle. Safe to
+        // switch on `state` because refresh() is guarded while an action runs,
+        // so the menu cannot flip Stop -> Start mid-restart.
+        if model.state == .allDown {
+            Button("Start") { model.perform("up", label: "Starting…") }
+                .disabled(model.busy != nil || model.scriptMissing)
+        } else {
+            Button("Restart") { model.perform("restart", label: "Restarting…") }
+                .disabled(model.busy != nil || model.scriptMissing)
+            Button("Stop") { model.perform("down", label: "Stopping…") }
+                .disabled(model.busy != nil || model.scriptMissing)
+        }
         if model.failure != nil {
             Button("Open logs") { model.openLogs() }
         }

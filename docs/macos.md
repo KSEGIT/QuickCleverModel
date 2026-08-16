@@ -113,8 +113,10 @@ opening the menu does not trigger an immediate refresh (`MenuBarExtra` in
 duration of a Restart/Stop action — progress during an action is shown in the
 title row, not by the icon changing.
 
-With the stack down, **Restart** is what starts it — `stack.sh restart` is
-`down` then `up`, so there is no separate Start item.
+The actions follow the stack's state: while it is running the menu offers
+**Restart** and **Stop**; once everything is down those are replaced by a
+single **Start**. Stopping an already-stopped stack is a no-op, so the menu
+does not offer it.
 
 The app is a thin client over `stack.sh`; it reads `./stack.sh status --json`
 and shells out for actions. Ports come from `port_of`, so `BONSAI_PORT`,
