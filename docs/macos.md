@@ -79,6 +79,17 @@ docker compose --env-file .env -f docker/compose.yaml up -d
 
 It points at `host.docker.internal:8080`.
 
+Tunables (env): `BONSAI_CTX` (default 32768), `BONSAI_PORT`, `BONSAI_HOST`,
+`BONSAI_MODELS_MAX` (default 1 — see
+[architecture.md](architecture.md#model-selection)). The model trains to
+262144 context; that KV cache will not fit in 24 GB, hence the lower default.
+Extra `llama-server` flags pass straight through to the **router**:
+
+```bash
+./start-server.sh --reasoning off        # disable thinking mode
+./start-server.sh --reasoning-budget 256 # cap thinking tokens
+```
+
 ## Menu bar control
 
 A small native app shows stack state and offers whole-stack Restart and Stop.
@@ -100,17 +111,6 @@ With the stack down, **Restart** is what starts it — `stack.sh restart` is
 The app is a thin client over `stack.sh`; it reads `./stack.sh status --json`
 and shells out for actions. Ports come from `port_of`, so `BONSAI_PORT`,
 `PW_MCP_PORT` and `WEBUI_PORT` in `.env` are honored.
-
-Tunables (env): `BONSAI_CTX` (default 32768), `BONSAI_PORT`, `BONSAI_HOST`,
-`BONSAI_MODELS_MAX` (default 1 — see
-[architecture.md](architecture.md#model-selection)). The model trains to
-262144 context; that KV cache will not fit in 24 GB, hence the lower default.
-Extra `llama-server` flags pass straight through to the **router**:
-
-```bash
-./start-server.sh --reasoning off        # disable thinking mode
-./start-server.sh --reasoning-budget 256 # cap thinking tokens
-```
 
 ## Thinking mode
 
