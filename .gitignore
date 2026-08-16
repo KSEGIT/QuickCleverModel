@@ -8,6 +8,9 @@ models/
 src/
 bin/
 
+# compiled menu bar app
+build/
+
 # runtime state
 run/
 .webui-data/

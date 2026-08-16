@@ -1,5 +1,7 @@
 # Thin wrapper over stack.sh so `make up` works alongside `./stack.sh up`.
-.PHONY: help up down restart status logs open bench reap cache-viz models
+.PHONY: help up down restart status logs open bench reap cache-viz models menubar
+
+APP := build/BonsaiMenuBar.app
 
 help:           ## Show this help
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-9s\033[0m %s\n",$$1,$$2}'
@@ -36,3 +38,10 @@ open:           ## Open the chat UI
 
 bench:          ## Median throughput over N reps — make bench MODEL=bonsai-27b-1bit REPS=9
 	@./bench.sh -n "$(or $(REPS),5)" -m "$(or $(MODEL),bonsai-27b-ternary)"
+
+menubar:        ## Build the menu bar app into build/ (needs Xcode)
+	@mkdir -p $(APP)/Contents/MacOS
+	@sed -e "s|@ROOT@|$(CURDIR)|g" menubar/Info.plist.in > $(APP)/Contents/Info.plist
+	@swiftc -O -swift-version 5 -parse-as-library \
+	  -o $(APP)/Contents/MacOS/BonsaiMenuBar menubar/BonsaiMenuBar.swift
+	@echo "  built $(APP)"
