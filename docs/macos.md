@@ -68,6 +68,16 @@ Individual services, if you need them separately:
 ```
 
 Nothing survives a reboot — these are plain user processes, not launchd services.
+Run `make up` again.
+
+Once the Docker registry proxy is working again, the same UI runs in a
+container instead — from the repo root, so interpolation finds the key:
+
+```bash
+docker compose --env-file .env -f docker/compose.yaml up -d
+```
+
+It points at `host.docker.internal:8080`.
 
 ## Menu bar control
 
@@ -81,7 +91,8 @@ make menubar-uninstall  # remove the login item
 
 The icon is a leaf: filled when all three services are up, outline when all
 are down, a warning triangle when only some are. Status refreshes every 15
-seconds.
+seconds; opening the menu does not trigger an immediate refresh (`MenuBarExtra`
+in `.menu` style has no reliable hook for that).
 
 With the stack down, **Restart** is what starts it — `stack.sh restart` is
 `down` then `up`, so there is no separate Start item.
@@ -89,16 +100,6 @@ With the stack down, **Restart** is what starts it — `stack.sh restart` is
 The app is a thin client over `stack.sh`; it reads `./stack.sh status --json`
 and shells out for actions. Ports come from `port_of`, so `BONSAI_PORT`,
 `PW_MCP_PORT` and `WEBUI_PORT` in `.env` are honored.
-Run `make up` again.
-
-Once the Docker registry proxy is working again, the same UI runs in a
-container instead — from the repo root, so interpolation finds the key:
-
-```bash
-docker compose --env-file .env -f docker/compose.yaml up -d
-```
-
-It points at `host.docker.internal:8080`.
 
 Tunables (env): `BONSAI_CTX` (default 32768), `BONSAI_PORT`, `BONSAI_HOST`,
 `BONSAI_MODELS_MAX` (default 1 — see
