@@ -38,6 +38,10 @@ final class StackModel: ObservableObject {
 
     let root: String
     private var timer: Timer?
+    /// Bumped whenever an action starts, so a status poll already in flight
+    /// cannot land afterwards and overwrite the post-action state. Main-thread
+    /// only, like every other mutable property here.
+    private var refreshGeneration = 0
 
     init(root: String) {
         self.root = root
@@ -104,11 +108,18 @@ final class StackModel: ObservableObject {
             return
         }
         scriptMissing = false
+        // A poll already in flight when an action starts would land AFTER the
+        // action's own post-completion refresh and overwrite it with pre-action
+        // state, leaving the menu wrong for up to 15s. The `busy` guard above
+        // cannot catch that — it runs at start, not at completion. Stamp each
+        // poll with a generation and drop results that are no longer current.
+        let generation = refreshGeneration
         DispatchQueue.global(qos: .utility).async {
             let (_, out) = StackModel.capture(path, ["status", "--json"])
             let parsed = (try? JSONDecoder().decode([ServiceStatus].self,
                                                     from: Data(out.utf8))) ?? []
             DispatchQueue.main.async {
+                guard generation == self.refreshGeneration, self.busy == nil else { return }
                 self.services = parsed
                 self.hasLoaded = true
                 // Clear a stale failure only on genuine recovery (fully up),
@@ -126,6 +137,7 @@ final class StackModel: ObservableObject {
         guard busy == nil else { return }   // one action at a time
         busy = label
         failure = nil
+        refreshGeneration &+= 1   // invalidate any poll already in flight
         let path = scriptPath
         DispatchQueue.global(qos: .userInitiated).async {
             let (code, out) = StackModel.capture(path, [verb])
@@ -163,13 +175,29 @@ final class StackModel: ObservableObject {
         let body = output.isEmpty ? "(no output captured)" : output
         let entry = "=== \(verb) failed ===\n\(body)\(body.hasSuffix("\n") ? "" : "\n")"
         guard let data = entry.data(using: .utf8) else { return }
+        // Rotate before appending: nothing else prunes this file, and a stack
+        // that fails repeatedly would otherwise grow it without bound. One
+        // generation of history is enough to diagnose the last failure.
+        let maxBytes = 1 << 20   // 1 MiB
+        if let size = (try? fm.attributesOfItem(atPath: path)[.size]) as? NSNumber,
+           size.intValue > maxBytes {
+            try? fm.removeItem(atPath: path + ".1")
+            try? fm.moveItem(atPath: path, toPath: path + ".1")
+        }
         if !fm.fileExists(atPath: path) {
             fm.createFile(atPath: path, contents: nil)
         }
+        // Throwing variants deliberately: seekToEndOfFile()/write(_:) raise an
+        // uncatchable ObjC exception when the disk is full, which would take
+        // the whole app down over a log line.
         if let handle = FileHandle(forWritingAtPath: path) {
             defer { try? handle.close() }
-            handle.seekToEndOfFile()
-            handle.write(data)
+            do {
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            } catch {
+                return   // logging is best-effort; never fail an action over it
+            }
         }
     }
 

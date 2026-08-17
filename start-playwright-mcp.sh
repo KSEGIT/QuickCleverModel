@@ -45,11 +45,20 @@ OUTPUT_DIR="${PW_MCP_OUTPUT_DIR:-$ROOT/.playwright-mcp}"
 # still reaches the model inline. The context saving here comes entirely from
 # --snapshot-mode above, which is untouched.
 #
-# Not passed: --output-max-size. It caps the directory's total bytes and
-# evicts oldest-first, but the implementation opens with `if (!maxSize)
-# return`, so leaving it unset means no eviction at all and this directory
-# grows without bound. Set PW_MCP_OUTPUT_MAX_SIZE-style pruning here if that
-# ever matters; it is deliberately off because eviction deletes files.
+# --output-max-size caps the output directory's total bytes, evicting
+# oldest-first. Upstream's implementation opens with `if (!maxSize) return`, so
+# leaving it unset means no eviction at all and screenshots/snapshots/traces
+# accumulate until the disk fills. Default to a generous 512 MiB — far above
+# anything a normal session produces, so in practice it only ever trims
+# long-forgotten artifacts. Set PW_MCP_OUTPUT_MAX_SIZE=0 to opt out entirely
+# and keep everything forever.
+#
+# Note this DELETES files once the cap is exceeded, oldest first. Point
+# PW_MCP_OUTPUT_DIR somewhere else if you need artifacts kept permanently.
+OUTPUT_MAX_SIZE="${PW_MCP_OUTPUT_MAX_SIZE:-536870912}"
+MAX_SIZE_ARGS=(--output-max-size "$OUTPUT_MAX_SIZE")
+[[ "$OUTPUT_MAX_SIZE" == "0" ]] && MAX_SIZE_ARGS=()
+
 exec npx -y @playwright/mcp@latest \
   --port "$PORT" \
   --host 127.0.0.1 \
@@ -57,5 +66,6 @@ exec npx -y @playwright/mcp@latest \
   --isolated \
   --snapshot-mode "${PW_MCP_SNAPSHOT:-none}" \
   --output-dir "$OUTPUT_DIR" \
+  "${MAX_SIZE_ARGS[@]}" \
   --image-responses omit \
   "$@"

@@ -18,18 +18,6 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-# The menu bar app runs this from a launchd LaunchAgent (see
-# menubar/com.bonsai.menubar.plist.in), and launchd gives every agent a
-# minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin — verified via `launchctl print
-# gui/$(id -u)/com.bonsai.menubar`) that does not include Homebrew. Without
-# this, `npx` (start-playwright-mcp.sh) is unresolvable when launched from the
-# installed app, even though every command here works fine from an
-# interactive shell. Prepend (not replace) so this only adds Homebrew's
-# directories — an existing PATH (e.g. a login shell invoking this directly)
-# is preserved in full, just with lower priority than Homebrew, matching what
-# Homebrew's own shell-profile setup does.
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-
 RUN="$ROOT/run"
 LOGS="$RUN/logs"
 mkdir -p "$LOGS"
@@ -42,6 +30,18 @@ mkdir -p "$LOGS"
 # would fail to stop it. cmd_up still requires .env to exist; this only reads it.
 [[ -f "$ROOT/.env" ]] && set -a && . "$ROOT/.env" && set +a
 
+# AFTER the .env source, deliberately. The menu bar app runs this from a launchd
+# LaunchAgent (see menubar/com.bonsai.menubar.plist.in), and launchd gives every
+# agent a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin — verified via `launchctl
+# print gui/$(id -u)/com.bonsai.menubar`) that does not include Homebrew.
+# Without this, `npx` (start-playwright-mcp.sh) is unresolvable when launched
+# from the installed app, even though every command here works from an
+# interactive shell. `.env` is sourced with `set -a`, so a PATH= line there
+# would otherwise replace this wholesale and silently reinstate the bug.
+# Prepend (not replace) so an existing PATH is preserved in full, just below
+# Homebrew — matching what Homebrew's own shell-profile setup does.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 SERVICES=(llama playwright webui)
 
 port_of() {
@@ -50,6 +50,21 @@ port_of() {
     webui)      echo "${WEBUI_PORT:-9090}";;
     playwright) echo "${PW_MCP_PORT:-8931}";;
   esac
+}
+
+# Ports come straight from .env, and `status --json` emits them as bare JSON
+# numbers. A typo like WEBUI_PORT=invalid would produce `"port":invalid` —
+# invalid JSON, which the menu bar app decodes as an empty service list and
+# renders as a silent warning triangle. Fail loudly at the source instead.
+validate_ports() {
+  local svc port
+  for svc in "${SERVICES[@]}"; do
+    port="$(port_of "$svc")"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+      echo "invalid port for $svc: '$port' — must be an integer 1-65535 (check .env)" >&2
+      exit 1
+    fi
+  done
 }
 script_of() {
   case "$1" in
@@ -225,6 +240,8 @@ cmd_logs() {
   [[ -e "${logs[0]}" ]] || { echo "no logs yet — run: ./stack.sh up"; return 1; }
   tail -n 40 -f "${logs[@]}"
 }
+
+validate_ports
 
 case "${1:-}" in
   up)      cmd_up;;
