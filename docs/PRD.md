@@ -60,6 +60,8 @@ generation with the shipped tuning. An RTX 4060 Laptop (256 GB/s) runs the same
 | F8 | Reproducible CUDA build of the fork, pinned commit, multi-stage Dockerfile | ✅ (build unverified on real hardware) |
 | F9 | Prompt-cache dashboard (`cache-viz.py`) + unittest suite | ✅ |
 | F10 | Thinking mode on by default; `--reasoning off` / `--reasoning-budget` passthrough | ✅ |
+| F11 | macOS menu bar app: at-a-glance stack status and whole-stack Start/Restart/Stop, installed as a login item (`make menubar-install`) | ✅ |
+| F12 | Machine-readable stack status (`./stack.sh status --json`) as the contract between the control UI and the stack | ✅ |
 
 `install.sh` is the one-command installer for the Linux+NVIDIA path — it orchestrates F6–F8 (weights, host setup, CUDA build) end to end.
 
