@@ -90,7 +90,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 Useful commands:
 
 - macOS: `make up` start, `make down` stop, `make status` check, `make logs`
-  watch logs, `make bench` measure speed.
+  watch logs, `make bench` measure speed, `make menubar-install` for a menu
+  bar icon with stack status and restart/stop.
 - Linux: `docker compose --env-file .env -f docker/compose.linux.yaml up -d`
   to start, same command with `down` to stop.
 

@@ -267,3 +267,11 @@ another machine): two options.
   to recreate. This exposes the **unauthenticated** UI to your whole tailnet —
   fine on a personal tailnet, otherwise flip `WEBUI_AUTH` to `true` first.
   `LLAMA_BIND` does the same for :8080 (the API key is enforced there).
+
+On macOS, `make menubar-install` adds `stack.sh` execution as a persistent,
+login-session trigger: the installed LaunchAgent starts the menu bar app at
+login, and it runs `stack.sh status --json` on a 15s timer plus `stack.sh`
+verbs on every action for as long as the user is logged in. Write access to
+`stack.sh` (or to anything on its `PATH`) is therefore equivalent to code
+execution in that user's session, not just at the moment someone happens to
+run `./stack.sh` by hand.

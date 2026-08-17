@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command control for the whole local Bonsai stack.
 #
-#   ./stack.sh up | down | restart | status | logs [svc] | open | reap
+#   ./stack.sh up | down | restart | status [--json] | logs [svc] | open | reap
 #
 # Three processes, all native on the host — nothing runs in Docker, because
 # Docker on macOS cannot reach Metal (see docs/architecture.md).
@@ -10,18 +10,62 @@
 #   playwright  :8931  browser tools over MCP         start-playwright-mcp.sh
 #   webui       :9090  Open WebUI chat interface      start-webui.sh
 #
+# Ports shown are defaults; BONSAI_PORT / PW_MCP_PORT / WEBUI_PORT in .env win.
+#
 # Start order matters: llama first (webui probes it for the model list),
 # playwright before webui so the tool server is live when the UI connects.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+
 RUN="$ROOT/run"
 LOGS="$RUN/logs"
 mkdir -p "$LOGS"
 
+# Source .env for the same reason the launchers do: each of them honours a port
+# variable (BONSAI_PORT, WEBUI_PORT, PW_MCP_PORT), so if this file hardcoded the
+# ports instead, setting one in .env would start a service on the new port while
+# every probe here — listening, ready, status, stop_one — still watched the old
+# one. `up` would then report the service down and start a duplicate, and `down`
+# would fail to stop it. cmd_up still requires .env to exist; this only reads it.
+[[ -f "$ROOT/.env" ]] && set -a && . "$ROOT/.env" && set +a
+
+# AFTER the .env source, deliberately. The menu bar app runs this from a launchd
+# LaunchAgent (see menubar/com.bonsai.menubar.plist.in), and launchd gives every
+# agent a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin — verified via `launchctl
+# print gui/$(id -u)/com.bonsai.menubar`) that does not include Homebrew.
+# Without this, `npx` (start-playwright-mcp.sh) is unresolvable when launched
+# from the installed app, even though every command here works from an
+# interactive shell. `.env` is sourced with `set -a`, so a PATH= line there
+# would otherwise replace this wholesale and silently reinstate the bug.
+# Prepend (not replace) so an existing PATH is preserved in full, just below
+# Homebrew — matching what Homebrew's own shell-profile setup does.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 SERVICES=(llama playwright webui)
 
-port_of() { case "$1" in llama) echo 8080;; webui) echo 9090;; playwright) echo 8931;; esac; }
+port_of() {
+  case "$1" in
+    llama)      echo "${BONSAI_PORT:-8080}";;
+    webui)      echo "${WEBUI_PORT:-9090}";;
+    playwright) echo "${PW_MCP_PORT:-8931}";;
+  esac
+}
+
+# Ports come straight from .env, and `status --json` emits them as bare JSON
+# numbers. A typo like WEBUI_PORT=invalid would produce `"port":invalid` —
+# invalid JSON, which the menu bar app decodes as an empty service list and
+# renders as a silent warning triangle. Fail loudly at the source instead.
+validate_ports() {
+  local svc port
+  for svc in "${SERVICES[@]}"; do
+    port="$(port_of "$svc")"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+      echo "invalid port for $svc: '$port' — must be an integer 1-65535 (check .env)" >&2
+      exit 1
+    fi
+  done
+}
 script_of() {
   case "$1" in
     llama)      echo "$ROOT/start-server.sh";;
@@ -99,7 +143,7 @@ start_one() {
       printf "\r  %-11s ready on :%s (pid %s)\n" "$svc" "$port" "$pid"; return 0
     fi
     # bail out early if the process died rather than waiting the full 4 minutes
-    if grep -qaiE "Traceback|error loading model|failed to load|Address already in use" "$LOGS/$svc.log" 2>/dev/null; then
+    if grep -qaiE "Traceback|error loading model|failed to load|Address already in use|command not found|No such file or directory" "$LOGS/$svc.log" 2>/dev/null; then
       printf "\r  %-11s FAILED — see %s\n" "$svc" "$LOGS/$svc.log"; return 1
     fi
     printf "."; sleep 2
@@ -159,7 +203,7 @@ cmd_up() {
   echo
   cmd_status
   echo
-  echo "  chat UI -> http://127.0.0.1:9090"
+  echo "  chat UI -> http://127.0.0.1:$(port_of webui)"
 }
 
 cmd_down() { echo "stopping stack..."; for i in 2 1 0; do stop_one "${SERVICES[$i]}"; done; }
@@ -172,6 +216,22 @@ cmd_status() {
   done
 }
 
+# Machine-readable status. The menu bar app consumes this; the table above is
+# for humans. Keep them separate — the app must never depend on printf layout.
+cmd_status_json() {
+  local first=1 s port pid state
+  printf '['
+  for s in "${SERVICES[@]}"; do
+    port="$(port_of "$s")"; pid="$(listening "$s")"
+    if [[ -n "$pid" ]]; then state=up; else state=down; fi
+    [[ $first -eq 0 ]] && printf ','
+    first=0
+    printf '\n  {"service":"%s","port":%s,"state":"%s","pid":%s}' \
+      "$s" "$port" "$state" "${pid:-null}"
+  done
+  printf '\n]\n'
+}
+
 cmd_logs() {
   local svc="${1:-}"
   if [[ -n "$svc" ]]; then tail -n 60 -f "$LOGS/$svc.log"; return; fi
@@ -181,13 +241,15 @@ cmd_logs() {
   tail -n 40 -f "${logs[@]}"
 }
 
+validate_ports
+
 case "${1:-}" in
   up)      cmd_up;;
   down)    cmd_down;;
   restart) cmd_down; echo; cmd_up;;
-  status)  cmd_status;;
+  status)  if [[ "${2:-}" == "--json" ]]; then cmd_status_json; else cmd_status; fi;;
   reap)    cmd_reap;;
   logs)    cmd_logs "${2:-}";;
-  open)    (open http://127.0.0.1:9090 2>/dev/null || xdg-open http://127.0.0.1:9090 >/dev/null 2>&1 &);;
+  open)    U="http://127.0.0.1:$(port_of webui)"; ( { open "$U" || xdg-open "$U"; } >/dev/null 2>&1 & );;
   *) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 1;;
 esac

@@ -76,3 +76,20 @@ box already holding 6.7 GB of weights wired by Metal, letting the prompt cache
 grow to 8 GB is what pushes the weights out to swap — measured at 13.5 GB of
 page-ins during a single benchmark run. The cap keeps multi-turn reuse (a few
 checkpoints of ~150 MiB each) without competing with the weights for RAM.
+
+## Menu bar app is native Swift, not SwiftBar
+
+SwiftBar or xbar would have made this a 30-line bash script that prints menu
+lines. Rejected because it puts a third-party app between the user and the
+stack: the thing in the menu bar would be SwiftBar, with its formatting
+constraints, and `brew install --cask swiftbar` becomes a prerequisite for a
+repo that otherwise needs only what macOS ships.
+
+Xcode is already present on this machine, and a single-file SwiftUI
+`MenuBarExtra` has no runtime dependencies at all. The cost is a few hundred
+lines of Swift instead of ~30 lines of bash, plus a build step — `make
+menubar` needs Xcode, while `make up` does not.
+
+Compiled with `-swift-version 5`: Swift 6 strict concurrency rejects the
+`DispatchQueue` hand-off between the status poller and the UI, and adopting
+full actor isolation is not worth it for one file.
