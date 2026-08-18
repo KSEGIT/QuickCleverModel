@@ -130,6 +130,34 @@ launchd runs the app binary from): both are absolute paths pointing at the
 old location. Run `make menubar-install` again after moving the repo to
 regenerate both.
 
+## Hosted models (optional)
+
+The stack is local-only by default. Setting `HETZNER_API_KEY` in `.env` adds
+Hetzner's hosted open-weight models (Qwen3.6-35B-A3B-FP8, Qwen3.8-27B) to the
+same Open WebUI dropdown as the local Bonsai models — useful for comparing
+against a larger model without more hardware.
+
+```bash
+# .env
+HETZNER_API_KEY=<your token>
+```
+
+Restart the stack and both providers appear together. Unset the key and it is
+local again; nothing else changes.
+
+**This sends prompts off the machine.** Everything else here runs locally.
+Hetzner state they keep usage metadata only, not request or response content.
+Their rate limit is 10 requests per 60s, which is low for a chat UI — this
+stack already disables Open WebUI's background title/tag/follow-up generation,
+which would otherwise consume that budget quickly.
+
+`.env` is the only source of truth for connections: `start-webui.sh` sets
+`ENABLE_PERSISTENT_CONFIG=False`, because Open WebUI otherwise stores
+connections in its own database and that copy wins over the environment on
+every later start — an edited `.env` would silently do nothing. The trade-off
+is that connection settings changed in the admin UI no longer survive a
+restart; change them in `.env` instead.
+
 ## Thinking mode
 
 The model reasons by default: short `max_tokens` yields an **empty `content`**
