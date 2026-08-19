@@ -70,23 +70,37 @@ if [[ -z "${BONSAI_SERVER_URL:-}" && -z "${BONSAI_HOST:-}" && "$MODE" != check &
     # Accept either a bare host/IP or a full URL.
     [[ "$reply" == http*://* ]] || reply="http://$reply:${BONSAI_PORT:-8080}/v1"
     BONSAI_SERVER_URL="$reply"
-    printf 'BONSAI_SERVER_URL=%s\n' "$BONSAI_SERVER_URL" >> "$ENV_FILE"
+    printf 'BONSAI_SERVER_URL=%q\n' "$BONSAI_SERVER_URL" >> "$ENV_FILE"
     ok "BONSAI_SERVER_URL saved to .env"
   fi
 fi
 
 if [[ -z "${BONSAI_SERVER_KEY:-}${BONSAI_API_KEY:-}" ]]; then
   [[ "$MODE" == check ]] && err "no BONSAI_SERVER_KEY or BONSAI_API_KEY in $ENV_FILE"
-  info "no key in .env — trying SSH to ${BONSAI_HOST:-the server}"
-  BONSAI_API_KEY=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$BONSAI_HOST" \
-    'grep ^BONSAI_API_KEY= ~/QuickCleverModel/.env 2>/dev/null' 2>/dev/null \
-    | head -1 | cut -d= -f2- || true)
+  # Derive SSH host from BONSAI_SERVER_URL if available, else use BONSAI_HOST
+  SSH_HOST="${BONSAI_HOST:-}"
+  if [[ -z "$SSH_HOST" && -n "${BONSAI_SERVER_URL:-}" ]]; then
+    # Extract hostname from URL like http://10.1.2.3:8080/v1 -> 10.1.2.3
+    SSH_HOST=$(echo "$BONSAI_SERVER_URL" | sed -E 's|^https?://([^:/]+).*|\1|')
+  fi
+  if [[ -n "$SSH_HOST" ]]; then
+    info "no key in .env — trying SSH to $SSH_HOST"
+    BONSAI_API_KEY=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$SSH_HOST" \
+      'grep ^BONSAI_API_KEY= ~/QuickCleverModel/.env 2>/dev/null' 2>/dev/null \
+      | head -1 | cut -d= -f2- || true)
+  else
+    BONSAI_API_KEY=""
+  fi
   if [[ -n "$BONSAI_API_KEY" ]]; then
     ok "key fetched over SSH"
   else
-    printf 'SSH fetch failed — paste BONSAI_API_KEY (from .env on the server): '
-    read -r BONSAI_API_KEY
-    [[ -n "$BONSAI_API_KEY" ]] || err "no key given"
+    if [[ -t 0 ]]; then
+      printf 'SSH fetch failed — paste BONSAI_API_KEY (from .env on the server): '
+      read -r BONSAI_API_KEY
+      [[ -n "$BONSAI_API_KEY" ]] || err "no key given"
+    else
+      err "no API key available and cannot prompt (non-interactive)"
+    fi
   fi
   printf 'BONSAI_API_KEY=%s\n' "$BONSAI_API_KEY" >> "$ENV_FILE"
   ok "BONSAI_API_KEY saved to .env"

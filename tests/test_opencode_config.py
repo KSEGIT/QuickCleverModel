@@ -35,6 +35,16 @@ class Harness(unittest.TestCase):
         self.cfg_home = os.path.join(self.tmp, "cfg")
         self.cfg = os.path.join(self.cfg_home, "opencode", "opencode.json")
 
+        # Create a test double for opencode if not already on PATH
+        self.bin_dir = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin_dir, exist_ok=True)
+        self.fake_opencode = os.path.join(self.bin_dir, "opencode")
+        if not shutil.which("opencode"):
+            with open(self.fake_opencode, "w") as fh:
+                fh.write("#!/bin/sh\n")
+                fh.write('[ "$1" = "--version" ] && echo "opencode test-double 1.0.0" || exit 0\n')
+            os.chmod(self.fake_opencode, 0o755)
+
     def write_env(self, **pairs):
         with open(self.env_file, "w") as fh:
             for k, v in pairs.items():
@@ -44,6 +54,8 @@ class Harness(unittest.TestCase):
         env = dict(os.environ)
         env["BONSAI_ENV_FILE"] = self.env_file
         env["XDG_CONFIG_HOME"] = self.cfg_home
+        # Prepend bin_dir to PATH so our test double is found if needed
+        env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
         return subprocess.run([SCRIPT, *args], capture_output=True, text=True,
                               env=env, cwd=ROOT, stdin=subprocess.DEVNULL)
 
@@ -52,7 +64,6 @@ class Harness(unittest.TestCase):
             return json.load(fh)["provider"]["bonsai"]["options"]
 
 
-@unittest.skipUnless(shutil.which("opencode"), "opencode not installed")
 class ConnectTargetTest(Harness):
     def test_defaults_to_localhost_not_a_bind_wildcard(self):
         """Nothing configured must mean this machine, never 0.0.0.0."""
@@ -91,7 +102,6 @@ class ConnectTargetTest(Harness):
         self.assertEqual(self.rendered()["apiKey"], LOCAL_KEY)
 
 
-@unittest.skipUnless(shutil.which("opencode"), "opencode not installed")
 class DriftCheckTest(Harness):
     def render_then(self, **changes):
         """Render a config, then change .env so the two disagree."""
