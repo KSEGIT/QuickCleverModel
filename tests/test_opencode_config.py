@@ -35,15 +35,43 @@ class Harness(unittest.TestCase):
         self.cfg_home = os.path.join(self.tmp, "cfg")
         self.cfg = os.path.join(self.cfg_home, "opencode", "opencode.json")
 
-    def write_env(self, **pairs):
+        # Stub `opencode` when the real one is absent. Without this the render
+        # tests skip on a machine that has no opencode — precisely the machine
+        # this script exists to set up — and the suite reports OK having
+        # verified nothing.
+        self.bin_dir = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin_dir, exist_ok=True)
+        if not shutil.which("opencode"):
+            stub = os.path.join(self.bin_dir, "opencode")
+            with open(stub, "w") as fh:
+                fh.write('#!/bin/sh\n[ "$1" = "--version" ] && echo "stub" || exit 0\n')
+            os.chmod(stub, 0o755)
+
+    def write_env(self, _probe=False, **pairs):
+        """Write a fixture .env.
+
+        BONSAI_CTX is set by default so the render skips its /props probe:
+        fixture URLs point at unreachable hosts, and waiting out the timeout
+        on every render turned a 3s suite into a 64s one. Tests that are
+        specifically about context resolution pass _probe=True to leave it
+        unset and exercise the real path.
+        """
+        if not _probe:
+            pairs.setdefault("BONSAI_CTX", "8192")
         with open(self.env_file, "w") as fh:
             for k, v in pairs.items():
                 fh.write(f"{k}={v}\n")
 
     def run_script(self, *args):
-        env = dict(os.environ)
+        # Strip every BONSAI_* from the inherited environment. The script
+        # sources .env with `set -a`, but a var already exported in the
+        # developer's shell survives and silently overrides the fixture —
+        # in a repo whose whole premise is exporting BONSAI_*, that is a
+        # near-certain flake rather than a theoretical one.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("BONSAI_")}
         env["BONSAI_ENV_FILE"] = self.env_file
         env["XDG_CONFIG_HOME"] = self.cfg_home
+        env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
         return subprocess.run([SCRIPT, *args], capture_output=True, text=True,
                               env=env, cwd=ROOT, stdin=subprocess.DEVNULL)
 
@@ -52,7 +80,6 @@ class Harness(unittest.TestCase):
             return json.load(fh)["provider"]["bonsai"]["options"]
 
 
-@unittest.skipUnless(shutil.which("opencode"), "opencode not installed")
 class ConnectTargetTest(Harness):
     def test_defaults_to_localhost_not_a_bind_wildcard(self):
         """Nothing configured must mean this machine, never 0.0.0.0."""
@@ -91,8 +118,11 @@ class ConnectTargetTest(Harness):
         self.assertEqual(self.rendered()["apiKey"], LOCAL_KEY)
 
 
-@unittest.skipUnless(shutil.which("opencode"), "opencode not installed")
 class DriftCheckTest(Harness):
+    """No opencode binary needed: --check skips the install gate entirely, and
+    the render path only writes JSON. Gating these on the binary meant a fresh
+    box — exactly what this script exists to set up — ran none of them."""
+
     def render_then(self, **changes):
         """Render a config, then change .env so the two disagree."""
         base = dict(BONSAI_API_KEY=LOCAL_KEY,
@@ -135,7 +165,7 @@ class DriftCheckTest(Harness):
         self.write_env(BONSAI_API_KEY=LOCAL_KEY, BONSAI_CTX="4096",
                        BONSAI_SERVER_URL="http://10.1.2.3:8080/v1")
         self.assertEqual(self.run_script().returncode, 0)   # renders ctx 4096
-        self.write_env(BONSAI_API_KEY=LOCAL_KEY,            # now silent on ctx
+        self.write_env(_probe=True, BONSAI_API_KEY=LOCAL_KEY,  # silent on ctx
                        BONSAI_SERVER_URL="http://10.1.2.3:8080/v1")
         proc = self.run_script("--check")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
