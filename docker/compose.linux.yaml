@@ -73,6 +73,16 @@ services:
       # The trailing /v1 matters — llama-server serves the OpenAI-compatible API there.
       OPENAI_API_BASE_URL: "http://llama:8080/v1"
       OPENAI_API_KEY: "${BONSAI_API_KEY:?set BONSAI_API_KEY in ../.env}"
+      # .env is the only source of truth for connections. Without this, Open
+      # WebUI persists them in its own DB and the DB wins over the environment
+      # on every later start, so editing .env silently does nothing.
+      ENABLE_PERSISTENT_CONFIG: "false"
+      # Optional second provider: Hetzner's hosted models in the same dropdown.
+      # Semicolon-separated lists; the plural forms win over the singular ones.
+      # Empty HETZNER_API_KEY collapses these to the local backend alone.
+      # NOTE this sends prompts off the machine — see .env.example.
+      OPENAI_API_BASE_URLS: "http://llama:8080/v1${HETZNER_API_KEY:+;${HETZNER_API_BASE:-https://inference.hetzner.com/api/v1}}"
+      OPENAI_API_KEYS: "${BONSAI_API_KEY}${HETZNER_API_KEY:+;${HETZNER_API_KEY}}"
       WEBUI_AUTH: "false"          # single-user local box; flip to true to require login
       ENABLE_OLLAMA_API: "false"   # we are not running Ollama
       # Background generations (title, tags, follow-ups...) decode concurrently

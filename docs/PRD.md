@@ -62,6 +62,7 @@ generation with the shipped tuning. An RTX 4060 Laptop (256 GB/s) runs the same
 | F10 | Thinking mode on by default; `--reasoning off` / `--reasoning-budget` passthrough | ✅ |
 | F11 | macOS menu bar app: at-a-glance stack status and whole-stack Start/Restart/Stop, installed as a login item (`make menubar-install`) | ✅ |
 | F12 | Machine-readable stack status (`./stack.sh status --json`) as the contract between the control UI and the stack | ✅ |
+| F13 | Optional hosted provider (Hetzner Inference API) alongside the local models in one dropdown, off unless `HETZNER_API_KEY` is set | ✅ (plumbing verified; live calls need a key) |
 
 `install.sh` is the one-command installer for the Linux+NVIDIA path — it orchestrates F6–F8 (weights, host setup, CUDA build) end to end.
 
