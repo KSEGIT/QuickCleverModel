@@ -31,6 +31,9 @@ Docker Desktop's registry proxy wedged mid-setup — see
 │                                                    │        │               │
 │   open-webui (native, :9090) ──────────────────────┘        │ host.docker.internal
 │                                                             │               │
+│   BonsaiMenuBar.app  ──► stack.sh ──► starts/stops the three services above  │
+│   (menu bar, LaunchAgent; polls `stack.sh status --json` every 15s)          │
+│                                                             │               │
 │   ┌─────────────── Docker Desktop Linux VM ──────────────────┼────────────┐ │
 │   │   any container ─────────────────────────────────────────┘            │ │
 │   │   (verified: curl container got a completion at 13.0 tok/s)           │ │
@@ -47,11 +50,18 @@ flowchart LR
         B["child: bonsai-27b-1bit<br/>Q1_0 · 3.8 GB"]
         PW["Playwright MCP<br/>:8931"]
         CV["cache-viz :8090"]
+        MB["BonsaiMenuBar.app<br/>menu bar · LaunchAgent"]
+        SH["stack.sh"]
         UI -->|OpenAI API + key| RTR
         RTR -->|spawn/proxy| T
         RTR -->|spawn/proxy| B
         UI -.->|MCP streamable-http| PW
         RTR -.->|logs| CV
+        MB -->|"status --json (15s poll)"| SH
+        MB -->|"up / down / restart / open"| SH
+        SH -.->|starts| RTR
+        SH -.->|starts| UI
+        SH -.->|starts| PW
     end
     GPUm["Metal GPU"] --- T
     GPUm --- B
@@ -222,6 +232,49 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 Router mode is marked experimental upstream (`server.cpp:340` prints
 `NOTE: router mode is experimental`).
+
+## Control plane
+
+`stack.sh` is the only thing that starts, stops, or inspects services. Every
+other control surface is a client of it, and none of them reimplement its
+knowledge of ports, PIDs, or start order.
+
+```
+  make up/down/status        ─┐
+  ./stack.sh directly        ─┼─►  stack.sh  ─►  start-server.sh
+  BonsaiMenuBar.app          ─┘                  start-playwright-mcp.sh
+                                                 start-webui.sh
+```
+
+The macOS menu bar app (`menubar/BonsaiMenuBar.swift`, built by `make menubar`)
+talks to it through **`./stack.sh status --json`**, not by parsing the human
+table that `status` prints. That separation is deliberate: the table is a UI and
+will change, so a cosmetic edit to its `printf` must not be able to break a
+consumer. The JSON is the contract:
+
+```json
+[{"service":"llama","port":8080,"state":"up","pid":57187}, …]
+```
+
+One object per service in `SERVICES` order; `pid` is a number exactly when
+`state` is `"up"` and `null` exactly when `"down"`. Ports come from `port_of`,
+so `BONSAI_PORT` / `PW_MCP_PORT` / `WEBUI_PORT` overrides are reflected.
+`tests/test_stack_status_json.py` pins this shape from the shell side.
+
+Two constraints fall out of the app being a launchd agent rather than a shell
+child, both of which bit us in practice:
+
+- **launchd gives agents a minimal `PATH`** (`/usr/bin:/bin:/usr/sbin:/sbin`),
+  which has no Homebrew, so `npx` was unresolvable and Restart could stop the
+  stack without being able to start it again. `stack.sh` normalizes `PATH`
+  itself — after sourcing `.env`, so a `PATH=` line there cannot defeat it —
+  and the LaunchAgent plist sets it too.
+- **A LaunchServices-started app inherits cwd `/`**, so subprocesses wrote into
+  the filesystem root until `capture()` pinned cwd to the script's directory.
+
+Any future control surface (a Windows tray app, a web control page) should
+consume `status --json` and shell out to `stack.sh` the same way, rather than
+growing its own service model.
 
 ## Ports & security
 
