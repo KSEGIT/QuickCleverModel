@@ -32,9 +32,12 @@ def env_defines(var):
 def source_and_dump(extra_env=None):
     """Source the script (it self-terminates) and return its exported env."""
     env = dict(os.environ)
+    # Provide BONSAI_API_KEY if not already set (required by start-webui.sh)
+    if "BONSAI_API_KEY" not in env:
+        env["BONSAI_API_KEY"] = "test-bonsai-key"
     env.update(extra_env or {})
     proc = subprocess.run(
-        ["bash", "-c", f'source "{SCRIPT}"; env'],
+        ["bash", "-c", 'source "$1"; env', "bash", SCRIPT],
         capture_output=True, text=True, env=env, cwd=ROOT)
     if proc.returncode != 0:
         raise AssertionError(f"sourcing failed:\n{proc.stdout}\n{proc.stderr}")
@@ -88,3 +91,20 @@ class ProviderCompositionTest(unittest.TestCase):
             with self.subTest(extra=extra):
                 self.assertEqual(
                     source_and_dump(extra)["ENABLE_PERSISTENT_CONFIG"], "False")
+
+    def test_stale_plural_env_cleared_in_local_only_mode(self):
+        """Regression: plural forms inherited from the parent must be unset.
+
+        If OPENAI_API_BASE_URLS or OPENAI_API_KEYS are set in the parent
+        environment but HETZNER_API_KEY is not, the script must unset them
+        before exporting the singular forms — otherwise the plural forms take
+        precedence in Open WebUI and the local-only config is silently ignored.
+        """
+        env = source_and_dump({
+            "HETZNER_API_KEY": "",
+            "OPENAI_API_BASE_URLS": "http://stale.example/v1",
+            "OPENAI_API_KEYS": "stale-key"
+        })
+        self.assertNotIn("OPENAI_API_BASE_URLS", env)
+        self.assertNotIn("OPENAI_API_KEYS", env)
+        self.assertTrue(env["OPENAI_API_BASE_URL"].startswith("http://127.0.0.1:"))

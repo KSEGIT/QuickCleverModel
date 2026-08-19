@@ -235,11 +235,13 @@ Router mode is marked experimental upstream (`server.cpp:340` prints
 
 ## Control plane
 
-`stack.sh` is the only thing that starts, stops, or inspects services. Every
-other control surface is a client of it, and none of them reimplement its
-knowledge of ports, PIDs, or start order.
+On **macOS**, `stack.sh` is the sole interface for the native Metal stack —
+every control surface (CLI, menu bar app) is a client of it, and none
+reimplement its knowledge of ports, PIDs, or start order. On **Linux**, Docker
+Compose (`docker compose -f docker/compose.linux.yaml`) is the control
+interface for the containerised stack.
 
-```
+```text
   make up/down/status        ─┐
   ./stack.sh directly        ─┼─►  stack.sh  ─►  start-server.sh
   BonsaiMenuBar.app          ─┘                  start-playwright-mcp.sh
@@ -253,7 +255,7 @@ will change, so a cosmetic edit to its `printf` must not be able to break a
 consumer. The JSON is the contract:
 
 ```json
-[{"service":"llama","port":8080,"state":"up","pid":57187}, …]
+[{"service":"llama","port":8080,"state":"up","pid":57187}]
 ```
 
 One object per service in `SERVICES` order; `pid` is a number exactly when
