@@ -68,7 +68,15 @@ normalise_server_url() {
   if [[ "$v" != *://* ]]; then
     # Bracket a bare IPv6 literal, else host:port parsing is ambiguous.
     [[ "$v" == *:*:* && "$v" != \[*\] ]] && v="[$v]"
-    v="http://$v:${BONSAI_PORT:-8080}/v1"
+    # Only append default port if the input has no port already.
+    # Detect port: bracketed IPv6 with :port after ], or plain host:port (single colon).
+    if [[ "$v" == \]*:* || ( "$v" == *:* && "$v" != *:*:* && "$v" != \[*\] ) ]]; then
+      # Port already present
+      v="http://$v/v1"
+    else
+      # No port, add default
+      v="http://$v:${BONSAI_PORT:-8080}/v1"
+    fi
   fi
   local scheme="${v%%://*}"
   scheme="$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')"
@@ -77,9 +85,11 @@ normalise_server_url() {
   # Normalise the scheme's case so the rendered config and --check agree
   # regardless of how it was typed.
   v="$scheme://${v#*://}"
+  # Strip trailing slashes before checking/appending /v1 to avoid /v1/v1 or /v1/
+  v="${v%/}"
   # llama-server serves the OpenAI-compatible API under /v1; without it every
   # completions request 404s with nothing to explain why.
-  [[ "$v" == */v1 ]] || v="${v%/}/v1"
+  [[ "$v" == */v1 ]] || v="$v/v1"
   printf '%s' "$v"
 }
 
@@ -121,7 +131,18 @@ if [[ -z "${BONSAI_SERVER_KEY:-}${BONSAI_API_KEY:-}" ]]; then
   elif [[ -n "${BONSAI_SERVER_URL:-}" ]]; then
     # host[:port] out of scheme://host[:port]/path, minus any IPv6 brackets.
     SSH_TARGET="${BONSAI_SERVER_URL#*://}"; SSH_TARGET="${SSH_TARGET%%/*}"
-    SSH_TARGET="${SSH_TARGET%:*}"; SSH_TARGET="${SSH_TARGET#[}"; SSH_TARGET="${SSH_TARGET%]}"
+    # Strip port: for [host]:port, remove ]:port; for plain host:port (single colon), remove :port
+    if [[ "$SSH_TARGET" == \]*:* ]]; then
+      # Bracketed IPv6 with port: [::1]:8080 -> [::1] -> ::1
+      SSH_TARGET="${SSH_TARGET%]:*}"
+      SSH_TARGET="${SSH_TARGET#[}"
+    elif [[ "$SSH_TARGET" == *:* && "$SSH_TARGET" != *:*:* ]]; then
+      # Plain host:port (single colon): host:8080 -> host
+      SSH_TARGET="${SSH_TARGET%:*}"
+    else
+      # No port or bracketed IPv6 without port: [::1] -> ::1
+      SSH_TARGET="${SSH_TARGET#[}"; SSH_TARGET="${SSH_TARGET%]}"
+    fi
   fi
 
   FETCHED=""
@@ -267,6 +288,8 @@ if mode == "check":
     try:
         with open(cfg_path) as fh:
             actual = json.load(fh)
+        if not isinstance(actual, dict):
+            raise ValueError("config must be a JSON object, not " + type(actual).__name__)
     except (OSError, ValueError) as exc:
         sys.exit(f"err  {cfg_path} is unreadable or not valid JSON: {exc}")
 
@@ -298,13 +321,19 @@ if mode == "check":
             (drift if ctx_explicit else notes).append(msg)
 
     if strip_ctx(actual) != strip_ctx(expected):
+        found_specific = False
         for field in ("npm", "name"):
             a = actual.get("provider", {}).get("bonsai", {}).get(field)
             e = expected["provider"]["bonsai"][field]
             if a != e:
                 drift.append(f"provider.{field}: config has {a!r}, expected {e!r}")
+                found_specific = True
         if actual.get("model") != expected["model"]:
             drift.append(f"default model: config has {actual.get('model')!r}, expected {expected['model']!r}")
+            found_specific = True
+        if not found_specific:
+            # Structural difference not covered by specific checks above
+            drift.append("config structure differs from expected (possibly $schema, limit.output, or provider keys)")
 
     if drift:
         print("err  opencode config has drifted from .env:", file=sys.stderr)
