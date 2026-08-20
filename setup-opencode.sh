@@ -50,6 +50,49 @@ info() { echo "==>  $*"; }
 ok()   { echo " ok  $*"; }
 err()  { echo "err  $*" >&2; exit 1; }
 
+# The model asked for /props below. Any id the router knows will do; this one
+# is the smallest, so if it is not already resident the load is the cheapest.
+DEFAULT_MODEL="bonsai-27b-1bit"
+
+# Appending to a file that does not end in a newline silently glues the new
+# assignment onto the previous line, corrupting both.
+append_env() {
+  [[ -s "$ENV_FILE" && -n "$(tail -c1 "$ENV_FILE")" ]] && printf '\n' >> "$ENV_FILE"
+  printf '%s\n' "$1" >> "$ENV_FILE"
+}
+
+# A bare host becomes a full URL; a URL is validated rather than trusted. An
+# unusable value here is persisted to .env, so re-running never repairs it.
+normalise_server_url() {
+  local v="$1"
+  if [[ "$v" != *://* ]]; then
+    # Bracket a bare IPv6 literal, else host:port parsing is ambiguous.
+    [[ "$v" == *:*:* && "$v" != \[*\] ]] && v="[$v]"
+    # Only append default port if the input has no port already.
+    # Detect port: bracketed IPv6 with :port after ], or plain host:port (single colon).
+    if [[ "$v" == \]*:* || ( "$v" == *:* && "$v" != *:*:* && "$v" != \[*\] ) ]]; then
+      # Port already present
+      v="http://$v/v1"
+    else
+      # No port, add default
+      v="http://$v:${BONSAI_PORT:-8080}/v1"
+    fi
+  fi
+  local scheme="${v%%://*}"
+  scheme="$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')"
+  [[ "$scheme" == http || "$scheme" == https ]] \
+    || err "server URL must be http:// or https://, got: $1"
+  # Normalise the scheme's case so the rendered config and --check agree
+  # regardless of how it was typed.
+  v="$scheme://${v#*://}"
+  # Strip trailing slashes before checking/appending /v1 to avoid /v1/v1 or /v1/
+  v="${v%/}"
+  # llama-server serves the OpenAI-compatible API under /v1; without it every
+  # completions request 404s with nothing to explain why.
+  [[ "$v" == */v1 ]] || v="$v/v1"
+  printf '%s' "$v"
+}
+
 if [[ ! -f "$ENV_FILE" ]]; then
   [[ "$MODE" == check ]] && err "no $ENV_FILE to check against"
   info "creating $ENV_FILE"
@@ -66,30 +109,72 @@ set -a; . "$ENV_FILE"; set +a
 if [[ -z "${BONSAI_SERVER_URL:-}" && -z "${BONSAI_HOST:-}" && "$MODE" != check && -t 0 ]]; then
   printf 'Where is the llama-server? [http://127.0.0.1:%s/v1] ' "${BONSAI_PORT:-8080}"
   read -r reply || reply=""
-  if [[ -n "$reply" ]]; then
-    # Accept either a bare host/IP or a full URL.
-    [[ "$reply" == http*://* ]] || reply="http://$reply:${BONSAI_PORT:-8080}/v1"
-    BONSAI_SERVER_URL="$reply"
-    printf 'BONSAI_SERVER_URL=%s\n' "$BONSAI_SERVER_URL" >> "$ENV_FILE"
-    ok "BONSAI_SERVER_URL saved to .env"
-  fi
+  # Persist even when the default is accepted: otherwise the prompt re-fires on
+  # every run, including the re-runs this script tells you to do to fix drift.
+  BONSAI_SERVER_URL="$(normalise_server_url "${reply:-127.0.0.1}")"
+  append_env "BONSAI_SERVER_URL=$BONSAI_SERVER_URL"
+  ok "BONSAI_SERVER_URL=$BONSAI_SERVER_URL saved to .env"
+fi
+
+# Validate whatever .env supplied, too — it may have been hand-edited.
+if [[ -n "${BONSAI_SERVER_URL:-}" ]]; then
+  BONSAI_SERVER_URL="$(normalise_server_url "$BONSAI_SERVER_URL")"
 fi
 
 if [[ -z "${BONSAI_SERVER_KEY:-}${BONSAI_API_KEY:-}" ]]; then
   [[ "$MODE" == check ]] && err "no BONSAI_SERVER_KEY or BONSAI_API_KEY in $ENV_FILE"
-  info "no key in .env — trying SSH to ${BONSAI_HOST:-the server}"
-  BONSAI_API_KEY=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$BONSAI_HOST" \
-    'grep ^BONSAI_API_KEY= ~/QuickCleverModel/.env 2>/dev/null' 2>/dev/null \
-    | head -1 | cut -d= -f2- || true)
-  if [[ -n "$BONSAI_API_KEY" ]]; then
-    ok "key fetched over SSH"
-  else
-    printf 'SSH fetch failed — paste BONSAI_API_KEY (from .env on the server): '
-    read -r BONSAI_API_KEY
-    [[ -n "$BONSAI_API_KEY" ]] || err "no key given"
+  # Only SSH when there is a host to SSH to. The prompt that used to guarantee
+  # BONSAI_HOST was set is gone, and an unguarded reference dies under `set -u`.
+  SSH_TARGET=""
+  if [[ -n "${BONSAI_HOST:-}" && "${BONSAI_HOST}" != "0.0.0.0" ]]; then
+    SSH_TARGET="$BONSAI_HOST"
+  elif [[ -n "${BONSAI_SERVER_URL:-}" ]]; then
+    # host[:port] out of scheme://host[:port]/path, minus any IPv6 brackets.
+    SSH_TARGET="${BONSAI_SERVER_URL#*://}"; SSH_TARGET="${SSH_TARGET%%/*}"
+    # Strip port: for [host]:port, remove ]:port; for plain host:port (single colon), remove :port
+    if [[ "$SSH_TARGET" == \]*:* ]]; then
+      # Bracketed IPv6 with port: [::1]:8080 -> [::1] -> ::1
+      SSH_TARGET="${SSH_TARGET%]:*}"
+      SSH_TARGET="${SSH_TARGET#[}"
+    elif [[ "$SSH_TARGET" == *:* && "$SSH_TARGET" != *:*:* ]]; then
+      # Plain host:port (single colon): host:8080 -> host
+      SSH_TARGET="${SSH_TARGET%:*}"
+    else
+      # No port or bracketed IPv6 without port: [::1] -> ::1
+      SSH_TARGET="${SSH_TARGET#[}"; SSH_TARGET="${SSH_TARGET%]}"
+    fi
   fi
-  printf 'BONSAI_API_KEY=%s\n' "$BONSAI_API_KEY" >> "$ENV_FILE"
-  ok "BONSAI_API_KEY saved to .env"
+
+  FETCHED=""
+  if [[ -n "$SSH_TARGET" && "$SSH_TARGET" != "127.0.0.1" && "$SSH_TARGET" != "localhost" ]]; then
+    info "no key in .env — trying SSH to $SSH_TARGET"
+    FETCHED=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$SSH_TARGET" \
+      'grep ^BONSAI_API_KEY= ~/QuickCleverModel/.env 2>/dev/null' 2>/dev/null \
+      | head -1 | cut -d= -f2- || true)
+    [[ -n "$FETCHED" ]] && ok "key fetched over SSH from $SSH_TARGET"
+  fi
+
+  if [[ -z "$FETCHED" ]]; then
+    # Fail with a clear message rather than blocking forever on a prompt
+    # nobody can answer (CI, a cron, the test suite).
+    [[ -t 0 ]] || err "no API key in $ENV_FILE and cannot prompt (non-interactive) — set BONSAI_SERVER_KEY or BONSAI_API_KEY"
+    printf 'Paste the API key for %s: ' "${BONSAI_SERVER_URL:-this machine}"
+    read -r FETCHED || FETCHED=""
+    [[ -n "$FETCHED" ]] || err "no key given"
+  fi
+
+  # A key fetched from another box is THAT server's key. Writing it to
+  # BONSAI_API_KEY would hand it to start-server.sh, which would then serve
+  # this machine with a foreign key and 401 every local client.
+  if [[ -n "$SSH_TARGET" && "$SSH_TARGET" != "127.0.0.1" && "$SSH_TARGET" != "localhost" ]]; then
+    append_env "BONSAI_SERVER_KEY=$FETCHED"
+    BONSAI_SERVER_KEY="$FETCHED"
+    ok "BONSAI_SERVER_KEY saved to .env (key for $SSH_TARGET, not this machine)"
+  else
+    append_env "BONSAI_API_KEY=$FETCHED"
+    BONSAI_API_KEY="$FETCHED"
+    ok "BONSAI_API_KEY saved to .env"
+  fi
 fi
 
 if [[ "$MODE" != check ]] && ! command -v opencode >/dev/null; then
@@ -107,127 +192,183 @@ if [[ "$MODE" != check ]] && ! command -v opencode >/dev/null; then
   command -v opencode >/dev/null || err "install finished but opencode is not on PATH — open a new shell and re-run"
 fi
 [[ "$MODE" == check ]] || ok "opencode installed: $(opencode --version 2>/dev/null || echo present)"
-
-# limit.context tells opencode when to compact. It must match the server's
-# BONSAI_CTX (in .env on the machine running llama-server), else opencode
-# compacts too early or the server rejects long requests.
+# Where the CLIENT connects. Deliberately NOT BONSAI_HOST: start-server.sh uses
+# that as the server's BIND address (`--host "$HOST"`), and a machine cannot
+# bind an address it does not own. Connect and bind are different facts.
 #
-# The default mirrors the server launcher for THIS platform (start-server.sh
-# uses 32768 on macOS; docker/compose.linux.yaml uses 8192). When the server
-# runs on a different machine, that guess can be wrong in either direction —
-# set BONSAI_CTX explicitly to whatever that machine serves.
-if [[ -n "${BONSAI_CTX:-}" ]]; then
-  CTX="$BONSAI_CTX"
-  CTX_EXPLICIT=1
-else
-  case "$(uname -s)" in
-    Darwin) CTX=32768 ;;
-    *)      CTX=8192 ;;
-  esac
-  CTX_EXPLICIT=0
-fi
-
-# Where the CLIENT connects. Deliberately NOT BONSAI_HOST: start-server.sh
-# uses that as the server's BIND address (`--host "$HOST"`), so a tailnet IP
-# there makes this machine try to bind an address it does not own and
-# llama-server fails to start. Connect-address and bind-address are different
-# facts; they get different variables.
-#
-# Falls back to BONSAI_HOST for configs written before this split existed.
+# BONSAI_HOST is still accepted as a fallback for configs written before the
+# split — except 0.0.0.0, a bind wildcard that is never a connect target.
 if [[ -n "${BONSAI_SERVER_URL:-}" ]]; then
   BASE_URL="$BONSAI_SERVER_URL"
 else
-  # Default is this machine. BONSAI_HOST is only consulted for configs written
-  # before the split; 0.0.0.0 is a bind wildcard, never a connect target.
   CONNECT_HOST="${BONSAI_HOST:-127.0.0.1}"
   [[ "$CONNECT_HOST" == "0.0.0.0" ]] && CONNECT_HOST=127.0.0.1
   BASE_URL="http://${CONNECT_HOST}:${BONSAI_PORT:-8080}/v1"
 fi
 
 # The key belongs to whichever server BASE_URL names. BONSAI_API_KEY is this
-# machine's server key — right when the target is local, wrong (401) when it
-# is another box with its own key.
-API_KEY="${BONSAI_SERVER_KEY:-$BONSAI_API_KEY}"
+# machine's server key — right when the target is local, a guaranteed 401 when
+# it is another box with its own key.
+API_KEY="${BONSAI_SERVER_KEY:-${BONSAI_API_KEY:-}}"
+[[ -n "$API_KEY" ]] || err "no BONSAI_SERVER_KEY or BONSAI_API_KEY in $ENV_FILE"
+
+# limit.context tells opencode when to compact, and must match what the server
+# actually serves: too high and long requests are rejected mid-session, too low
+# and it compacts away context you paid for.
+#
+# Ask the server rather than guess. Guessing from this machine's `uname` is
+# wrong whenever the server is elsewhere — a Mac pointed at the 8 GB Linux box
+# would advertise 32768 against a server serving 8192. /props?model=<id>
+# reports the resident child's real n_ctx.
+if [[ -n "${BONSAI_CTX:-}" ]]; then
+  CTX="$BONSAI_CTX"
+  CTX_SOURCE="BONSAI_CTX in .env"
+else
+  CTX="$(curl -s -m 5 -H "Authorization: Bearer $API_KEY" \
+           "${BASE_URL%/v1}/props?model=$DEFAULT_MODEL" 2>/dev/null \
+         | python3 -c 'import sys,json
+try:
+    n = json.load(sys.stdin).get("default_generation_settings", {}).get("n_ctx")
+    print(n if isinstance(n, int) and n > 0 else "")
+except Exception:
+    print("")' 2>/dev/null || true)"
+  if [[ -n "$CTX" ]]; then
+    CTX_SOURCE="the server ($BASE_URL)"
+  else
+    # Unreachable at setup time. 8192 is the conservative floor across both
+    # shipped configurations (docker/compose.linux.yaml) — advertising less
+    # than the server allows only costs early compaction, while advertising
+    # more gets requests rejected.
+    CTX=8192
+    CTX_SOURCE="fallback (server unreachable; set BONSAI_CTX to pin it)"
+  fi
+fi
+
+# Render and compare in Python: a shell heredoc cannot escape these values, so
+# a context of "32k" or a key containing a quote silently produced invalid JSON
+# while the script reported success. json.dump cannot.
+#
+# The key goes over stdin, not argv or the environment: `ps eww` exposes both.
+PYHELPER="$(mktemp)"
+trap 'rm -f "$PYHELPER"' EXIT
+cat > "$PYHELPER" <<'PYEOF'
+import hashlib, json, os, sys
+
+mode, cfg_path, base_url, ctx_raw, ctx_source = sys.argv[1:6]
+api_key = sys.stdin.read()
+
+try:
+    ctx = int(ctx_raw)
+    if ctx <= 0:
+        raise ValueError
+except ValueError:
+    sys.exit(f"err  context must be a positive integer, got {ctx_raw!r} (from {ctx_source})")
+
+MODELS = ("bonsai-27b-1bit", "bonsai-27b-ternary", "bonsai-27b-ternary-text")
+expected = {
+    "$schema": "https://opencode.ai/config.json",
+    "provider": {
+        "bonsai": {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "Bonsai local",
+            "options": {"baseURL": base_url, "apiKey": api_key},
+            "models": {m: {"name": m, "limit": {"context": ctx, "output": 4096}}
+                       for m in MODELS},
+        }
+    },
+    "model": "bonsai/bonsai-27b-ternary-text",
+}
+
+def digest(value):
+    """Compare secrets without printing them. A 14-char prefix of a live key
+    leaks 7 hex characters of it into scrollback and CI logs."""
+    return hashlib.sha256((value or "").encode()).hexdigest()[:8]
+
+if mode == "check":
+    try:
+        with open(cfg_path) as fh:
+            actual = json.load(fh)
+        if not isinstance(actual, dict):
+            raise ValueError("config must be a JSON object, not " + type(actual).__name__)
+    except (OSError, ValueError) as exc:
+        sys.exit(f"err  {cfg_path} is unreadable or not valid JSON: {exc}")
+
+    # Compare the whole rendered document, not a hand-picked subset: a config
+    # with the right url and key but no models, or a stale model list, is still
+    # a config opencode cannot use.
+    ctx_explicit = ctx_source.startswith("BONSAI_CTX")
+
+    def strip_ctx(doc):
+        clone = json.loads(json.dumps(doc))
+        for m in clone.get("provider", {}).get("bonsai", {}).get("models", {}).values():
+            m.get("limit", {}).pop("context", None)
+        return clone
+
+    drift, notes = [], []
+    a_opts = actual.get("provider", {}).get("bonsai", {}).get("options", {})
+    if a_opts.get("baseURL") != base_url:
+        drift.append(f"baseURL: config has {a_opts.get('baseURL')!r}, .env implies {base_url!r}")
+    if digest(a_opts.get("apiKey")) != digest(api_key):
+        drift.append(f"apiKey: config sha256:{digest(a_opts.get('apiKey'))}, .env sha256:{digest(api_key)}")
+
+    a_models = actual.get("provider", {}).get("bonsai", {}).get("models", {})
+    if set(a_models) != set(MODELS):
+        drift.append(f"models: config has {sorted(a_models)}, expected {sorted(MODELS)}")
+    for name in sorted(set(a_models) & set(MODELS)):
+        got = a_models[name].get("limit", {}).get("context")
+        if got != ctx:
+            msg = f"{name}: context {got}, {ctx_source} says {ctx}"
+            (drift if ctx_explicit else notes).append(msg)
+
+    if strip_ctx(actual) != strip_ctx(expected):
+        found_specific = False
+        for field in ("npm", "name"):
+            a = actual.get("provider", {}).get("bonsai", {}).get(field)
+            e = expected["provider"]["bonsai"][field]
+            if a != e:
+                drift.append(f"provider.{field}: config has {a!r}, expected {e!r}")
+                found_specific = True
+        if actual.get("model") != expected["model"]:
+            drift.append(f"default model: config has {actual.get('model')!r}, expected {expected['model']!r}")
+            found_specific = True
+        if not found_specific:
+            # Structural difference not covered by specific checks above
+            drift.append("config structure differs from expected (possibly $schema, limit.output, or provider keys)")
+
+    if drift:
+        print("err  opencode config has drifted from .env:", file=sys.stderr)
+        for d in drift:
+            print(f"       - {d}", file=sys.stderr)
+        print("     fix with: ./setup-opencode.sh", file=sys.stderr)
+        sys.exit(1)
+    for n in notes:
+        print(f"note  {n}")
+    print(f" ok  opencode config matches .env ({base_url})")
+    sys.exit(0)
+
+# Write mode. umask before creating: chmod after the fact leaves a window in
+# which a file containing the API key is world-readable.
+os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+old = os.umask(0o077)
+try:
+    with open(cfg_path, "w") as fh:
+        json.dump(expected, fh, indent=2)
+        fh.write("\n")
+finally:
+    os.umask(old)
+os.chmod(cfg_path, 0o600)
+print(f" ok  config written to {cfg_path} (mode 600 — it holds the API key)")
+PYEOF
 
 if [[ "$MODE" == check ]]; then
   [[ -f "$CONFIG" ]] || err "no config at $CONFIG — run ./setup-opencode.sh to create it"
-  BASE_URL="$BASE_URL" API_KEY="$API_KEY" CTX="$CTX" CONFIG="$CONFIG" \
-  CTX_EXPLICIT="$CTX_EXPLICIT" \
-  python3 - <<'PYCHECK'
-import json, os, sys
-
-cfg_path = os.environ["CONFIG"]
-try:
-    with open(cfg_path) as fh:
-        cfg = json.load(fh)
-except (OSError, ValueError) as exc:
-    print(f"err  {cfg_path} is unreadable or not valid JSON: {exc}", file=sys.stderr)
-    sys.exit(1)
-
-opts = cfg.get("provider", {}).get("bonsai", {}).get("options", {})
-models = cfg.get("provider", {}).get("bonsai", {}).get("models", {})
-want_ctx = int(os.environ["CTX"])
-
-drift = []
-if opts.get("baseURL") != os.environ["BASE_URL"]:
-    drift.append(f"baseURL: config has {opts.get('baseURL')!r}, .env implies {os.environ['BASE_URL']!r}")
-if opts.get("apiKey") != os.environ["API_KEY"]:
-    # Never print either key; a prefix is enough to tell them apart.
-    have = (opts.get("apiKey") or "")[:14]
-    want = os.environ["API_KEY"][:14]
-    drift.append(f"apiKey: config has {have}…, .env has {want}…")
-# Only a real mismatch when .env states the context. Otherwise `want_ctx` is
-# this platform's default, which says nothing about a remote server — report
-# it as a note so it is visible without failing the check.
-notes = []
-for name, m in sorted(models.items()):
-    got = m.get("limit", {}).get("context")
-    if got == want_ctx:
-        continue
-    msg = f"{name}: context {got}, .env implies {want_ctx}"
-    (drift if os.environ["CTX_EXPLICIT"] == "1" else notes).append(msg)
-
-if drift:
-    print("err  opencode config has drifted from .env:", file=sys.stderr)
-    for d in drift:
-        print(f"       - {d}", file=sys.stderr)
-    print("     fix with: ./setup-opencode.sh", file=sys.stderr)
-    sys.exit(1)
-for n in notes:
-    print(f"note  {n} (BONSAI_CTX unset — set it to the server's value to pin this)")
-print(f" ok  opencode config matches .env ({os.environ['BASE_URL']})")
-PYCHECK
-  exit $?
+else
+  info "writing $CONFIG ($BASE_URL, context $CTX from $CTX_SOURCE)"
 fi
 
-info "writing $CONFIG ($BASE_URL)"
-mkdir -p "$CONFIG_DIR"
-cat > "$CONFIG" <<JSON
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "bonsai": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Bonsai local",
-      "options": {
-        "baseURL": "$BASE_URL",
-        "apiKey": "$API_KEY"
-      },
-      "models": {
-        "bonsai-27b-1bit":    { "name": "bonsai-27b-1bit",
-                                "limit": { "context": $CTX, "output": 4096 } },
-        "bonsai-27b-ternary": { "name": "bonsai-27b-ternary",
-                                "limit": { "context": $CTX, "output": 4096 } },
-        "bonsai-27b-ternary-text": { "name": "bonsai-27b-ternary-text",
-                                "limit": { "context": $CTX, "output": 4096 } }
-      }
-    }
-  },
-  "model": "bonsai/bonsai-27b-ternary-text"
-}
-JSON
-chmod 600 "$CONFIG"
-ok "config written (mode 600 — it holds the API key)"
+printf '%s' "$API_KEY" | python3 "$PYHELPER" "$MODE" "$CONFIG" "$BASE_URL" "$CTX" "$CTX_SOURCE"
+RC=$?
+[[ "$MODE" == check ]] && exit $RC
 
 echo
 echo "==> done. Run:  opencode"
