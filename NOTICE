@@ -1,0 +1,23 @@
+QuickCleverModel
+Copyright (c) 2026 Daniel Kiska
+
+The MIT license in LICENSE covers the contents of this repository: the setup
+and run scripts, the Docker and compose files, the menu bar app, the tests,
+and the documentation. It does not cover the third-party inference engine or
+the model weights, neither of which is distributed here. Both are fetched from
+their own sources at install time and carry their own terms:
+
+  - llama.cpp (PrismML-Eng fork) — built from source by install.sh and
+    setup-nvidia.sh into src/ and bin/, which this repository does not track.
+    Source: https://github.com/PrismML-Eng/llama.cpp
+    Upstream project: https://github.com/ggml-org/llama.cpp
+
+  - Bonsai 27B GGUF weights — downloaded by fetch-models.sh into models/,
+    which this repository does not track.
+    Source: https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf
+            https://huggingface.co/prism-ml/Bonsai-27B-gguf
+
+  - Open WebUI — pulled as a container image by the compose files.
+    Source: https://github.com/open-webui/open-webui
+
+Check the license of each before redistributing anything built from them.
