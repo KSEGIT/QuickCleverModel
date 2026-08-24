@@ -102,3 +102,10 @@ Useful commands:
 - [docs/decisions.md](docs/decisions.md) — why we built it this way, with measured evidence.
 - [docs/tuning.md](docs/tuning.md) — speed numbers measured on this machine.
 - [docs/macos.md](docs/macos.md) — setup and day-to-day use on a Mac.
+
+## License
+
+MIT — see [LICENSE](LICENSE). That covers the scripts, compose files, menu bar
+app, tests, and docs in this repository. The inference engine and the model
+weights are not distributed here; they are fetched from their own sources at
+install time and carry their own terms. See [NOTICE](NOTICE).
