@@ -27,3 +27,6 @@ docs/superpowers/
 
 # subagent-driven-development scratch (ledger, briefs, review packages)
 .superpowers/
+
+# git worktrees for parallel agent sessions
+.worktrees/

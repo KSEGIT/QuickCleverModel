@@ -1,0 +1,40 @@
+name: tests
+
+# The suite is stdlib-only and needs no .env, no weights and no running
+# services: the tests assert contract shape rather than standing up the stack.
+# That is what makes it safe to run on a bare runner.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A superseded run tells you nothing useful.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Both platforms are shipped, so both must report. One red must not
+      # hide the other's result.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          # Matches the 3.11 used for local development. The suite imports
+          # nothing outside the stdlib, so there is no install step.
+          python-version: '3.11'
+
+      - name: Run the unittest suite
+        run: python3 -m unittest discover -s tests -v
