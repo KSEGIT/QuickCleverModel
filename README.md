@@ -4,6 +4,10 @@
 
 # QuickCleverModel — Bonsai 27B, fast on consumer GPUs
 
+[![tests](https://github.com/KSEGIT/QuickCleverModel/actions/workflows/tests.yml/badge.svg)](https://github.com/KSEGIT/QuickCleverModel/actions/workflows/tests.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![release](https://img.shields.io/github/v/release/KSEGIT/QuickCleverModel)](https://github.com/KSEGIT/QuickCleverModel/releases/latest)
+
 ## What is this?
 
 This runs a 27B thinking AI model on your own computer. You need a Mac with
