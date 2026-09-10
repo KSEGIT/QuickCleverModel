@@ -38,7 +38,7 @@ The container still pointed at the old folder. Docker made that folder again,
 empty. So `/app/models` held no weights. The containers were alive. They just
 could not answer.
 
-A health check cannot see this. A real answer can. That is why step 4 loads
+A health check cannot see this. A real answer can. That is why step 6 loads
 every model, and why step 1 refuses to start when the weights folder is empty.
 
 ## Why it tests every alias, not just one

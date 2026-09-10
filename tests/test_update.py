@@ -13,6 +13,7 @@ Every JSON fixture below is a VERBATIM response captured from the box
 that motivated this script. They are not invented.
 """
 import json
+import shlex
 import os
 import subprocess
 import tempfile
@@ -262,7 +263,8 @@ class RollbackIsSticky(unittest.TestCase):
             self._pinned_bad("sha=aaa\nbad=oldbad\nbad=newbad\n"), "newbad")
 
     def test_update_refuses_a_commit_that_already_failed(self):
-        body = open(UPDATE_SH).read()
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
         self.assertIn('bad="$(pinned_bad)"', body,
                       "cmd_update must consult the pin before pulling")
         self.assertIn('already failed its smoke test', body,
@@ -274,13 +276,15 @@ class RollbackReportsHonestly(unittest.TestCase):
         """`git reset --hard ... >/dev/null 2>&1` discards the exit status, so
         a reset onto a commit that no longer exists left the broken code
         checked out while the run still logged success."""
-        body = open(UPDATE_SH).read()
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
         self.assertNotIn('reset --hard "$sha" >/dev/null 2>&1', body)
         self.assertIn("STILL checked out", body,
                       "a failed restore has to be stated, not swallowed")
 
     def test_answering_is_not_reported_as_restored(self):
-        body = open(UPDATE_SH).read()
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
         self.assertIn("was NOT fully restored", body,
                       "a stack that answers with the bad code still checked "
                       "out is not a successful rollback")
@@ -291,7 +295,8 @@ class CheckActuallyCompares(unittest.TestCase):
         """The old code took `docker manifest inspect | head -c 40`, which is
         the first 40 bytes of the manifest JSON, and never compared it to
         anything. --check reported "up to date" on a six-month-old image."""
-        body = open(UPDATE_SH).read()
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
         self.assertNotIn("head -c 40", body)
         self.assertIn("RepoDigests", body,
                       "the local side must be a repo digest, not .Id, which "
@@ -301,11 +306,13 @@ class CheckActuallyCompares(unittest.TestCase):
         """buildx is a CLI plugin the distro docker.io package does not ship —
         confirmed absent on the box this runs on, where `docker buildx` is an
         unknown command. Depending on it made --check permanently 'unknown'."""
-        body = open(UPDATE_SH).read()
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
         self.assertNotIn("buildx imagetools inspect \"$1\"", body)
 
     def test_unknown_drift_is_not_reported_as_up_to_date(self):
-        body = open(UPDATE_SH).read()
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
         self.assertIn("image drift unknown", body)
 
 
@@ -314,11 +321,120 @@ class PreflightChecksEveryTool(unittest.TestCase):
         """smoke_ok and parse_model_ids are python3. A missing interpreter
         exits 127, which reads exactly like a dead model — so it would roll
         back a healthy stack and then fail its own rollback the same way."""
-        body = open(UPDATE_SH).read()
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
         line = [l for l in body.splitlines() if l.strip().startswith("for tool in")]
         self.assertEqual(len(line), 1, "expected one required-tool list")
         for tool in ("docker", "git", "curl", "python3"):
             self.assertIn(tool, line[0], f"{tool} is used but never checked")
+
+
+class SmokeHasThreeOutcomes(unittest.TestCase):
+    """smoke() decides whether a stack gets torn down, so "the model is dead"
+    and "I could not ask" must not collapse into one answer.
+
+    Drives the real smoke() with a stubbed ask(), so no server is needed.
+    """
+
+    @staticmethod
+    def _ask_stub(models=(200, MODELS_LIST), chat=(200, GOOD_CONTENT)):
+        mcode, mbody = models
+        ccode, cbody = chat
+        return (
+            'ask() { case "$1" in '
+            f'*models) printf "{mcode}\\n%s" {shlex.quote(mbody)};; '
+            f'*) printf "{ccode}\\n%s" {shlex.quote(cbody)};; '
+            'esac; }'
+        )
+
+    def _smoke(self, stub):
+        script = (
+            'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+            f'source "{UPDATE_SH}"; API=http://stub; BONSAI_API_KEY=k; '
+            f'{stub}; smoke; echo "rc=$?"'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        return r.stdout + r.stderr
+
+    def test_every_model_answering_is_success(self):
+        self.assertIn("rc=0", self._smoke(self._ask_stub()))
+
+    def test_a_dead_model_is_a_real_failure(self):
+        """A 500 'failed to load' is the outage. rc=1 means roll back."""
+        out = self._smoke(self._ask_stub(chat=(500, FAILED_LOAD)))
+        self.assertIn("rc=1", out)
+        self.assertIn("failed to load", out,
+                      "the error body is the whole diagnostic — curl -f used "
+                      "to throw it away and log an empty reason")
+
+    def test_a_rotated_key_is_not_a_dead_model(self):
+        """401 means our credentials are stale, not that the stack is broken.
+        Rolling back here would turn our own problem into a real outage."""
+        out = self._smoke(self._ask_stub(models=(401, '{"error":"unauthorized"}')))
+        self.assertIn("rc=2", out)
+
+    def test_a_401_on_one_model_still_stops_the_run(self):
+        out = self._smoke(self._ask_stub(chat=(401, '{"error":"nope"}')))
+        self.assertIn("rc=2", out)
+
+    def test_curl_failing_outright_is_not_a_dead_model(self):
+        self.assertIn("rc=2", self._smoke("ask() { return 7; }"))
+
+    def test_a_reasoning_only_reply_passes_end_to_end(self):
+        """The thinking-model fixture, through the real smoke() this time."""
+        out = self._smoke(self._ask_stub(chat=(200, GOOD_REASONING_ONLY)))
+        self.assertIn("rc=0", out)
+
+    def test_ask_does_not_use_curl_f(self):
+        """curl -f prints nothing on HTTP >= 400 and returns 22, so the error
+        body — the only explanation the operator ever gets — is discarded."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        fn = body[body.index("ask() {"):body.index("smoke() {")]
+        self.assertNotIn(" -f", fn, "curl -f would discard the error body")
+
+
+class PinningIsNarrow(unittest.TestCase):
+    """The refusal message says a commit 'already failed its smoke test'. That
+    has to be true, so only the smoke-failure path may pin."""
+
+    def test_only_the_smoke_failure_path_pins(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertEqual(body.count("do_rollback pin"), 1,
+                         "exactly one call site may pin a commit")
+        # build / compose up / health failures are infrastructure, not proof
+        # of a bad commit — compose.linux.yaml warns that a bind can lose a
+        # race with tailscaled at boot.
+        for site in ('warn "build failed"; do_rollback;',
+                     'warn "compose up failed"; do_rollback;',
+                     'warn "never became healthy"; do_rollback;'):
+            self.assertIn(site, body, f"{site!r} must roll back WITHOUT pinning")
+
+    def test_manual_rollback_does_not_pin(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn("--rollback) preflight; do_rollback;;", body,
+                      "a deliberate rollback must not blacklist the commit")
+
+
+class SignalHandling(unittest.TestCase):
+    def test_the_signal_trap_exits(self):
+        """bash RESUMES after a non-EXIT trap handler returns. A handler that
+        only cleaned up would let the run keep pulling and building past
+        systemd's TimeoutStartSec, until SIGKILL."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn("exit 143", body)
+        self.assertRegex(body, r"trap '[^']*exit 143' INT TERM")
+
+    def test_exec_failure_has_a_fallback(self):
+        """/tmp mounted noexec is ordinary hardening; bash can still read a
+        script it may not execute."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn("shopt -s execfail", body)
+        self.assertIn('exec bash "$copy" "$@"', body)
 
 
 class UsageContract(unittest.TestCase):
@@ -383,6 +499,15 @@ class SystemdUnits(unittest.TestCase):
         self.assertIn("Persistent=true", body,
                       "a box that was off on the scheduled day should still "
                       "update when it comes back")
+
+    def test_service_has_no_install_section(self):
+        """A timer-activated oneshot with [Install] can be enabled on its own,
+        and then it runs a full pull, rebuild and smoke sweep on every boot —
+        while the GPU stack is still coming up."""
+        with open(self.SERVICE) as fh:
+            lines = [l.strip() for l in fh]
+        self.assertNotIn("[Install]", lines,
+                         "enable the timer, not the service")
 
     def test_timer_is_wanted_by_timers_target(self):
         with open(self.TIMER) as fh:

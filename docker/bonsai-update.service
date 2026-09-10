@@ -41,5 +41,9 @@ TimeoutStartSec=14400
 Nice=10
 IOSchedulingClass=idle
 
-[Install]
-WantedBy=multi-user.target
+# No [Install] section, on purpose. This unit is started by
+# bonsai-update.timer, and that is the unit you enable. With an [Install]
+# here, `systemctl enable bonsai-update.service` — a natural thing to type
+# after installing the file — would run a full pull, rebuild and smoke sweep
+# on every boot, at the worst possible moment: while the GPU stack is still
+# coming up and LLAMA_BIND2 may not be bound yet.

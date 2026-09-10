@@ -84,6 +84,67 @@ text = (msg.get("content") or "") + (msg.get("reasoning_content") or "")
 sys.exit(0 if text.strip() else 1)'
 }
 
+# ask <url> [curl args...] -> prints "<http_code>\n<body>", returns curl's status
+#
+# Deliberately no -f: curl with -f prints NOTHING on an HTTP error and just
+# returns 22. The body of a 500 is the entire diagnostic here — it carries
+# `{"error":{"message":"model ... failed to load"}}`, the exact text this
+# script exists to surface. With -f the operator gets a rollback and an empty
+# reason in the journal.
+ask() {
+  local url="$1"; shift
+  local out rc
+  out="$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $BONSAI_API_KEY" \
+        "$@" "$url" 2>/dev/null)"; rc=$?
+  printf '%s\n%s' "${out##*$'\n'}" "${out%$'\n'*}"
+  return "$rc"
+}
+
+# Exit status, and it has three meanings, not two:
+#   0  every model answered
+#   1  a model could not answer            -> a real outage, roll back
+#   2  we could not ASK                    -> our problem, do NOT roll back
+#
+# The third is the point. A rotated BONSAI_API_KEY, a connection reset or a
+# timeout would otherwise look exactly like a dead model, and tear down a
+# stack that was serving perfectly.
+smoke() {
+  local resp code body ids id failed=0
+
+  resp="$(ask "$API/v1/models" -m 15)" || {
+    warn "could not reach $API/v1/models (curl failed)"; return 2; }
+  code="${resp%%$'\n'*}"; body="${resp#*$'\n'}"
+  if [[ "$code" != "200" ]]; then
+    warn "/v1/models returned HTTP $code — cannot judge the stack: ${body:0:200}"
+    return 2
+  fi
+  ids="$(printf '%s' "$body" | parse_model_ids)"
+  [[ -n "$ids" ]] || { warn "/v1/models listed no models"; return 2; }
+
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    log "  smoke: $id"
+    resp="$(ask "$API/v1/chat/completions" -m 600 \
+      -H "Content-Type: application/json" \
+      -d "{\"model\":\"$id\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"max_tokens\":8}")" || {
+        warn "  smoke: $id — curl failed; cannot judge the stack"; return 2; }
+    code="${resp%%$'\n'*}"; body="${resp#*$'\n'}"
+    case "$code" in
+      401|403|404)
+        # Our credentials or our URL, not the model.
+        warn "  smoke: $id returned HTTP $code — cannot judge the stack"
+        return 2;;
+    esac
+    if printf '%s' "$body" | smoke_ok; then
+      log "  smoke: $id OK"
+    else
+      warn "  smoke: $id FAILED (HTTP $code) — ${body:0:200}"
+      failed=1
+    fi
+  done <<< "$ids"
+  return "$failed"
+}
+
 # Sourced by the test suite to exercise the helpers above without running an
 # update. Executing the script normally leaves BONSAI_UPDATE_LIB unset, the
 # && short-circuits, and the `return` is never reached.
@@ -101,19 +162,31 @@ sys.exit(0 if text.strip() else 1)'
 # will touch. The copy deletes itself on exit.
 if [[ -z "${BONSAI_UPDATE_REEXEC:-}" ]]; then
   copy="$(mktemp "${TMPDIR:-/tmp}/bonsai-update.XXXXXX")" || die "mktemp failed"
+  # Only reached if a step below fails: a successful exec replaces this shell
+  # and the child cleans up after itself.
+  trap 'rm -f -- "$copy"' EXIT
   cat "${BASH_SOURCE[0]}" > "$copy" || die "could not copy myself to $copy"
   chmod +x "$copy"
   export BONSAI_UPDATE_REEXEC=1
   export BONSAI_UPDATE_ROOT="$ROOT"
+  # execfail keeps the shell alive if the exec cannot happen, so the fallback
+  # below is reachable. /tmp mounted noexec is ordinary hardening, and bash
+  # can still READ a script it is not allowed to execute.
+  shopt -s execfail
   exec "$copy" "$@"
+  exec bash "$copy" "$@"
 fi
 
 # Captured now: inside a function BASH_SOURCE[0] is the function's source, so
 # reading it at trap time would delete the wrong path.
 SELF="${BASH_SOURCE[0]}"
-# systemd sends SIGTERM at TimeoutStartSec, and bash does not run an EXIT
-# trap on an untrapped signal — without INT/TERM here the copy leaks.
-trap 'rm -f -- "$SELF"' EXIT INT TERM
+# Two traps, deliberately. bash does not run an EXIT trap on an untrapped
+# signal, so the copy would leak on systemd's SIGTERM at TimeoutStartSec —
+# but bash also RESUMES after a non-EXIT handler returns, so a handler that
+# only cleans up would let the run carry on pulling and building until
+# SIGKILL arrives. The signal handler has to exit.
+trap 'rm -f -- "$SELF"' EXIT
+trap 'warn "interrupted — stopping"; rm -f -- "$SELF"; exit 143' INT TERM
 
 # --- everything below needs a real box ---------------------------------------
 
@@ -263,55 +336,51 @@ wait_for_health() {
   return 1
 }
 
-smoke() {
-  # Load every alias and require a real generation from each. Slow by design:
-  # a cold 27B load is the thing being tested.
-  local ids id body failed=0
-  ids="$(curl -fsS -m 15 -H "Authorization: Bearer $BONSAI_API_KEY" \
-         "$API/v1/models" 2>/dev/null | parse_model_ids)"
-  [[ -n "$ids" ]] || { warn "/v1/models returned nothing"; return 1; }
-
-  while read -r id; do
-    [[ -n "$id" ]] || continue
-    log "  smoke: $id"
-    body="$(curl -fsS -m 600 \
-      -H "Authorization: Bearer $BONSAI_API_KEY" \
-      -H "Content-Type: application/json" \
-      -d "{\"model\":\"$id\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"max_tokens\":8}" \
-      "$API/v1/chat/completions" 2>/dev/null)"
-    if printf '%s' "$body" | smoke_ok; then
-      log "  smoke: $id OK"
-    else
-      warn "smoke: $id FAILED — ${body:0:200}"
-      failed=1
-    fi
-  done <<< "$ids"
-  return "$failed"
-}
-
 record_rollback_point() {
   local verified="${1:-0}"
   mkdir -p "$(dirname "$STATE")" \
     || die "cannot create $(dirname "$STATE") — refusing to update with no way back"
-  local sha webui
+  local sha webui llama pins
   sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   webui="$(docker image inspect "$WEBUI_IMAGE" --format '{{.Id}}' 2>/dev/null)"
+  llama="$(docker image inspect "$LLAMA_IMAGE" --format '{{.Id}}' 2>/dev/null)"
   # Retag rather than copy: the old layers stay on disk under a second name,
-  # so rollback is a tag move and needs no network.
-  docker image inspect "$LLAMA_IMAGE" >/dev/null 2>&1 \
-    && docker tag "$LLAMA_IMAGE" "$ROLLBACK_IMAGE"
+  # so rollback is a tag move and needs no network. Recording the image id
+  # alongside it matters — if this tag fails, bonsai-llama:rollback still
+  # points at whatever an earlier run left there, and restoring it would pair
+  # one commit's source with another commit's binary.
+  if [[ -n "$llama" ]]; then
+    docker tag "$LLAMA_IMAGE" "$ROLLBACK_IMAGE" \
+      || warn "could not tag $ROLLBACK_IMAGE; rollback may have no image to restore"
+  else
+    warn "no $LLAMA_IMAGE present to save"
+  fi
+  # do_rollback appends bad= pins here; a plain truncate would drop them.
+  pins="$(grep '^bad=' "$STATE" 2>/dev/null)"
   # An unwritten rollback point is only discovered when it is needed, which
   # is after the stack is already broken. Fail now instead.
-  printf 'sha=%s\nwebui=%s\nverified=%s\n' "$sha" "$webui" "$verified" > "$STATE" \
+  printf 'sha=%s\nwebui=%s\nllama=%s\nverified=%s\n' \
+    "$sha" "$webui" "$llama" "$verified" > "$STATE" \
     || die "cannot write the rollback point to $STATE — refusing to update with no way back"
+  [[ -n "$pins" ]] && printf '%s\n' "$pins" >> "$STATE"
   log "rollback point: ${sha:0:12} / ${webui:0:19} (verified=$verified)"
 }
 
+# do_rollback [pin]
+#
+# "pin" is passed ONLY by the smoke-failure path. A build that failed on a
+# network blip, a compose up that lost a race with tailscaled bringing up
+# LLAMA_BIND2 (compose.linux.yaml warns about exactly this), or a human
+# running --rollback deliberately must not blacklist a commit — the refusal
+# message says the commit "already failed its smoke test", and that has to
+# stay true.
 do_rollback() {
   [[ -f "$STATE" ]] || die "no rollback point recorded at $STATE"
-  local sha webui verified bad restored=1
+  local pin="${1:-}"
+  local sha webui llama verified bad restored=1
   sha="$(sed -n 's/^sha=//p' "$STATE")"
   webui="$(sed -n 's/^webui=//p' "$STATE")"
+  llama="$(sed -n 's/^llama=//p' "$STATE")"
   verified="$(sed -n 's/^verified=//p' "$STATE")"
   [[ "$verified" == "1" ]] || warn \
     "the recorded rollback point was never proven to serve — restoring it anyway"
@@ -332,19 +401,25 @@ do_rollback() {
     restored=0
   fi
 
-  if docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
-    docker tag "$ROLLBACK_IMAGE" "$LLAMA_IMAGE" \
-      || { warn "could not restore $LLAMA_IMAGE"; restored=0; }
-  else
+  local have
+  have="$(docker image inspect "$ROLLBACK_IMAGE" --format '{{.Id}}' 2>/dev/null)"
+  if [[ -z "$have" ]]; then
     warn "no $ROLLBACK_IMAGE to restore; keeping the current llama image"
     restored=0
+  elif [[ -n "$llama" && "$have" != "$llama" ]]; then
+    # A stale tag would pair this commit's source with another commit's binary.
+    warn "$ROLLBACK_IMAGE is ${have:0:19}, not the recorded ${llama:0:19} — not restoring it"
+    restored=0
+  else
+    docker tag "$ROLLBACK_IMAGE" "$LLAMA_IMAGE" \
+      || { warn "could not restore $LLAMA_IMAGE"; restored=0; }
   fi
   if [[ -n "$webui" ]] && docker image inspect "$webui" >/dev/null 2>&1; then
     docker tag "$webui" "$WEBUI_IMAGE" || warn "could not restore $WEBUI_IMAGE"
   fi
 
   # Appended after the reset so the pin survives even when the reset failed.
-  if [[ -n "$bad" && "$bad" != "$sha" ]]; then
+  if [[ "$pin" == "pin" && -n "$bad" && "$bad" != "$sha" ]]; then
     printf 'bad=%s\n' "$bad" >> "$STATE" \
       || warn "could not pin the failed commit; it may be retried next week"
   fi
@@ -449,9 +524,16 @@ To try it again anyway:
   wait_for_health || { warn "never became healthy"; do_rollback; exit 1; }
 
   log "smoke testing every model"
-  if ! smoke; then
+  smoke; local verdict=$?
+  if (( verdict == 2 )); then
+    # We could not ask. Tearing down a stack we failed to interrogate would
+    # turn our own broken credentials or network into a real outage.
+    die "could not determine whether the stack works, so this run will not
+judge it. The update is applied and NOT rolled back — check the warnings
+above, then run ./update.sh --rollback yourself if you want the old version."
+  elif (( verdict != 0 )); then
     warn "smoke test failed after update — rolling back"
-    do_rollback
+    do_rollback pin
     exit 1
   fi
 
