@@ -14,6 +14,7 @@ that motivated this script. They are not invented.
 """
 import json
 import shlex
+import shutil
 import os
 import subprocess
 import tempfile
@@ -392,6 +393,138 @@ class SmokeHasThreeOutcomes(unittest.TestCase):
             body = fh.read()
         fn = body[body.index("ask() {"):body.index("smoke() {")]
         self.assertNotIn(" -f", fn, "curl -f would discard the error body")
+
+
+class NeverDeletesTheRealScript(unittest.TestCase):
+    """The delete-on-exit trap must only ever fire for the temp copy.
+
+    The trap used to arm on a bare BONSAI_UPDATE_REEXEC flag, so anything
+    that put that name in the environment — a hand-export, a stale value
+    inherited from a parent, or falling through a failed re-exec — armed it
+    while BASH_SOURCE[0] was still the repo's own update.sh. Exiting then
+    deleted the real script off disk. Reproduced before the fix: after one
+    `BONSAI_UPDATE_REEXEC=1 bash update.sh --help`, the file was gone.
+    """
+
+    def test_a_stale_reexec_variable_does_not_delete_the_script(self):
+        with tempfile.TemporaryDirectory() as d:
+            copy = os.path.join(d, "update.sh")
+            shutil.copy(UPDATE_SH, copy)
+            os.chmod(copy, 0o755)
+            env = dict(os.environ, BONSAI_UPDATE_REEXEC="1")
+            subprocess.run(["bash", copy, "--help"], capture_output=True,
+                           text=True, env=env, cwd=d)
+            self.assertTrue(os.path.isfile(copy),
+                            "update.sh deleted itself — the EXIT trap fired "
+                            "for the repo's own file, not the temp copy")
+
+    def test_a_mismatched_reexec_path_does_not_delete_the_script(self):
+        """The variable now carries the copy's path; a value naming some other
+        file must not license deleting the one that is running."""
+        with tempfile.TemporaryDirectory() as d:
+            copy = os.path.join(d, "update.sh")
+            shutil.copy(UPDATE_SH, copy)
+            os.chmod(copy, 0o755)
+            env = dict(os.environ,
+                       BONSAI_UPDATE_REEXEC=os.path.join(d, "somewhere-else"))
+            subprocess.run(["bash", copy, "--help"], capture_output=True,
+                           text=True, env=env, cwd=d)
+            self.assertTrue(os.path.isfile(copy))
+
+    def test_the_normal_run_still_cleans_up_its_copy(self):
+        """The guard must not be so tight that the real copy leaks."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, TMPDIR=tmp)
+            env.pop("BONSAI_UPDATE_REEXEC", None)
+            r = subprocess.run(["bash", UPDATE_SH, "--help"],
+                               capture_output=True, text=True, cwd=ROOT, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(
+                [f for f in os.listdir(tmp) if f.startswith("bonsai-update.")], [])
+
+    def test_a_failed_reexec_does_not_fall_through(self):
+        """Falling out of the re-exec block would run on from the very file
+        git is about to rewrite — what the copy exists to prevent."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn("could not run the copy at", body,
+                      "the fallback must die, not continue")
+
+
+class WeightsMayBeSymlinked(unittest.TestCase):
+    """Weights routinely live on a second drive with models/ symlinked in.
+    Docker resolves that bind mount fine, so a find that refuses to follow
+    symlinks reports "no weights" for a stack that works — and preflight then
+    blocks update, --check and --rollback alike."""
+
+    def _models_present(self, path):
+        script = (
+            'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+            f'source "{UPDATE_SH}"; models_present {shlex.quote(path)}'
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True).returncode
+
+    def test_a_symlinked_models_dir_is_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "on-the-big-disk", "Bonsai-27B-gguf")
+            os.makedirs(real)
+            open(os.path.join(real, "Bonsai-27B-Q1_0.gguf"), "w").close()
+            link = os.path.join(d, "models")
+            os.symlink(os.path.join(d, "on-the-big-disk"), link)
+            self.assertEqual(self._models_present(link), 0,
+                             "a symlinked models dir must still count")
+
+    def test_a_symlinked_model_subdir_is_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            models = os.path.join(d, "models")
+            os.makedirs(models)
+            real = os.path.join(d, "elsewhere")
+            os.makedirs(real)
+            open(os.path.join(real, "Ternary-Bonsai-27B-Q2_0.gguf"), "w").close()
+            os.symlink(real, os.path.join(models, "Ternary-Bonsai-27B-gguf"))
+            self.assertEqual(self._models_present(models), 0)
+
+    def test_an_empty_symlink_target_is_still_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "empty"))
+            link = os.path.join(d, "models")
+            os.symlink(os.path.join(d, "empty"), link)
+            self.assertNotEqual(self._models_present(link), 0)
+
+
+class RestoreIsAllOrNothing(unittest.TestCase):
+    """A rollback that only half happened must not log "rollback verified"."""
+
+    def setUp(self):
+        with open(UPDATE_SH) as fh:
+            self.body = fh.read()
+
+    def test_an_unrecorded_llama_image_blocks_the_restore(self):
+        self.assertIn("no llama image id recorded", self.body,
+                      "an empty recorded id used to skip the guard entirely "
+                      "and tag whatever an earlier run left under :rollback")
+
+    def test_a_pruned_webui_image_is_not_silently_skipped(self):
+        self.assertIn("is gone (pruned?)", self.body)
+
+    def test_every_restore_failure_clears_restored(self):
+        """Each warn in the restore section must also drop `restored`."""
+        start = self.body.index("do_rollback() {")
+        end = self.body.index("cmd_check() {")
+        section = self.body[start:end]
+        self.assertGreaterEqual(section.count("restored=0"), 6,
+                                "a restore step warns without clearing the flag")
+
+
+class CheckNeverGuesses(unittest.TestCase):
+    def test_an_unresolvable_upstream_is_not_up_to_date(self):
+        """`rev-list ... || echo 0` reported "code up to date" on a detached
+        HEAD or a branch with no tracking branch."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertNotIn("rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0", body)
+        self.assertIn("no upstream for HEAD", body)
 
 
 class PinningIsNarrow(unittest.TestCase):

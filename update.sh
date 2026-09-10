@@ -26,6 +26,10 @@ LLAMA_IMAGE="bonsai-llama:cuda"
 ROLLBACK_IMAGE="bonsai-llama:rollback"
 WEBUI_IMAGE="ghcr.io/open-webui/open-webui:main"
 LLAMA_CONTAINER="bonsai-llama-1"
+# Per-model smoke request. Generous: /health answering says nothing about
+# whether a model is loaded, and in router mode the first request pays the
+# whole cold load. Override on a slow box with BONSAI_SMOKE_TIMEOUT.
+CHAT_TIMEOUT="${BONSAI_SMOKE_TIMEOUT:-900}"
 
 log()  { printf '%s  %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 warn() { printf '%s  WARN %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -38,9 +42,13 @@ models_present() {
   # 2026-09-10 failure: a bind-mount source that exists but is empty.
   local dir="${1:-}"
   [[ -n "$dir" && -d "$dir" ]] || return 1
+  # -L because weights routinely live on a second drive with models/ (or one
+  # model dir) symlinked in. Docker resolves that bind mount fine, so a plain
+  # -P find would report "no weights" for a stack that works, and preflight
+  # would block update, --check and --rollback alike.
   # -print -quit stops at the first hit; the tree is ~11 GB and the only
   # question is whether it holds any weights at all.
-  [[ -n "$(find "$dir" -name '*.gguf' -type f -print -quit 2>/dev/null)" ]]
+  [[ -n "$(find -L "$dir" -name '*.gguf' -type f -print -quit 2>/dev/null)" ]]
 }
 
 parse_model_ids() {
@@ -109,7 +117,7 @@ ask() {
 # timeout would otherwise look exactly like a dead model, and tear down a
 # stack that was serving perfectly.
 smoke() {
-  local resp code body ids id failed=0
+  local resp code body ids id rc failed=0
 
   resp="$(ask "$API/v1/models" -m 15)" || {
     warn "could not reach $API/v1/models (curl failed)"; return 2; }
@@ -124,10 +132,21 @@ smoke() {
   while read -r id; do
     [[ -n "$id" ]] || continue
     log "  smoke: $id"
-    resp="$(ask "$API/v1/chat/completions" -m 600 \
+    resp="$(ask "$API/v1/chat/completions" -m "$CHAT_TIMEOUT" \
       -H "Content-Type: application/json" \
-      -d "{\"model\":\"$id\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"max_tokens\":8}")" || {
-        warn "  smoke: $id — curl failed; cannot judge the stack"; return 2; }
+      -d "{\"model\":\"$id\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"max_tokens\":8}")"; rc=$?
+    if (( rc != 0 )); then
+      # /health answering does not mean a model is loaded: in router mode the
+      # first request carries the whole cold load. A timeout is ambiguous — a
+      # wedged model looks the same as a very slow first read — so it stays
+      # "cannot judge" and never triggers a rollback on its own.
+      if (( rc == 28 )); then
+        warn "  smoke: $id timed out after ${CHAT_TIMEOUT}s — a cold load can exceed this; raise BONSAI_SMOKE_TIMEOUT if the box is slow"
+      else
+        warn "  smoke: $id — curl failed (exit $rc); cannot judge the stack"
+      fi
+      return 2
+    fi
     code="${resp%%$'\n'*}"; body="${resp#*$'\n'}"
     case "$code" in
       401|403|404)
@@ -167,7 +186,9 @@ if [[ -z "${BONSAI_UPDATE_REEXEC:-}" ]]; then
   trap 'rm -f -- "$copy"' EXIT
   cat "${BASH_SOURCE[0]}" > "$copy" || die "could not copy myself to $copy"
   chmod +x "$copy"
-  export BONSAI_UPDATE_REEXEC=1
+  # Carries the copy's PATH, not a flag. The child deletes the file it is
+  # running only when that file is this copy — see the trap below.
+  export BONSAI_UPDATE_REEXEC="$copy"
   export BONSAI_UPDATE_ROOT="$ROOT"
   # execfail keeps the shell alive if the exec cannot happen, so the fallback
   # below is reachable. /tmp mounted noexec is ordinary hardening, and bash
@@ -175,18 +196,32 @@ if [[ -z "${BONSAI_UPDATE_REEXEC:-}" ]]; then
   shopt -s execfail
   exec "$copy" "$@"
   exec bash "$copy" "$@"
+  # Never fall through to the code below from here: it would run on from the
+  # very file git is about to rewrite, which is what the copy exists to avoid.
+  die "could not run the copy at $copy (is ${TMPDIR:-/tmp} noexec, and is bash missing?)"
 fi
 
-# Captured now: inside a function BASH_SOURCE[0] is the function's source, so
-# reading it at trap time would delete the wrong path.
+# Delete-on-exit applies to the temp copy and NOTHING else. BONSAI_UPDATE_REEXEC
+# holds the copy's path, so this compares it against the file actually running:
+# with the variable merely present in the environment — someone exporting it by
+# hand, or a stale value inherited from a parent — the old flag-based check
+# armed the trap while BASH_SOURCE[0] was still the repo's own update.sh, and
+# exiting deleted the real script off disk.
+#
+# Captured now because inside a function BASH_SOURCE[0] is the function's
+# source file, so reading it at trap time would name the wrong path.
 SELF="${BASH_SOURCE[0]}"
 # Two traps, deliberately. bash does not run an EXIT trap on an untrapped
 # signal, so the copy would leak on systemd's SIGTERM at TimeoutStartSec —
 # but bash also RESUMES after a non-EXIT handler returns, so a handler that
 # only cleans up would let the run carry on pulling and building until
 # SIGKILL arrives. The signal handler has to exit.
-trap 'rm -f -- "$SELF"' EXIT
-trap 'warn "interrupted — stopping"; rm -f -- "$SELF"; exit 143' INT TERM
+if [[ "${BONSAI_UPDATE_REEXEC:-}" == "$SELF" ]]; then
+  trap 'rm -f -- "$SELF"' EXIT
+  trap 'warn "interrupted — stopping"; rm -f -- "$SELF"; exit 143' INT TERM
+else
+  trap 'warn "interrupted — stopping"; exit 143' INT TERM
+fi
 
 # --- everything below needs a real box ---------------------------------------
 
@@ -406,7 +441,13 @@ do_rollback() {
   if [[ -z "$have" ]]; then
     warn "no $ROLLBACK_IMAGE to restore; keeping the current llama image"
     restored=0
-  elif [[ -n "$llama" && "$have" != "$llama" ]]; then
+  elif [[ -z "$llama" ]]; then
+    # Nothing was recorded, so :rollback is whatever an earlier run left
+    # there. Restoring it would pair this commit's source with that run's
+    # binary, which is the very thing the recorded id exists to prevent.
+    warn "no llama image id recorded — cannot prove $ROLLBACK_IMAGE belongs to ${sha:0:12}; not restoring it"
+    restored=0
+  elif [[ "$have" != "$llama" ]]; then
     # A stale tag would pair this commit's source with another commit's binary.
     warn "$ROLLBACK_IMAGE is ${have:0:19}, not the recorded ${llama:0:19} — not restoring it"
     restored=0
@@ -414,8 +455,16 @@ do_rollback() {
     docker tag "$ROLLBACK_IMAGE" "$LLAMA_IMAGE" \
       || { warn "could not restore $LLAMA_IMAGE"; restored=0; }
   fi
-  if [[ -n "$webui" ]] && docker image inspect "$webui" >/dev/null 2>&1; then
-    docker tag "$webui" "$WEBUI_IMAGE" || warn "could not restore $WEBUI_IMAGE"
+  if [[ -z "$webui" ]]; then
+    warn "no open-webui image recorded; leaving the current one in place"
+    restored=0
+  elif ! docker image inspect "$webui" >/dev/null 2>&1; then
+    # `docker system prune -a` on a timer is common and takes the old layers.
+    warn "recorded open-webui image ${webui:0:19} is gone (pruned?); leaving the current one"
+    restored=0
+  elif ! docker tag "$webui" "$WEBUI_IMAGE"; then
+    warn "could not restore $WEBUI_IMAGE"
+    restored=0
   fi
 
   # Appended after the reset so the pin survives even when the reset failed.
@@ -424,7 +473,8 @@ do_rollback() {
       || warn "could not pin the failed commit; it may be retried next week"
   fi
 
-  compose up -d --force-recreate || warn "compose failed during rollback"
+  compose up -d --force-recreate \
+    || { warn "compose failed during rollback"; restored=0; }
 
   if wait_for_health && smoke; then
     if (( restored )); then
@@ -442,13 +492,15 @@ do_rollback() {
 
 cmd_check() {
   preflight
-  local behind=0 rc=0
-  if git -C "$ROOT" fetch --quiet 2>/dev/null; then
-    behind="$(git -C "$ROOT" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)"
-  else
-    warn "could not fetch; commit drift unknown"
-  fi
-  if (( behind > 0 )); then
+  local behind rc=0
+  git -C "$ROOT" fetch --quiet 2>/dev/null || warn "could not fetch; drift may be stale"
+  # A detached HEAD or a branch with no upstream makes @{u} fail. Folding that
+  # into 0 reported "code up to date" on a box arbitrarily far behind — the
+  # same mistake the image half of this function refuses to make below.
+  if ! behind="$(git -C "$ROOT" rev-list --count 'HEAD..@{u}' 2>/dev/null)"; then
+    warn "no upstream for HEAD (detached, or no tracking branch) — commit drift unknown"
+    rc=1
+  elif (( behind > 0 )); then
     log "behind origin by $behind commit(s)"
     rc=1
   else
