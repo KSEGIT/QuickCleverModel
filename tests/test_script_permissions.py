@@ -30,6 +30,7 @@ EXECUTABLE = [
     "install.sh",
     "setup-nvidia.sh",
     "setup-opencode.sh",
+    "update.sh",
     "cache-viz.py",
 ]
 

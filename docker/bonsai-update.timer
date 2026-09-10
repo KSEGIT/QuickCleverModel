@@ -1,0 +1,25 @@
+# Fires bonsai-update.service once a week.
+#
+# Install alongside the service (see its header for the sed line), then:
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now bonsai-update.timer
+#   systemctl list-timers bonsai-update.timer
+#
+# Check what it did:  journalctl -u bonsai-update.service -n 50
+
+[Unit]
+Description=Weekly Bonsai stack update
+
+[Timer]
+OnCalendar=weekly
+# Monday 04:00 plus up to 4 hours of jitter. Without the jitter every box that
+# copies this repo hits GHCR on the same second, and an update that lands
+# mid-conversation is worse than one that lands at night.
+RandomizedDelaySec=4h
+# A box that was powered off on the scheduled day still updates when it comes
+# back, instead of silently skipping the week.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

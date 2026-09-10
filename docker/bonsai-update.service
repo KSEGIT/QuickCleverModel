@@ -1,0 +1,36 @@
+# Weekly update for the Linux/Docker Bonsai stack.
+#
+# __ROOT__ and __USER__ are placeholders — this file is not usable as-is.
+# Install it from the repo root with:
+#
+#   sed -e "s|__ROOT__|$PWD|g" -e "s|__USER__|$USER|g" \
+#       docker/bonsai-update.service | sudo tee /etc/systemd/system/bonsai-update.service
+#
+# The user must be in the docker group; update.sh talks to the daemon.
+
+[Unit]
+Description=Update and verify the Bonsai model stack
+# Pulling code and images needs the network, and the smoke test needs the
+# published port to be bound.
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__ROOT__
+ExecStart=__ROOT__/update.sh
+
+# A cold 27B smoke test is minutes, and update.sh rolls back on failure. Give
+# it room to finish rather than killing it midway and leaving a half-updated
+# stack behind.
+TimeoutStartSec=3600
+
+# Build and rollback must not fight the model server for CPU on a box that is
+# also serving chat.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
