@@ -16,9 +16,35 @@
 # the thing can answer. Only a real generation does.
 set -uo pipefail
 
-# BONSAI_UPDATE_ROOT is set by the re-exec below, where this file has been
-# copied to a temp dir and dirname no longer points at the repo.
-ROOT="${BONSAI_UPDATE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# The file actually running. Captured here because inside a function
+# BASH_SOURCE[0] names that function's source, and several guards below
+# compare against it.
+SELF="${BASH_SOURCE[0]}"
+
+# True only when this process is one of our own temp copies.
+#
+# Two conditions, and the second is what makes it safe. Matching the variable
+# alone is not: it is ordinary environment, so a systemd Environment= line, an
+# inherited export or a hand-typed value can name anything — including the
+# repo's own update.sh, which then got the delete-on-exit trap and was removed
+# from disk. mktemp names every copy bonsai-update.XXXXXX and the repo's file
+# is update.sh, so the pattern can never match the real one.
+looks_like_temp_copy() {
+  [[ "${BONSAI_UPDATE_REEXEC:-}" == "$SELF" ]] || return 1
+  case "${SELF##*/}" in
+    bonsai-update.*) return 0;;
+    *) return 1;;
+  esac
+}
+
+# BONSAI_UPDATE_ROOT carries the repo across the re-exec, where this file sits
+# in a temp dir and dirname no longer finds it. Trusted only from a real copy,
+# so a leaked value cannot aim the script at someone else's checkout.
+if looks_like_temp_copy && [[ -n "${BONSAI_UPDATE_ROOT:-}" ]]; then
+  ROOT="$BONSAI_UPDATE_ROOT"
+else
+  ROOT="$(cd "$(dirname "$SELF")" && pwd)"
+fi
 COMPOSE_FILE="$ROOT/docker/compose.linux.yaml"
 ENV_FILE="$ROOT/.env"
 STATE="$ROOT/run/update-state"
@@ -60,6 +86,8 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)          # a bare scalar would raise AttributeError into the journal
 for m in d.get("data", []):
     if m.get("id"):
         print(m["id"])'
@@ -92,19 +120,30 @@ text = (msg.get("content") or "") + (msg.get("reasoning_content") or "")
 sys.exit(0 if text.strip() else 1)'
 }
 
-# ask <url> [curl args...] -> prints "<http_code>\n<body>", returns curl's status
+# ask <url> [curl args...] -> sets ASK_CODE and ASK_BODY, returns curl's status
 #
 # Deliberately no -f: curl with -f prints NOTHING on an HTTP error and just
 # returns 22. The body of a 500 is the entire diagnostic here — it carries
 # `{"error":{"message":"model ... failed to load"}}`, the exact text this
 # script exists to surface. With -f the operator gets a rollback and an empty
 # reason in the journal.
+#
+# Globals, not a printed "code\nbody": re-printing in that order loses the
+# separator when the body is empty. Command substitution strips the trailing
+# newline, "500\n" becomes "500", the caller's ${resp#*\n} finds nothing to
+# cut, and the BODY silently became the status code — so a 500 with no body
+# logged "FAILED (HTTP 500) — 500", discarding the diagnostic this -f-free
+# design exists to preserve. curl puts the code last, which parses correctly
+# for an empty body and a multi-line one alike.
+ASK_CODE=""
+ASK_BODY=""
 ask() {
   local url="$1"; shift
   local out rc
   out="$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $BONSAI_API_KEY" \
         "$@" "$url" 2>/dev/null)"; rc=$?
-  printf '%s\n%s' "${out##*$'\n'}" "${out%$'\n'*}"
+  ASK_CODE="${out##*$'\n'}"
+  ASK_BODY="${out%$'\n'*}"
   return "$rc"
 }
 
@@ -117,24 +156,23 @@ ask() {
 # timeout would otherwise look exactly like a dead model, and tear down a
 # stack that was serving perfectly.
 smoke() {
-  local resp code body ids id rc failed=0
+  local ids id rc failed=0
 
-  resp="$(ask "$API/v1/models" -m 15)" || {
+  ask "$API/v1/models" -m 15 || {
     warn "could not reach $API/v1/models (curl failed)"; return 2; }
-  code="${resp%%$'\n'*}"; body="${resp#*$'\n'}"
-  if [[ "$code" != "200" ]]; then
-    warn "/v1/models returned HTTP $code — cannot judge the stack: ${body:0:200}"
+  if [[ "$ASK_CODE" != "200" ]]; then
+    warn "/v1/models returned HTTP $ASK_CODE — cannot judge the stack: ${ASK_BODY:0:200}"
     return 2
   fi
-  ids="$(printf '%s' "$body" | parse_model_ids)"
+  ids="$(printf '%s' "$ASK_BODY" | parse_model_ids)"
   [[ -n "$ids" ]] || { warn "/v1/models listed no models"; return 2; }
 
   while read -r id; do
     [[ -n "$id" ]] || continue
     log "  smoke: $id"
-    resp="$(ask "$API/v1/chat/completions" -m "$CHAT_TIMEOUT" \
+    ask "$API/v1/chat/completions" -m "$CHAT_TIMEOUT" \
       -H "Content-Type: application/json" \
-      -d "{\"model\":\"$id\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"max_tokens\":8}")"; rc=$?
+      -d "{\"model\":\"$id\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"max_tokens\":8}"; rc=$?
     if (( rc != 0 )); then
       # /health answering does not mean a model is loaded: in router mode the
       # first request carries the whole cold load. A timeout is ambiguous — a
@@ -147,17 +185,16 @@ smoke() {
       fi
       return 2
     fi
-    code="${resp%%$'\n'*}"; body="${resp#*$'\n'}"
-    case "$code" in
+    case "$ASK_CODE" in
       401|403|404)
         # Our credentials or our URL, not the model.
-        warn "  smoke: $id returned HTTP $code — cannot judge the stack"
+        warn "  smoke: $id returned HTTP $ASK_CODE — cannot judge the stack"
         return 2;;
     esac
-    if printf '%s' "$body" | smoke_ok; then
+    if printf '%s' "$ASK_BODY" | smoke_ok; then
       log "  smoke: $id OK"
     else
-      warn "  smoke: $id FAILED (HTTP $code) — ${body:0:200}"
+      warn "  smoke: $id FAILED (HTTP $ASK_CODE) — ${ASK_BODY:-<empty body>}"
       failed=1
     fi
   done <<< "$ids"
@@ -179,17 +216,25 @@ smoke() {
 #
 # Copying to a temp file and exec-ing that leaves bash reading a file nothing
 # will touch. The copy deletes itself on exit.
-if [[ -z "${BONSAI_UPDATE_REEXEC:-}" ]]; then
+#
+# The test is "am I a copy", not "is the variable set". Keying on presence
+# meant any leaked value skipped the copy entirely, and `git pull` and `git
+# reset --hard` then rewrote the very file bash was reading by byte offset.
+if ! looks_like_temp_copy; then
+  # Backstop against an exec loop if TMPDIR ever lands where the name pattern
+  # cannot match. Two attempts is one more than a healthy run needs.
+  (( ${BONSAI_UPDATE_DEPTH:-0} >= 2 )) \
+    && die "re-exec loop: not running from a temp copy after ${BONSAI_UPDATE_DEPTH} attempts"
   copy="$(mktemp "${TMPDIR:-/tmp}/bonsai-update.XXXXXX")" || die "mktemp failed"
   # Only reached if a step below fails: a successful exec replaces this shell
   # and the child cleans up after itself.
   trap 'rm -f -- "$copy"' EXIT
-  cat "${BASH_SOURCE[0]}" > "$copy" || die "could not copy myself to $copy"
+  cat "$SELF" > "$copy" || die "could not copy myself to $copy"
   chmod +x "$copy"
-  # Carries the copy's PATH, not a flag. The child deletes the file it is
-  # running only when that file is this copy — see the trap below.
+  # Carries the copy's PATH, not a flag — see looks_like_temp_copy above.
   export BONSAI_UPDATE_REEXEC="$copy"
   export BONSAI_UPDATE_ROOT="$ROOT"
+  export BONSAI_UPDATE_DEPTH=$(( ${BONSAI_UPDATE_DEPTH:-0} + 1 ))
   # execfail keeps the shell alive if the exec cannot happen, so the fallback
   # below is reachable. /tmp mounted noexec is ordinary hardening, and bash
   # can still READ a script it is not allowed to execute.
@@ -201,22 +246,16 @@ if [[ -z "${BONSAI_UPDATE_REEXEC:-}" ]]; then
   die "could not run the copy at $copy (is ${TMPDIR:-/tmp} noexec, and is bash missing?)"
 fi
 
-# Delete-on-exit applies to the temp copy and NOTHING else. BONSAI_UPDATE_REEXEC
-# holds the copy's path, so this compares it against the file actually running:
-# with the variable merely present in the environment — someone exporting it by
-# hand, or a stale value inherited from a parent — the old flag-based check
-# armed the trap while BASH_SOURCE[0] was still the repo's own update.sh, and
-# exiting deleted the real script off disk.
+# Delete-on-exit applies to a temp copy and NOTHING else — looks_like_temp_copy
+# above explains why the name pattern, not just the variable, is what makes
+# that safe.
 #
-# Captured now because inside a function BASH_SOURCE[0] is the function's
-# source file, so reading it at trap time would name the wrong path.
-SELF="${BASH_SOURCE[0]}"
 # Two traps, deliberately. bash does not run an EXIT trap on an untrapped
 # signal, so the copy would leak on systemd's SIGTERM at TimeoutStartSec —
 # but bash also RESUMES after a non-EXIT handler returns, so a handler that
 # only cleans up would let the run carry on pulling and building until
 # SIGKILL arrives. The signal handler has to exit.
-if [[ "${BONSAI_UPDATE_REEXEC:-}" == "$SELF" ]]; then
+if looks_like_temp_copy; then
   trap 'rm -f -- "$SELF"' EXIT
   trap 'warn "interrupted — stopping"; rm -f -- "$SELF"; exit 143' INT TERM
 else
@@ -312,12 +351,25 @@ PY
 }
 
 running_working_dir() {
-  docker inspect "$LLAMA_CONTAINER" \
+  # Found by IMAGE, not by container name. COMPOSE_PROJECT_NAME in .env
+  # overrides the compose file's `name: bonsai` and is passed through by
+  # --env-file, which renames the container — a name-based lookup then finds
+  # nothing, reads as "nothing is running", and lets the update restart into
+  # the stale bind mount this whole script exists to prevent.
+  local dir
+  dir="$(docker ps --filter "ancestor=$LLAMA_IMAGE" \
+        --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null \
+        | grep -v '^$' | sort -u | head -1)"
+  # Fall back to the conventional name for a stack started before a retag.
+  [[ -n "$dir" ]] || dir="$(docker inspect "$LLAMA_CONTAINER" \
     --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' \
-    2>/dev/null
+    2>/dev/null)"
+  printf '%s' "$dir"
 }
 
+# preflight <mode>   update | rollback | check
 preflight() {
+  local mode="${1:-update}"
   # parse_model_ids and smoke_ok are python3, and curl carries every request.
   # A missing interpreter exits 127, which reads exactly like a dead model —
   # so it would tear down and roll back a perfectly healthy stack. A missing
@@ -335,7 +387,14 @@ This is the Linux/Docker path; macOS uses ./stack.sh"
   [[ -f "$ENV_FILE" ]]     || die "no .env at $ENV_FILE"
   [[ -n "${BONSAI_API_KEY:-}" ]] || die "BONSAI_API_KEY is not set in $ENV_FILE"
 
-  models_present "$ROOT/models" || die \
+  # --check only reads. Dying here would break it at exactly the moment
+  # someone reaches for it — when the stack is dark.
+  [[ "$mode" == "check" ]] && return 0
+
+  # A rollback restores code and images, not weights. Refusing to run it
+  # because the weights are missing takes away the one tool that helps when
+  # the stack is already down.
+  [[ "$mode" == "rollback" ]] || models_present "$ROOT/models" || die \
 "no *.gguf under $ROOT/models
 
 Refusing to restart into an empty bind mount. That is the 2026-09-10 failure
@@ -394,10 +453,18 @@ record_rollback_point() {
   pins="$(grep '^bad=' "$STATE" 2>/dev/null)"
   # An unwritten rollback point is only discovered when it is needed, which
   # is after the stack is already broken. Fail now instead.
-  printf 'sha=%s\nwebui=%s\nllama=%s\nverified=%s\n' \
-    "$sha" "$webui" "$llama" "$verified" > "$STATE" \
-    || die "cannot write the rollback point to $STATE — refusing to update with no way back"
-  [[ -n "$pins" ]] && printf '%s\n' "$pins" >> "$STATE"
+  # Write beside it and rename. `> "$STATE"` truncates when the redirect is
+  # set up, i.e. BEFORE printf can fail — so a full or read-only filesystem
+  # destroyed the previous sha, images and pins, and only then announced it
+  # was "refusing to update with no way back", by which point there was none.
+  local new="$STATE.new"
+  {
+    printf 'sha=%s\nwebui=%s\nllama=%s\nverified=%s\n' \
+      "$sha" "$webui" "$llama" "$verified"
+    [[ -n "$pins" ]] && printf '%s\n' "$pins"
+  } > "$new" || die "cannot write $new — refusing to update with no way back"
+  mv -f "$new" "$STATE" \
+    || die "cannot replace $STATE — refusing to update with no way back"
   log "rollback point: ${sha:0:12} / ${webui:0:19} (verified=$verified)"
 }
 
@@ -476,22 +543,28 @@ do_rollback() {
   compose up -d --force-recreate \
     || { warn "compose failed during rollback"; restored=0; }
 
-  if wait_for_health && smoke; then
-    if (( restored )); then
-      log "rollback verified — stack is serving again"
-      return 0
-    fi
-    # Answering is not the same as being restored: a transient registry
-    # failure can leave the bad code checked out and still serving.
-    warn "the stack answers, but the previous state was NOT fully restored"
+  local verdict=1
+  if wait_for_health; then smoke; verdict=$?; fi
+
+  if (( ! restored )); then
+    # Answering is not the same as being restored: a pruned image or a failed
+    # reset can leave the bad code in place and still serve.
+    warn "the previous state was NOT fully restored — see the warnings above"
     return 1
   fi
-  warn "ROLLBACK DID NOT RECOVER THE STACK — needs a human"
-  return 1
+  case "$verdict" in
+    0) log "rollback verified — stack is serving again"; return 0;;
+    2) # smoke's "could not ask" — a rotated key, a network fault. Every
+       # restore step succeeded, so the rollback itself did work; calling it a
+       # failure would send someone chasing a stack that is fine.
+       warn "rolled back, but could not verify it serves (see above) — check by hand"
+       return 0;;
+    *) warn "ROLLBACK DID NOT RECOVER THE STACK — needs a human"; return 1;;
+  esac
 }
 
 cmd_check() {
-  preflight
+  preflight check
   local behind rc=0
   git -C "$ROOT" fetch --quiet 2>/dev/null || warn "could not fetch; drift may be stale"
   # A detached HEAD or a branch with no upstream makes @{u} fail. Folding that
@@ -529,7 +602,7 @@ cmd_check() {
 }
 
 cmd_update() {
-  preflight
+  preflight update
 
   # A commit that already failed here must not be walked onto again. Without
   # this the rolled-back branch is a plain ancestor of origin, so next week's
@@ -537,7 +610,9 @@ cmd_update() {
   # repeats — the box goes down every week with only a journal line to say so.
   local target bad
   git -C "$ROOT" fetch --quiet 2>/dev/null || warn "fetch failed; using what is already here"
-  target="$(git -C "$ROOT" rev-parse '@{u}' 2>/dev/null)"
+  target="$(git -C "$ROOT" rev-parse '@{u}' 2>/dev/null)" \
+    || die "no upstream for HEAD (detached, or no tracking branch) — nothing to update to"
+  [[ -n "$target" ]] || die "could not resolve the upstream commit"
   bad="$(pinned_bad)"
   if [[ -n "$bad" && "$target" == "$bad" ]]; then
     die "upstream is still at ${target:0:12}, which already failed its smoke test
@@ -558,9 +633,12 @@ To try it again anyway:
   fi
   record_rollback_point "$verified"
 
-  log "pulling code"
-  if ! git -C "$ROOT" pull --ff-only; then
-    die "git pull --ff-only failed — the checkout has diverged, fix it by hand"
+  # merge, not pull: `git pull` runs its OWN fetch, which can land on a commit
+  # newer than the $target the pin was just checked against — including the
+  # pinned bad one, which is the single thing the pin exists to prevent.
+  log "moving to ${target:0:12}"
+  if ! git -C "$ROOT" merge --ff-only "$target"; then
+    die "git merge --ff-only $target failed — the checkout has diverged, fix it by hand"
   fi
 
   log "building llama image"
@@ -610,7 +688,7 @@ USAGE
 case "${1:-}" in
   "")         cmd_update;;
   --check)    cmd_check;;
-  --rollback) preflight; do_rollback;;
+  --rollback) preflight rollback; do_rollback;;
   -h|--help)  usage;;
   *)          usage >&2; exit 2;;
 esac

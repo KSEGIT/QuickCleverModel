@@ -194,13 +194,46 @@ class RunsFromACopy(unittest.TestCase):
         """After re-exec the script lives in a temp dir, so dirname($0) no
         longer finds the repo. ROOT must come from the exported override or
         every path in the script points at /tmp."""
+        # The override is trusted only from something that really looks like
+        # one of our copies: the variable must name the running file AND that
+        # file must carry mktemp's bonsai-update.XXXXXX name. Naming the
+        # repo's own update.sh must not qualify — that is what let the script
+        # delete itself.
+        with tempfile.TemporaryDirectory() as d:
+            copy = os.path.join(d, "bonsai-update.ABC123")
+            shutil.copy(UPDATE_SH, copy)
+            script = (
+                'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+                'export BONSAI_UPDATE_ROOT=/tmp/pretend-repo; '
+                f'export BONSAI_UPDATE_REEXEC="{copy}"; '
+                f'source "{copy}"; echo "$ROOT"'
+            )
+            r = subprocess.run(["bash", "-c", script], capture_output=True,
+                               text=True)
+            self.assertEqual(r.stdout.strip(), "/tmp/pretend-repo", r.stderr)
+
+    def test_the_repo_script_never_counts_as_a_copy(self):
+        """Naming update.sh itself in the variable must not grant it copy
+        status — that combination skipped the self-copy AND armed the delete
+        trap, and removed the real script from disk."""
+        script = (
+            'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+            'export BONSAI_UPDATE_ROOT=/tmp/pretend-repo; '
+            f'export BONSAI_UPDATE_REEXEC="{UPDATE_SH}"; '
+            f'source "{UPDATE_SH}"; echo "$ROOT"'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), ROOT, r.stderr)
+
+    def test_a_root_override_without_a_matching_reexec_is_ignored(self):
+        """A leaked BONSAI_UPDATE_ROOT alone must not redirect the script."""
         script = (
             'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
             'export BONSAI_UPDATE_ROOT=/tmp/pretend-repo; '
             f'source "{UPDATE_SH}"; echo "$ROOT"'
         )
         r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-        self.assertEqual(r.stdout.strip(), "/tmp/pretend-repo", r.stderr)
+        self.assertEqual(r.stdout.strip(), ROOT, r.stderr)
 
     def test_root_defaults_to_the_script_directory(self):
         script = (
@@ -341,11 +374,14 @@ class SmokeHasThreeOutcomes(unittest.TestCase):
     def _ask_stub(models=(200, MODELS_LIST), chat=(200, GOOD_CONTENT)):
         mcode, mbody = models
         ccode, cbody = chat
+        # ask() sets globals rather than printing: re-printing "code\\nbody"
+        # loses the separator when the body is empty, and the body silently
+        # became the status code.
         return (
             'ask() { case "$1" in '
-            f'*models) printf "{mcode}\\n%s" {shlex.quote(mbody)};; '
-            f'*) printf "{ccode}\\n%s" {shlex.quote(cbody)};; '
-            'esac; }'
+            f'*models) ASK_CODE={mcode}; ASK_BODY={shlex.quote(mbody)};; '
+            f'*) ASK_CODE={ccode}; ASK_BODY={shlex.quote(cbody)};; '
+            'esac; return 0; }'
         )
 
     def _smoke(self, stub):
@@ -385,6 +421,28 @@ class SmokeHasThreeOutcomes(unittest.TestCase):
         """The thinking-model fixture, through the real smoke() this time."""
         out = self._smoke(self._ask_stub(chat=(200, GOOD_REASONING_ONLY)))
         self.assertIn("rc=0", out)
+
+    def test_an_empty_error_body_is_not_reported_as_the_status_code(self):
+        """A 500 with no body used to log "FAILED (HTTP 500) — 500": command
+        substitution stripped the trailing newline, so the caller's cut found
+        no separator and handed back the code as the body."""
+        out = self._smoke(self._ask_stub(chat=(500, "")))
+        self.assertIn("rc=1", out)
+        self.assertIn("<empty body>", out)
+        self.assertNotIn("— 500", out)
+
+    def test_ask_parses_curls_own_layout(self):
+        """curl -w appends the code AFTER the body, which survives an empty
+        body and a multi-line body alike."""
+        script = (
+            'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+            f'source "{UPDATE_SH}"; '
+            'out="$(printf \'a\\nb\\n500\')"; '
+            'echo "code=[${out##*$\'\\n\'}] body=[${out%$\'\\n\'*}]"'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertIn("code=[500]", r.stdout)
+        self.assertIn("body=[a\nb]", r.stdout)
 
     def test_ask_does_not_use_curl_f(self):
         """curl -f prints nothing on HTTP >= 400 and returns 22, so the error
@@ -449,6 +507,124 @@ class NeverDeletesTheRealScript(unittest.TestCase):
             body = fh.read()
         self.assertIn("could not run the copy at", body,
                       "the fallback must die, not continue")
+
+
+class LeakedReexecStillCopies(unittest.TestCase):
+    """Keying the guard on the mere PRESENCE of BONSAI_UPDATE_REEXEC meant any
+    leaked value — a systemd Environment= line, an inherited export — skipped
+    the self-copy, and `git pull`/`git reset --hard` then rewrote the very
+    file bash was reading by byte offset.
+
+    Observed through a read-only TMPDIR: if the script still tries to copy
+    itself it dies in mktemp, which a presence-based guard would have skipped
+    entirely.
+    """
+
+    def _run(self, reexec):
+        with tempfile.TemporaryDirectory() as d:
+            ro = os.path.join(d, "ro")
+            os.makedirs(ro)
+            os.chmod(ro, 0o500)
+            try:
+                env = dict(os.environ, TMPDIR=ro)
+                if reexec is None:
+                    env.pop("BONSAI_UPDATE_REEXEC", None)
+                else:
+                    env["BONSAI_UPDATE_REEXEC"] = reexec
+                return subprocess.run(["bash", UPDATE_SH, "--help"],
+                                      capture_output=True, text=True,
+                                      cwd=ROOT, env=env)
+            finally:
+                os.chmod(ro, 0o700)
+
+    def test_a_leaked_flag_value_does_not_skip_the_copy(self):
+        r = self._run("1")
+        self.assertNotEqual(r.returncode, 0,
+                            "a stale value skipped the self-copy entirely")
+        self.assertIn("mktemp failed", r.stderr)
+
+    def test_a_mismatched_path_does_not_skip_the_copy(self):
+        r = self._run("/some/other/update.sh")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("mktemp failed", r.stderr)
+
+    def test_pointing_the_variable_at_the_repo_script_does_not_disarm_it(self):
+        """Setting the variable to the repo's OWN path used to satisfy the
+        path comparison, so the script treated the real update.sh as its temp
+        copy: it skipped the self-copy AND armed the delete trap. Writing this
+        very test deleted update.sh from the worktree. The name pattern is
+        what closes it — mktemp copies are bonsai-update.XXXXXX."""
+        r = self._run(UPDATE_SH)
+        self.assertTrue(os.path.isfile(UPDATE_SH),
+                        "update.sh deleted itself")
+        self.assertNotEqual(r.returncode, 0,
+                            "the repo script must not pass as a temp copy")
+        self.assertIn("mktemp failed", r.stderr)
+
+
+class ReadOnlyCommandsSurviveADarkStack(unittest.TestCase):
+    """--check and --rollback are what you reach for when the stack is down,
+    so the weights gate must not block them."""
+
+    def setUp(self):
+        with open(UPDATE_SH) as fh:
+            self.body = fh.read()
+
+    def test_check_returns_before_the_weights_gate(self):
+        self.assertIn('[[ "$mode" == "check" ]] && return 0', self.body)
+
+    def test_rollback_skips_the_weights_gate(self):
+        self.assertIn('[[ "$mode" == "rollback" ]] || models_present', self.body,
+                      "a rollback restores code and images, not weights")
+
+    def test_each_entry_point_declares_its_mode(self):
+        for site in ("preflight check", "preflight update", "preflight rollback"):
+            self.assertIn(site, self.body)
+
+
+class StateSurvivesAFailedWrite(unittest.TestCase):
+    def test_the_state_file_is_replaced_not_truncated(self):
+        """`> "$STATE"` truncates when the redirect is set up, i.e. before
+        printf can fail — so a full disk destroyed the only way back and then
+        announced it was refusing to proceed without one."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn('mv -f "$new" "$STATE"', body)
+        self.assertNotIn('"$verified" > "$STATE"', body)
+
+
+class RollbackVerdictIsThreeWay(unittest.TestCase):
+    def test_could_not_ask_is_not_a_failed_rollback(self):
+        """Every restore step succeeding but a rotated key blocking the probe
+        printed "ROLLBACK DID NOT RECOVER THE STACK" for a rollback that
+        worked."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn("could not verify it serves", body)
+        section = body[body.index("do_rollback() {"):body.index("cmd_check() {")]
+        self.assertIn("case \"$verdict\" in", section)
+
+
+class GuardsDoNotDependOnTheProjectName(unittest.TestCase):
+    def test_the_running_stack_is_found_by_image(self):
+        """COMPOSE_PROJECT_NAME in .env renames the container, and a
+        name-based lookup then reads as "nothing is running" — letting the
+        update restart into the stale bind mount."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn('docker ps --filter "ancestor=$LLAMA_IMAGE"', body)
+
+
+class PullCannotOutrunThePin(unittest.TestCase):
+    def test_it_merges_the_checked_commit(self):
+        """`git pull` runs its own fetch, which can land on a commit newer
+        than the one the pin was checked against — including the pinned bad
+        one."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn('git -C "$ROOT" merge --ff-only "$target"', body)
+        self.assertNotIn('git -C "$ROOT" pull --ff-only', body,
+                         "pull runs its own fetch and can outrun the pin")
 
 
 class WeightsMayBeSymlinked(unittest.TestCase):
@@ -547,7 +723,7 @@ class PinningIsNarrow(unittest.TestCase):
     def test_manual_rollback_does_not_pin(self):
         with open(UPDATE_SH) as fh:
             body = fh.read()
-        self.assertIn("--rollback) preflight; do_rollback;;", body,
+        self.assertIn("--rollback) preflight rollback; do_rollback;;", body,
                       "a deliberate rollback must not blacklist the commit")
 
 
