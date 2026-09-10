@@ -723,8 +723,13 @@ class PinningIsNarrow(unittest.TestCase):
     def test_manual_rollback_does_not_pin(self):
         with open(UPDATE_SH) as fh:
             body = fh.read()
-        self.assertIn("--rollback) preflight rollback; do_rollback;;", body,
-                      "a deliberate rollback must not blacklist the commit")
+        # The dispatcher's rollback call must not pass `pin`: a deliberate
+        # rollback of a working commit would otherwise blacklist it, and the
+        # next update would refuse it claiming a smoke test that never ran.
+        line = [l for l in body.splitlines() if l.strip().startswith("--rollback)")]
+        self.assertEqual(len(line), 1, "expected one --rollback dispatch")
+        self.assertIn("do_rollback;;", line[0])
+        self.assertNotIn("do_rollback pin", line[0])
 
 
 class SignalHandling(unittest.TestCase):
@@ -744,6 +749,203 @@ class SignalHandling(unittest.TestCase):
             body = fh.read()
         self.assertIn("shopt -s execfail", body)
         self.assertIn('exec bash "$copy" "$@"', body)
+
+
+# Stubs for the two commands preflight probes for but CI need not have.
+# Functions shadow builtins in bash, so this intercepts `command -v`.
+_TOOLS_PRESENT = (
+    'command() { case "$2" in docker|git|curl|python3) return 0;; '
+    '*) builtin command "$@";; esac; }'
+)
+
+
+def run_real(setup, call):
+    """Source update.sh with every function defined, then run one for real.
+
+    The library guard used to sit ABOVE preflight, record_rollback_point,
+    do_rollback, cmd_check and cmd_update, so sourcing returned before they
+    existed and their tests could only grep the source text. A group-command
+    exit-status bug that aborted every single update passed a green suite
+    that way. These drive the shipped functions.
+    """
+    script = (
+        f'set -uo pipefail; export BONSAI_UPDATE_LIB=1; source "{UPDATE_SH}"; '
+        f'{setup}; {call}; echo "rc=$?"'
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+class RecordRollbackPointRuns(unittest.TestCase):
+    """Executed, not grepped. This is the test that was missing when a
+    group-command exit status aborted every update on a healthy box."""
+
+    STUBS = (
+        'git() { case "$*" in *"rev-parse HEAD"*) echo deadbeefcafe;; esac; return 0; }; '
+        'docker() { case "$1" in image) echo "sha256:imageid";; esac; return 0; }'
+    )
+
+    def _record(self, existing=None, verified="1"):
+        d = tempfile.mkdtemp()
+        state = os.path.join(d, "update-state")
+        if existing is not None:
+            with open(state, "w") as fh:
+                fh.write(existing)
+        r = run_real(f'{self.STUBS}; STATE={shlex.quote(state)}',
+                     f'record_rollback_point {verified}')
+        body = ""
+        if os.path.isfile(state):
+            with open(state) as fh:
+                body = fh.read()
+        shutil.rmtree(d, ignore_errors=True)
+        return r, body
+
+    def test_it_succeeds_on_a_box_with_no_pins(self):
+        """The normal case. `{ printf; [[ -n "$pins" ]] && printf; } > f` exits
+        with the status of its LAST command, so an empty pins list returned 1,
+        the group returned 1, and die fired though the file was written
+        correctly — aborting every update and every weekly timer run."""
+        r, body = self._record()
+        self.assertIn("rc=0", r.stdout,
+                      f"record_rollback_point failed with no pins: {r.stderr}")
+        self.assertNotIn("refusing to update", r.stderr)
+        self.assertIn("sha=deadbeefcafe", body)
+        self.assertIn("verified=1", body)
+
+    def test_it_carries_existing_pins_across(self):
+        r, body = self._record(existing="sha=old\nbad=deadcommit\n")
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertIn("bad=deadcommit", body,
+                      "a rewrite must not drop the bad-commit pins")
+        self.assertIn("sha=deadbeefcafe", body)
+
+    def test_it_records_an_unverified_point_as_such(self):
+        r, body = self._record(verified="0")
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertIn("verified=0", body)
+
+
+class PreflightModesRun(unittest.TestCase):
+    """Also executed. --check and --rollback are the commands you reach for
+    when the stack is dark, so their gates matter most when things are broken."""
+
+    def _preflight(self, mode, with_key=True, with_weights=False):
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "docker"))
+        compose = os.path.join(d, "docker", "compose.linux.yaml")
+        env = os.path.join(d, ".env")
+        open(compose, "w").close()
+        open(env, "w").close()
+        if with_weights:
+            sub = os.path.join(d, "models", "Bonsai-27B-gguf")
+            os.makedirs(sub)
+            open(os.path.join(sub, "w.gguf"), "w").close()
+        key = 'BONSAI_API_KEY=k' if with_key else 'unset BONSAI_API_KEY'
+        setup = (
+            f'{_TOOLS_PRESENT}; running_working_dir() {{ printf ""; }}; '
+            f'ROOT={shlex.quote(d)}; COMPOSE_FILE={shlex.quote(compose)}; '
+            f'ENV_FILE={shlex.quote(env)}; {key}'
+        )
+        r = run_real(setup, f'preflight {mode}')
+        shutil.rmtree(d, ignore_errors=True)
+        return r
+
+    def test_check_does_not_need_an_api_key(self):
+        """cmd_check runs git fetch, rev-list and a registry HEAD. It never
+        touches $API, so demanding a key broke the documented read-only
+        command on a fresh clone."""
+        r = self._preflight("check", with_key=False)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+
+    def test_check_does_not_need_weights(self):
+        r = self._preflight("check", with_weights=False)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+
+    def test_rollback_does_not_need_weights(self):
+        """A rollback restores code and images, not weights."""
+        r = self._preflight("rollback", with_weights=False)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+
+    def test_update_does_need_weights(self):
+        r = self._preflight("update", with_weights=False)
+        self.assertNotIn("rc=0", r.stdout)
+        self.assertIn("no *.gguf", r.stderr)
+
+    def test_update_accepts_a_stocked_models_dir(self):
+        r = self._preflight("update", with_weights=True)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+
+    def test_update_still_needs_an_api_key(self):
+        r = self._preflight("update", with_key=False, with_weights=True)
+        self.assertNotIn("rc=0", r.stdout)
+        self.assertIn("BONSAI_API_KEY", r.stderr)
+
+
+class OneWriterAtATime(unittest.TestCase):
+    """The weekly timer and a human running --rollback share one checkout."""
+
+    def test_a_second_run_is_refused_while_the_lock_is_held(self):
+        if not shutil.which("flock"):
+            self.skipTest("flock not available (BSD/macOS); Linux-only path")
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "run"))
+            state = os.path.join(d, "run", "update-state")
+            lock = os.path.join(d, "run", "update.lock")
+            # Hold the lock, then try to take it.
+            script = (
+                f'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+                f'source "{UPDATE_SH}"; ROOT={shlex.quote(d)}; '
+                f'STATE={shlex.quote(state)}; '
+                f'exec 8>{shlex.quote(lock)}; flock -n 8 || exit 9; '
+                f'( take_lock ) ; echo "rc=$?"'
+            )
+            r = subprocess.run(["bash", "-c", script], capture_output=True,
+                               text=True)
+            self.assertIn("already running", r.stderr,
+                          f"a concurrent run was not refused: {r.stdout}{r.stderr}")
+
+    def test_the_lock_is_taken_on_both_writing_paths(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn("preflight update\n  take_lock", body)
+        self.assertIn("preflight rollback; take_lock", body)
+        self.assertNotIn("preflight check; take_lock", body,
+                         "--check writes nothing and must not block on a lock")
+
+
+class LibraryGuardSitsBelowTheDefinitions(unittest.TestCase):
+    def test_every_command_function_is_reachable_when_sourced(self):
+        """Structural regression: with the guard higher up, the tests for
+        these could only grep the file."""
+        names = ["preflight", "record_rollback_point", "do_rollback",
+                 "cmd_check", "cmd_update", "running_working_dir", "smoke"]
+        checks = "; ".join(f'declare -F {n} >/dev/null || echo "MISSING {n}"'
+                           for n in names)
+        script = (f'export BONSAI_UPDATE_LIB=1; source "{UPDATE_SH}"; {checks}')
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "", r.stdout)
+
+    def test_sourcing_does_not_re_exec_or_arm_the_delete_trap(self):
+        """Library mode must have no side effects."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, TMPDIR=tmp, BONSAI_UPDATE_LIB="1")
+            env.pop("BONSAI_UPDATE_REEXEC", None)
+            r = subprocess.run(["bash", "-c", f'source "{UPDATE_SH}"; echo sourced'],
+                               capture_output=True, text=True, env=env)
+            self.assertIn("sourced", r.stdout)
+            self.assertEqual(
+                [f for f in os.listdir(tmp) if f.startswith("bonsai-update.")], [],
+                "sourcing copied itself")
+            self.assertTrue(os.path.isfile(UPDATE_SH))
+
+
+class StoppedContainersAreNotRunningStacks(unittest.TestCase):
+    def test_the_name_fallback_checks_running_state(self):
+        """docker inspect resolves STOPPED containers, so one left behind by
+        the very move this script detects would make preflight refuse both
+        update and rollback, citing a directory that no longer exists."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn("{{if .State.Running}}", body)
 
 
 class UsageContract(unittest.TestCase):

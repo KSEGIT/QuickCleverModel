@@ -201,11 +201,6 @@ smoke() {
   return "$failed"
 }
 
-# Sourced by the test suite to exercise the helpers above without running an
-# update. Executing the script normally leaves BONSAI_UPDATE_LIB unset, the
-# && short-circuits, and the `return` is never reached.
-[[ -n "${BONSAI_UPDATE_LIB:-}" ]] && return 0
-
 # --- run from a copy, never from the file we are about to rewrite -----------
 #
 # `git pull --ff-only` and `git reset --hard` both rewrite update.sh whenever
@@ -220,7 +215,7 @@ smoke() {
 # The test is "am I a copy", not "is the variable set". Keying on presence
 # meant any leaked value skipped the copy entirely, and `git pull` and `git
 # reset --hard` then rewrote the very file bash was reading by byte offset.
-if ! looks_like_temp_copy; then
+if [[ -z "${BONSAI_UPDATE_LIB:-}" ]] && ! looks_like_temp_copy; then
   # Backstop against an exec loop if TMPDIR ever lands where the name pattern
   # cannot match. Two attempts is one more than a healthy run needs.
   (( ${BONSAI_UPDATE_DEPTH:-0} >= 2 )) \
@@ -255,11 +250,13 @@ fi
 # but bash also RESUMES after a non-EXIT handler returns, so a handler that
 # only cleans up would let the run carry on pulling and building until
 # SIGKILL arrives. The signal handler has to exit.
-if looks_like_temp_copy; then
-  trap 'rm -f -- "$SELF"' EXIT
-  trap 'warn "interrupted — stopping"; rm -f -- "$SELF"; exit 143' INT TERM
-else
-  trap 'warn "interrupted — stopping"; exit 143' INT TERM
+if [[ -z "${BONSAI_UPDATE_LIB:-}" ]]; then
+  if looks_like_temp_copy; then
+    trap 'rm -f -- "$SELF"' EXIT
+    trap 'warn "interrupted — stopping"; rm -f -- "$SELF"; exit 143' INT TERM
+  else
+    trap 'warn "interrupted — stopping"; exit 143' INT TERM
+  fi
 fi
 
 # --- everything below needs a real box ---------------------------------------
@@ -360,11 +357,34 @@ running_working_dir() {
   dir="$(docker ps --filter "ancestor=$LLAMA_IMAGE" \
         --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null \
         | grep -v '^$' | sort -u | head -1)"
-  # Fall back to the conventional name for a stack started before a retag.
+  # Fall back to the conventional name for a stack started before a retag —
+  # but only while it is RUNNING. docker inspect resolves stopped containers
+  # too, and a stopped one left behind by the move this script exists to
+  # detect would make preflight refuse both update and rollback, pointing the
+  # operator at a directory that no longer exists.
   [[ -n "$dir" ]] || dir="$(docker inspect "$LLAMA_CONTAINER" \
-    --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' \
+    --format '{{if .State.Running}}{{index .Config.Labels "com.docker.compose.project.working_dir"}}{{end}}' \
     2>/dev/null)"
   printf '%s' "$dir"
+}
+
+take_lock() {
+  # One writer at a time. The weekly timer and a human running --rollback can
+  # otherwise interleave `git reset --hard`, `docker tag` and the state
+  # rewrite on the same checkout, and the loser silently corrupts the winner.
+  # Held on fd 9 for the life of the process; the kernel drops it on exit, so
+  # a killed run leaves nothing to clean up.
+  command -v flock >/dev/null 2>&1 || {
+    warn "flock not found; running without a lock"; return 0; }
+  # Derived from $STATE so the lock always lands beside the state it guards.
+  local dir lock
+  dir="$(dirname "$STATE")"
+  lock="$dir/update.lock"
+  mkdir -p "$dir" || return 0
+  exec 9>"$lock" || {
+    warn "could not open the lock file; running without a lock"; return 0; }
+  flock -n 9 || die "another update or rollback is already running
+(lock: $lock)"
 }
 
 # preflight <mode>   update | rollback | check
@@ -385,11 +405,13 @@ This is the Linux/Docker path; macOS uses ./stack.sh"
   fi
   [[ -f "$COMPOSE_FILE" ]] || die "no compose file at $COMPOSE_FILE"
   [[ -f "$ENV_FILE" ]]     || die "no .env at $ENV_FILE"
-  [[ -n "${BONSAI_API_KEY:-}" ]] || die "BONSAI_API_KEY is not set in $ENV_FILE"
 
-  # --check only reads. Dying here would break it at exactly the moment
-  # someone reaches for it — when the stack is dark.
+  # --check only reads: git fetch, rev-list and a registry HEAD. It never
+  # touches $API, so it must not demand a key — and dying here would break it
+  # at exactly the moment someone reaches for it, when the stack is dark.
   [[ "$mode" == "check" ]] && return 0
+
+  [[ -n "${BONSAI_API_KEY:-}" ]] || die "BONSAI_API_KEY is not set in $ENV_FILE"
 
   # A rollback restores code and images, not weights. Refusing to run it
   # because the weights are missing takes away the one tool that helps when
@@ -458,10 +480,14 @@ record_rollback_point() {
   # destroyed the previous sha, images and pins, and only then announced it
   # was "refusing to update with no way back", by which point there was none.
   local new="$STATE.new"
+  # `if`, not `[[ ... ]] && printf`: a group command exits with the status of
+  # its LAST command, so on a box with no pins — every healthy box — the
+  # failed test returned 1, the group returned 1, and die fired even though
+  # the file had been written correctly. That aborted every single update.
   {
     printf 'sha=%s\nwebui=%s\nllama=%s\nverified=%s\n' \
       "$sha" "$webui" "$llama" "$verified"
-    [[ -n "$pins" ]] && printf '%s\n' "$pins"
+    if [[ -n "$pins" ]]; then printf '%s\n' "$pins"; fi
   } > "$new" || die "cannot write $new — refusing to update with no way back"
   mv -f "$new" "$STATE" \
     || die "cannot replace $STATE — refusing to update with no way back"
@@ -603,6 +629,7 @@ cmd_check() {
 
 cmd_update() {
   preflight update
+  take_lock
 
   # A commit that already failed here must not be walked onto again. Without
   # this the rolled-back branch is a plain ancestor of origin, so next week's
@@ -685,10 +712,18 @@ Linux/Docker only. macOS runs everything natively — see stack.sh.
 USAGE
 }
 
+# Sourced by the test suite with BONSAI_UPDATE_LIB=1 to drive the functions
+# above directly. It sits HERE, below every definition, rather than above
+# them: when it sat higher, sourcing returned before preflight,
+# record_rollback_point, do_rollback, cmd_check and cmd_update existed, so
+# their tests could only grep the source text. A group-command exit-status
+# bug that aborted every update passed a green suite that way.
+[[ -n "${BONSAI_UPDATE_LIB:-}" ]] && return 0
+
 case "${1:-}" in
   "")         cmd_update;;
   --check)    cmd_check;;
-  --rollback) preflight rollback; do_rollback;;
+  --rollback) preflight rollback; take_lock; do_rollback;;
   -h|--help)  usage;;
   *)          usage >&2; exit 2;;
 esac

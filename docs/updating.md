@@ -13,8 +13,8 @@ Linux and Docker only. On macOS, run `git pull` then `make restart`.
 4. **Saves a way back.** It writes the commit to `run/update-state` with
    `verified=1` if step 3 passed, and gives the current image a second name,
    `bonsai-llama:rollback`.
-5. **Updates.** `git pull --ff-only`, rebuild the llama image, pull
-   Open WebUI, restart.
+5. **Updates.** Fetch, move to the commit it checked in step 2 with
+   `git merge --ff-only`, rebuild the llama image, pull Open WebUI, restart.
 6. **Proves it works.** It asks every model in `/v1/models` for a short
    answer.
 7. **Undoes the update if that fails.** It puts back the old commit and the
@@ -87,7 +87,12 @@ Install both files as shown in the README. Check it with
 
 ## When it will not update
 
-`update.sh` uses `git pull --ff-only`. If someone changed files on the
-machine, the pull stops and nothing else happens. Fix the checkout by hand.
+`update.sh` fetches, then moves with `git merge --ff-only` to the exact
+commit it checked against the pin. It does not use `git pull`, because `git
+pull` runs its own fetch and can land on a newer commit than the one just
+checked — including the pinned bad one.
+
+If someone changed files on the machine, the merge stops and nothing else
+happens. Fix the checkout by hand.
 This is on purpose: a machine that quietly throws away local changes is worse
 than one that stops and asks.
