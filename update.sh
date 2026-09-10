@@ -57,6 +57,12 @@ for m in d.get("data", []):
         print(m["id"])'
 }
 
+pinned_bad() {
+  # The last commit that failed its smoke test here, if any. do_rollback
+  # appends, so the newest pin is the one that counts.
+  sed -n 's/^bad=//p' "$STATE" 2>/dev/null | tail -1
+}
+
 smoke_ok() {
   # A /v1/chat/completions reply on stdin. Exit 0 only for a real generation.
   python3 -c 'import json, sys
@@ -105,7 +111,9 @@ fi
 # Captured now: inside a function BASH_SOURCE[0] is the function's source, so
 # reading it at trap time would delete the wrong path.
 SELF="${BASH_SOURCE[0]}"
-trap 'rm -f -- "$SELF"' EXIT
+# systemd sends SIGTERM at TimeoutStartSec, and bash does not run an EXIT
+# trap on an untrapped signal — without INT/TERM here the copy leaks.
+trap 'rm -f -- "$SELF"' EXIT INT TERM
 
 # --- everything below needs a real box ---------------------------------------
 
@@ -122,6 +130,79 @@ API="http://${LLAMA_BIND:-127.0.0.1}:8080"
 
 compose() { docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
+local_image_digest() {
+  # RepoDigests holds the manifest digest the image was pulled by, which is
+  # the only local value comparable with a registry digest. .Id is a local
+  # config hash and matches nothing upstream.
+  docker image inspect "$1" \
+    --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' 2>/dev/null \
+    | sed -n 's/.*@//p'
+}
+
+remote_image_digest() {
+  # The manifest-INDEX digest, which is the value a pull records in
+  # RepoDigests. Two tempting shortcuts do not work:
+  #   docker manifest inspect --verbose  returns one entry per platform, each
+  #     with its own digest; none of them is the index digest.
+  #   docker buildx imagetools inspect   needs the buildx CLI plugin, which
+  #     the distro docker.io package does not ship (verified on the box).
+  # So ask the registry, which needs nothing but python3 and the network.
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, sys, urllib.error, urllib.request
+
+ref = sys.argv[1]
+name, _, tag = ref.rpartition(":")
+first = name.split("/")[0]
+# A first segment with a dot or a port is a registry host; otherwise this is
+# a Docker Hub short name, and a bare one lives under library/.
+if "/" not in name or ("." not in first and ":" not in first and first != "localhost"):
+    registry, repo = "registry-1.docker.io", (name if "/" in name else "library/" + name)
+else:
+    registry, _, repo = name.partition("/")
+url = "https://%s/v2/%s/manifests/%s" % (registry, repo, tag)
+accept = ("application/vnd.oci.image.index.v1+json,"
+          "application/vnd.docker.distribution.manifest.list.v2+json,"
+          "application/vnd.oci.image.manifest.v1+json,"
+          "application/vnd.docker.distribution.manifest.v2+json")
+
+
+def head(token=None):
+    req = urllib.request.Request(url, method="HEAD")
+    req.add_header("Accept", accept)
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    return urllib.request.urlopen(req, timeout=15)
+
+
+try:
+    r = head()
+except urllib.error.HTTPError as e:
+    if e.code != 401:
+        sys.exit(1)
+    # Anonymous pull: follow the Bearer challenge for a throwaway token.
+    chal = e.headers.get("WWW-Authenticate", "")
+    body = chal.split(" ", 1)[1] if " " in chal else ""
+    parts = dict(p.split("=", 1) for p in body.split(",") if "=" in p)
+    realm = parts.pop("realm", "").strip('"')
+    if not realm:
+        sys.exit(1)
+    q = "&".join("%s=%s" % (k, v.strip('"')) for k, v in parts.items())
+    try:
+        with urllib.request.urlopen(realm + ("?" + q if q else ""), timeout=15) as t:
+            tok = json.load(t)
+        r = head(tok.get("token") or tok.get("access_token"))
+    except Exception:
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+
+d = r.headers.get("Docker-Content-Digest")
+if not d:
+    sys.exit(1)
+print(d)
+PY
+}
+
 running_working_dir() {
   docker inspect "$LLAMA_CONTAINER" \
     --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' \
@@ -129,8 +210,19 @@ running_working_dir() {
 }
 
 preflight() {
-  command -v docker >/dev/null 2>&1 \
-    || die "docker not found. This is the Linux/Docker path; macOS uses ./stack.sh"
+  # parse_model_ids and smoke_ok are python3, and curl carries every request.
+  # A missing interpreter exits 127, which reads exactly like a dead model —
+  # so it would tear down and roll back a perfectly healthy stack. A missing
+  # tool must never be able to manufacture a fake outage.
+  local missing=()
+  local tool
+  for tool in docker git curl python3; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  if (( ${#missing[@]} )); then
+    die "missing required tool(s): ${missing[*]}
+This is the Linux/Docker path; macOS uses ./stack.sh"
+  fi
   [[ -f "$COMPOSE_FILE" ]] || die "no compose file at $COMPOSE_FILE"
   [[ -f "$ENV_FILE" ]]     || die "no .env at $ENV_FILE"
   [[ -n "${BONSAI_API_KEY:-}" ]] || die "BONSAI_API_KEY is not set in $ENV_FILE"
@@ -152,8 +244,9 @@ mode: the container comes up healthy and every model load fails. Either run
   running:  $live
   this one: $ROOT/docker
 
-Bring it down from here first:
-  docker compose --env-file .env -f docker/compose.linux.yaml up -d --force-recreate"
+Stop it from the checkout that owns it, then start it from here:
+  (cd ${live%/docker} && docker compose --env-file .env -f docker/compose.linux.yaml down)
+  docker compose --env-file .env -f docker/compose.linux.yaml up -d"
   fi
 }
 
@@ -181,7 +274,7 @@ smoke() {
   while read -r id; do
     [[ -n "$id" ]] || continue
     log "  smoke: $id"
-    body="$(curl -fsS -m 900 \
+    body="$(curl -fsS -m 600 \
       -H "Authorization: Bearer $BONSAI_API_KEY" \
       -H "Content-Type: application/json" \
       -d "{\"model\":\"$id\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"max_tokens\":8}" \
@@ -197,7 +290,9 @@ smoke() {
 }
 
 record_rollback_point() {
-  mkdir -p "$(dirname "$STATE")"
+  local verified="${1:-0}"
+  mkdir -p "$(dirname "$STATE")" \
+    || die "cannot create $(dirname "$STATE") — refusing to update with no way back"
   local sha webui
   sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   webui="$(docker image inspect "$WEBUI_IMAGE" --format '{{.Id}}' 2>/dev/null)"
@@ -205,27 +300,66 @@ record_rollback_point() {
   # so rollback is a tag move and needs no network.
   docker image inspect "$LLAMA_IMAGE" >/dev/null 2>&1 \
     && docker tag "$LLAMA_IMAGE" "$ROLLBACK_IMAGE"
-  printf 'sha=%s\nwebui=%s\n' "$sha" "$webui" > "$STATE"
-  log "rollback point: ${sha:0:12} / ${webui:0:19}"
+  # An unwritten rollback point is only discovered when it is needed, which
+  # is after the stack is already broken. Fail now instead.
+  printf 'sha=%s\nwebui=%s\nverified=%s\n' "$sha" "$webui" "$verified" > "$STATE" \
+    || die "cannot write the rollback point to $STATE — refusing to update with no way back"
+  log "rollback point: ${sha:0:12} / ${webui:0:19} (verified=$verified)"
 }
 
 do_rollback() {
   [[ -f "$STATE" ]] || die "no rollback point recorded at $STATE"
-  local sha webui
+  local sha webui verified bad restored=1
   sha="$(sed -n 's/^sha=//p' "$STATE")"
   webui="$(sed -n 's/^webui=//p' "$STATE")"
+  verified="$(sed -n 's/^verified=//p' "$STATE")"
+  [[ "$verified" == "1" ]] || warn \
+    "the recorded rollback point was never proven to serve — restoring it anyway"
+
+  # The commit being left behind is the one that failed. Remember it before
+  # the reset moves HEAD, or the next timer run fast-forwards straight back
+  # onto it and the box goes dark again on the same commit, every week.
+  bad="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
 
   log "rolling back to ${sha:0:12}"
-  [[ -n "$sha" ]] && git -C "$ROOT" reset --hard "$sha" >/dev/null 2>&1
-  docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1 \
-    && docker tag "$ROLLBACK_IMAGE" "$LLAMA_IMAGE"
-  [[ -n "$webui" ]] && docker image inspect "$webui" >/dev/null 2>&1 \
-    && docker tag "$webui" "$WEBUI_IMAGE"
+  if [[ -z "$sha" ]]; then
+    warn "no commit recorded; leaving the checkout where it is"
+    restored=0
+  elif ! git -C "$ROOT" reset --hard "$sha"; then
+    # Silence here is how a rollback reports success with the broken code
+    # still checked out.
+    warn "git reset to $sha FAILED — the broken commit is STILL checked out"
+    restored=0
+  fi
+
+  if docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
+    docker tag "$ROLLBACK_IMAGE" "$LLAMA_IMAGE" \
+      || { warn "could not restore $LLAMA_IMAGE"; restored=0; }
+  else
+    warn "no $ROLLBACK_IMAGE to restore; keeping the current llama image"
+    restored=0
+  fi
+  if [[ -n "$webui" ]] && docker image inspect "$webui" >/dev/null 2>&1; then
+    docker tag "$webui" "$WEBUI_IMAGE" || warn "could not restore $WEBUI_IMAGE"
+  fi
+
+  # Appended after the reset so the pin survives even when the reset failed.
+  if [[ -n "$bad" && "$bad" != "$sha" ]]; then
+    printf 'bad=%s\n' "$bad" >> "$STATE" \
+      || warn "could not pin the failed commit; it may be retried next week"
+  fi
+
   compose up -d --force-recreate || warn "compose failed during rollback"
 
   if wait_for_health && smoke; then
-    log "rollback verified — stack is serving again"
-    return 0
+    if (( restored )); then
+      log "rollback verified — stack is serving again"
+      return 0
+    fi
+    # Answering is not the same as being restored: a transient registry
+    # failure can leave the bad code checked out and still serving.
+    warn "the stack answers, but the previous state was NOT fully restored"
+    return 1
   fi
   warn "ROLLBACK DID NOT RECOVER THE STACK — needs a human"
   return 1
@@ -246,21 +380,56 @@ cmd_check() {
     log "code up to date"
   fi
 
-  local local_id remote_digest
-  local_id="$(docker image inspect "$WEBUI_IMAGE" --format '{{.Id}}' 2>/dev/null)"
-  remote_digest="$(docker manifest inspect "$WEBUI_IMAGE" 2>/dev/null | head -c 40)"
-  if [[ -z "$local_id" ]]; then
+  local have want
+  have="$(local_image_digest "$WEBUI_IMAGE")"
+  want="$(remote_image_digest "$WEBUI_IMAGE")"
+  if [[ -z "$have" ]]; then
     log "open-webui image not present locally"
     rc=1
-  elif [[ -z "$remote_digest" ]]; then
-    warn "could not reach the registry; image drift unknown"
+  elif [[ -z "$want" ]]; then
+    # Never report "up to date" from a comparison that did not happen.
+    warn "could not read the registry digest; image drift unknown"
+    rc=1
+  elif [[ "$have" != "$want" ]]; then
+    log "open-webui image is behind"
+    log "  local  $have"
+    log "  remote $want"
+    rc=1
+  else
+    log "open-webui image up to date"
   fi
   return "$rc"
 }
 
 cmd_update() {
   preflight
-  record_rollback_point
+
+  # A commit that already failed here must not be walked onto again. Without
+  # this the rolled-back branch is a plain ancestor of origin, so next week's
+  # run fast-forwards right back onto the bad commit, fails, rolls back, and
+  # repeats — the box goes down every week with only a journal line to say so.
+  local target bad
+  git -C "$ROOT" fetch --quiet 2>/dev/null || warn "fetch failed; using what is already here"
+  target="$(git -C "$ROOT" rev-parse '@{u}' 2>/dev/null)"
+  bad="$(pinned_bad)"
+  if [[ -n "$bad" && "$target" == "$bad" ]]; then
+    die "upstream is still at ${target:0:12}, which already failed its smoke test
+here and was rolled back. Nothing to do until a newer commit lands.
+
+To try it again anyway:
+  sed -i '/^bad=/d' $STATE"
+  fi
+
+  # --rollback promises the last version that WORKED. A point recorded on a
+  # stack that was already dark would make that a lie, so prove it first.
+  local verified=0
+  log "checking the current stack before changing anything"
+  if wait_for_health && smoke; then
+    verified=1
+  else
+    warn "the stack is not serving BEFORE this update — recording the rollback point as unverified"
+  fi
+  record_rollback_point "$verified"
 
   log "pulling code"
   if ! git -C "$ROOT" pull --ff-only; then
@@ -289,10 +458,25 @@ cmd_update() {
   log "update complete and verified"
 }
 
+# A here-doc, not a line range out of the header: `sed -n 2,10p` stopped in
+# the middle of a sentence, and any edit to the comment block silently
+# changed what --help printed.
+usage() {
+  cat <<'USAGE'
+Update the Linux/Docker Bonsai stack, prove it still serves, roll back if not.
+
+  ./update.sh              update, smoke-test every model, roll back on failure
+  ./update.sh --check      report drift only; changes nothing; exit 1 if behind
+  ./update.sh --rollback   return to the last recorded good state
+
+Linux/Docker only. macOS runs everything natively — see stack.sh.
+USAGE
+}
+
 case "${1:-}" in
   "")         cmd_update;;
   --check)    cmd_check;;
   --rollback) preflight; do_rollback;;
-  -h|--help)  sed -n '2,10p' "$0" | sed 's/^# \?//';;
-  *)          sed -n '2,10p' "$0" | sed 's/^# \?//'; exit 2;;
+  -h|--help)  usage;;
+  *)          usage >&2; exit 2;;
 esac

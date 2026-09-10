@@ -12,10 +12,12 @@
 Description=Weekly Bonsai stack update
 
 [Timer]
-OnCalendar=weekly
-# Monday 04:00 plus up to 4 hours of jitter. Without the jitter every box that
-# copies this repo hits GHCR on the same second, and an update that lands
-# mid-conversation is worse than one that lands at night.
+# Spelled out rather than `weekly`, which systemd normalizes to Mon 00:00 —
+# with the jitter below that gave a real window of Mon 00:00-04:00, not the
+# 04:00-08:00 the comment used to claim.
+OnCalendar=Mon *-*-* 04:00:00
+# Without jitter every box that copies this repo hits GHCR on the same second,
+# and an update landing mid-conversation is worse than one landing at night.
 RandomizedDelaySec=4h
 # A box that was powered off on the scheduled day still updates when it comes
 # back, instead of silently skipping the week.

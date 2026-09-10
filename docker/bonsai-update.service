@@ -22,10 +22,19 @@ User=__USER__
 WorkingDirectory=__ROOT__
 ExecStart=__ROOT__/update.sh
 
-# A cold 27B smoke test is minutes, and update.sh rolls back on failure. Give
-# it room to finish rather than killing it midway and leaving a half-updated
-# stack behind.
-TimeoutStartSec=3600
+# Must cover the WHOLE worst case, including the rollback, or systemd sends
+# SIGTERM in the middle of the one path whose job is to rescue the stack.
+# Budget, with 3 model aliases at -m 600 each:
+#   compose build llama   up to 2700s  (Dockerfile builds llama.cpp + CUDA)
+#   smoke before update         1800s
+#   wait_for_health              180s
+#   smoke after update          1800s
+#   rollback: health + smoke    1980s
+#                              ------
+#                               8460s
+# 14400 leaves headroom for a slow registry without letting a hung run sit
+# there all day.
+TimeoutStartSec=14400
 
 # Build and rollback must not fight the model server for CPU on a box that is
 # also serving chat.

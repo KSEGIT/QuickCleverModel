@@ -4,16 +4,24 @@ Linux and Docker only. On macOS, run `git pull` then `make restart`.
 
 ## What `update.sh` does
 
-1. **Checks first.** It stops if the weights are missing, if `.env` is
-   missing, or if a stack is already running from a different folder.
-2. **Saves a way back.** It writes the current commit to `run/update-state`
-   and gives the current image a second name, `bonsai-llama:rollback`.
-3. **Updates.** `git pull --ff-only`, rebuild the llama image, pull
+1. **Checks first.** It stops if a tool it needs is missing, if the weights
+   are missing, if `.env` is missing, or if a stack is already running from a
+   different folder.
+2. **Refuses a commit that already failed.** See "The bad commit pin" below.
+3. **Tests the stack before changing it.** This proves the state it is about
+   to save really works.
+4. **Saves a way back.** It writes the commit to `run/update-state` with
+   `verified=1` if step 3 passed, and gives the current image a second name,
+   `bonsai-llama:rollback`.
+5. **Updates.** `git pull --ff-only`, rebuild the llama image, pull
    Open WebUI, restart.
-4. **Proves it works.** It asks every model in `/v1/models` for a short
+6. **Proves it works.** It asks every model in `/v1/models` for a short
    answer.
-5. **Undoes the update if that fails.** It puts back the old commit and the
+7. **Undoes the update if that fails.** It puts back the old commit and the
    old images, restarts, and tests again. Then it exits with an error.
+
+If any part of the undo fails, it says so. A stack that answers is not the
+same as a stack that was put back: a bad commit can still be checked out.
 
 ## Why it tests every model
 
@@ -45,12 +53,31 @@ is still thinking. Then `content` is empty and the text sits in
 `reasoning_content`. That is a good answer. `smoke_ok` counts both, so a
 working model is never rolled back by mistake.
 
+## The bad commit pin
+
+Undoing an update only moves the branch back. It does not stop the next run
+from pulling the same commit again.
+
+Without a pin, one bad commit upstream takes the machine down every week:
+pull, fail, undo, wait, pull the same commit, fail again.
+
+So when `update.sh` undoes an update, it writes the failed commit to
+`run/update-state` as `bad=`. The next run stops if the newest commit
+upstream is still that one. It starts working again on its own as soon as a
+newer commit lands.
+
+To try the same commit again anyway:
+
+```bash
+sed -i '/^bad=/d' run/update-state
+```
+
 ## The weekly timer
 
 `docker/bonsai-update.timer` runs the update once a week.
 
-- It waits a random time of up to 4 hours, so many machines do not hit the
-  registry at the same second.
+- It starts Monday at 04:00 and waits a random time of up to 4 hours, so many
+  machines do not hit the registry at the same second.
 - `Persistent=true` means a machine that was off still updates when it
   starts again.
 - It runs at low priority, so it does not fight the model server for the CPU.

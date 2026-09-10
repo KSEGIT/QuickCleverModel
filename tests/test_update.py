@@ -228,6 +228,99 @@ class RunsFromACopy(unittest.TestCase):
                       "usage must survive being printed from the temp copy")
 
 
+class RollbackIsSticky(unittest.TestCase):
+    """A rolled-back branch is a plain ancestor of origin, so the next run
+    fast-forwards straight back onto the commit that just failed. Without a
+    pin the box goes dark every week on the same commit, and the only signal
+    is a line in the journal."""
+
+    def _pinned_bad(self, state_body):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write(state_body)
+            script = (
+                'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+                f'source "{UPDATE_SH}"; STATE="{state}"; pinned_bad'
+            )
+            r = subprocess.run(["bash", "-c", script], capture_output=True,
+                               text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout.strip()
+
+    def test_reads_the_pinned_commit(self):
+        self.assertEqual(
+            self._pinned_bad("sha=aaa\nwebui=bbb\nverified=1\nbad=deadbeef\n"),
+            "deadbeef")
+
+    def test_is_empty_when_nothing_is_pinned(self):
+        self.assertEqual(self._pinned_bad("sha=aaa\nwebui=bbb\nverified=1\n"), "")
+
+    def test_the_newest_pin_wins(self):
+        """do_rollback appends, so an old pin must not shadow a newer one."""
+        self.assertEqual(
+            self._pinned_bad("sha=aaa\nbad=oldbad\nbad=newbad\n"), "newbad")
+
+    def test_update_refuses_a_commit_that_already_failed(self):
+        body = open(UPDATE_SH).read()
+        self.assertIn('bad="$(pinned_bad)"', body,
+                      "cmd_update must consult the pin before pulling")
+        self.assertIn('already failed its smoke test', body,
+                      "and must say why it is refusing")
+
+
+class RollbackReportsHonestly(unittest.TestCase):
+    def test_the_reset_is_not_silenced(self):
+        """`git reset --hard ... >/dev/null 2>&1` discards the exit status, so
+        a reset onto a commit that no longer exists left the broken code
+        checked out while the run still logged success."""
+        body = open(UPDATE_SH).read()
+        self.assertNotIn('reset --hard "$sha" >/dev/null 2>&1', body)
+        self.assertIn("STILL checked out", body,
+                      "a failed restore has to be stated, not swallowed")
+
+    def test_answering_is_not_reported_as_restored(self):
+        body = open(UPDATE_SH).read()
+        self.assertIn("was NOT fully restored", body,
+                      "a stack that answers with the bad code still checked "
+                      "out is not a successful rollback")
+
+
+class CheckActuallyCompares(unittest.TestCase):
+    def test_manifest_bytes_are_not_used_as_a_digest(self):
+        """The old code took `docker manifest inspect | head -c 40`, which is
+        the first 40 bytes of the manifest JSON, and never compared it to
+        anything. --check reported "up to date" on a six-month-old image."""
+        body = open(UPDATE_SH).read()
+        self.assertNotIn("head -c 40", body)
+        self.assertIn("RepoDigests", body,
+                      "the local side must be a repo digest, not .Id, which "
+                      "is a local config hash that matches nothing upstream")
+
+    def test_no_dependency_on_the_buildx_plugin(self):
+        """buildx is a CLI plugin the distro docker.io package does not ship —
+        confirmed absent on the box this runs on, where `docker buildx` is an
+        unknown command. Depending on it made --check permanently 'unknown'."""
+        body = open(UPDATE_SH).read()
+        self.assertNotIn("buildx imagetools inspect \"$1\"", body)
+
+    def test_unknown_drift_is_not_reported_as_up_to_date(self):
+        body = open(UPDATE_SH).read()
+        self.assertIn("image drift unknown", body)
+
+
+class PreflightChecksEveryTool(unittest.TestCase):
+    def test_the_smoke_paths_interpreter_is_required(self):
+        """smoke_ok and parse_model_ids are python3. A missing interpreter
+        exits 127, which reads exactly like a dead model — so it would roll
+        back a healthy stack and then fail its own rollback the same way."""
+        body = open(UPDATE_SH).read()
+        line = [l for l in body.splitlines() if l.strip().startswith("for tool in")]
+        self.assertEqual(len(line), 1, "expected one required-tool list")
+        for tool in ("docker", "git", "curl", "python3"):
+            self.assertIn(tool, line[0], f"{tool} is used but never checked")
+
+
 class UsageContract(unittest.TestCase):
     def test_the_three_documented_modes_are_in_the_header(self):
         with open(UPDATE_SH) as fh:
@@ -236,6 +329,20 @@ class UsageContract(unittest.TestCase):
             self.assertIn(flag, head,
                           f"{flag} is part of the interface and must be in "
                           "the header the usage message prints")
+
+    def test_help_is_a_complete_message(self):
+        """`sed -n '2,10p'` printed through the first line of the rationale
+        paragraph, so --help ended on a dangling fragment, and any edit to the
+        header block silently changed the output."""
+        r = subprocess.run(["bash", UPDATE_SH, "--help"],
+                           capture_output=True, text=True, cwd=ROOT)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Why this smoke-tests", r.stdout,
+                         "--help is spilling into the rationale comment")
+        self.assertTrue(r.stdout.rstrip().endswith("see stack.sh."),
+                        f"--help ends mid-sentence: {r.stdout.rstrip()[-60:]!r}")
+        for mode in ("--check", "--rollback"):
+            self.assertIn(mode, r.stdout)
 
     def test_unknown_flag_exits_nonzero(self):
         r = subprocess.run(["bash", UPDATE_SH, "--wat"],
@@ -265,7 +372,11 @@ class SystemdUnits(unittest.TestCase):
     def test_timer_is_weekly_and_spreads_the_load(self):
         with open(self.TIMER) as fh:
             body = fh.read()
-        self.assertIn("OnCalendar=weekly", body)
+        # Spelled out, not `weekly`: systemd normalizes `weekly` to Mon
+        # 00:00, so with RandomizedDelaySec the real window was Mon
+        # 00:00-04:00 while the comment claimed 04:00-08:00.
+        self.assertIn("OnCalendar=Mon *-*-* 04:00:00", body)
+        self.assertNotIn("OnCalendar=weekly", body)
         self.assertIn("RandomizedDelaySec", body,
                       "without a randomized delay every box that ever copies "
                       "this hits GHCR at the same second")

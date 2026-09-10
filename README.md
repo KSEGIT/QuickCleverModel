@@ -111,6 +111,10 @@ puts the old version back and tells you.
 ./update.sh --rollback # go back to the last version that worked
 ```
 
+If an update fails, `update.sh` remembers the commit that broke it and will
+not pull that commit again. It starts working again by itself once a newer
+commit lands. See [docs/updating.md](docs/updating.md).
+
 It checks the weights are really there before it restarts anything. A stack
 can report itself healthy while every model is dead, so a health check is not
 enough. Only a real answer proves the stack works.
