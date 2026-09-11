@@ -99,6 +99,41 @@ Useful commands:
 - Linux: `docker compose --env-file .env -f docker/compose.linux.yaml up -d`
   to start, same command with `down` to stop.
 
+## Keeping it up to date
+
+Linux only. `update.sh` pulls new code, rebuilds the image, restarts the
+stack, and then asks every model to answer. If any model cannot answer, it
+puts the old version back and tells you.
+
+```bash
+./update.sh            # update now, and undo it if the stack stops working
+./update.sh --check    # only report what is behind; changes nothing
+./update.sh --rollback # go back to the last version that worked
+```
+
+If the new code breaks the stack, `update.sh` remembers that commit and will
+not move to it again. It starts working again by itself once a newer commit
+lands. Failures that are not the code's fault, like a lost network, do not
+count. See [docs/updating.md](docs/updating.md).
+
+It checks the weights are really there before it restarts anything. A stack
+can report itself healthy while every model is dead, so a health check is not
+enough. Only a real answer proves the stack works.
+
+To update every week on its own:
+
+```bash
+sed -e "s|__ROOT__|$PWD|g" -e "s|__USER__|$USER|g" \
+    docker/bonsai-update.service | sudo tee /etc/systemd/system/bonsai-update.service
+sudo cp docker/bonsai-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now bonsai-update.timer
+```
+
+Read what it did with `journalctl -u bonsai-update.service -n 50`.
+
+On macOS, update by hand: `git pull` then `make restart`.
+
 ## Documentation
 
 - [docs/PRD.md](docs/PRD.md) — what this project is for and what it must do.
@@ -106,6 +141,7 @@ Useful commands:
 - [docs/decisions.md](docs/decisions.md) — why we built it this way, with measured evidence.
 - [docs/tuning.md](docs/tuning.md) — speed numbers measured on this machine.
 - [docs/macos.md](docs/macos.md) — setup and day-to-day use on a Mac.
+- [docs/updating.md](docs/updating.md) — how updates and the weekly timer work.
 
 ## License
 
