@@ -95,7 +95,9 @@ sed -i '/^bad=/d;/^badimg=/d' run/update-state
 
 To try the same commit again anyway:
 
-
+```bash
+sed -i '/^bad=/d' run/update-state
+```
 
 ## Tuning the deadlines
 
@@ -103,7 +105,7 @@ To try the same commit again anyway:
 remembers the commit when the code is to blame. So a deadline that is too
 short on a slow machine blocks good code until a person clears it.
 
-Five settings in `.env` control this. See `.env.example` for each one:
+Six settings in `.env` control this. See `.env.example` for each one:
 
 | Setting | Default | What it bounds |
 |---|---|---|
@@ -112,6 +114,7 @@ Five settings in `.env` control this. See `.env.example` for each one:
 | `BONSAI_HEALTH_TIMEOUT` | 900s | Waiting for llama's `/health` after a restart |
 | `BONSAI_WEBUI_TIMEOUT` | 900s | Waiting for the chat UI, which runs database migrations on first start |
 | `BONSAI_SMOKE_RETRY_SLEEP` | 15s | Backoff when the router says it is busy |
+| `BONSAI_PRECHECK_TIMEOUT` | 30s | The check before anything changes — asks about now, not about a restart |
 
 If you raise the first two, raise `TimeoutStartSec` in
 `docker/bonsai-update.service` as well. Its comment shows the arithmetic.

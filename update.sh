@@ -547,6 +547,7 @@ _pre_sweep_max="${BONSAI_SMOKE_SWEEP_MAX:-}"
 _pre_health_timeout="${BONSAI_HEALTH_TIMEOUT:-}"
 _pre_webui_timeout="${BONSAI_WEBUI_TIMEOUT:-}"
 _pre_retry_sleep="${BONSAI_SMOKE_RETRY_SLEEP:-}"
+_pre_precheck="${BONSAI_PRECHECK_TIMEOUT:-}"
 
 set -a
 if [[ -f "$ENV_FILE" ]]; then
@@ -562,6 +563,7 @@ set +a
 [[ -n "$_pre_health_timeout" ]] && BONSAI_HEALTH_TIMEOUT="$_pre_health_timeout"
 [[ -n "$_pre_webui_timeout" ]]  && BONSAI_WEBUI_TIMEOUT="$_pre_webui_timeout"
 [[ -n "$_pre_retry_sleep" ]]    && BONSAI_SMOKE_RETRY_SLEEP="$_pre_retry_sleep"
+[[ -n "$_pre_precheck" ]]       && BONSAI_PRECHECK_TIMEOUT="$_pre_precheck"
 
 API="http://${LLAMA_BIND:-127.0.0.1}:8080"
 # The other half of the stack. `compose pull open-webui` replaces a moving
@@ -1032,7 +1034,9 @@ this run introduced, because the recorded point predates it"
 
   local verdict=1
   if wait_for_health; then smoke; verdict=$?; fi
-  if (( verdict == 0 )) && ! webui_ok; then
+  local rb_ui_deadline="$WEBUI_TIMEOUT"
+  (( UI_WAS_UP )) || rb_ui_deadline="$PRECHECK_TIMEOUT"
+  if (( verdict == 0 )) && ! webui_ok "$rb_ui_deadline"; then
     if (( UI_WAS_UP )); then
       warn "models answer but the chat UI at $WEBUI_URL does not"
       verdict=1
@@ -1137,7 +1141,8 @@ pulled — so this is the commit, not the registry"
 pulled — not blaming the commit for it"
     # Pin the IMAGE instead, so the same broken :main is not pulled again
     # every week. Written before the rollback, which retags the old image.
-    if [[ -n "$webui_after" ]]; then
+    # Guarded, or a repeating failure appends the same digest every week.
+    if [[ -n "$webui_after" ]] && ! is_pinned_bad_image "$webui_after"; then
       printf 'badimg=%s\n' "$webui_after" >> "$STATE" \
         || warn "could not pin the failed image; it may be retried next week"
     fi
@@ -1366,9 +1371,20 @@ touch the running stack"
   fi
 
   log "pulling open-webui"
-  local webui_before webui_after
+  local webui_before webui_after want_now
   webui_before="$(local_image_digest "$WEBUI_IMAGE")"
-  compose pull open-webui || warn "pull failed; keeping the current image"
+  want_now="$(remote_image_digest "$WEBUI_IMAGE")"
+  if [[ -n "$want_now" ]] && is_pinned_bad_image "$want_now"; then
+    # The pin was only consulted on the code-is-current path, so a week that
+    # brought BOTH a new commit and a broken image looped forever: the commit
+    # is not pinned (the image is to blame), the rollback rewinds the code, and
+    # next week the commit is "new" again — so the early exit never runs, and
+    # the same broken image is pulled, fails and force-recreates every Monday.
+    log "skipping the open-webui pull: ${want_now:0:19} already broke the chat
+UI here and was rolled back"
+  else
+    compose pull open-webui || warn "pull failed; keeping the current image"
+  fi
   webui_after="$(local_image_digest "$WEBUI_IMAGE")"
 
   log "restarting stack"
@@ -1388,7 +1404,12 @@ recreate containers, raise BONSAI_HEALTH_TIMEOUT in .env before the next run"
 
   log "checking the chat UI"
   local ui_still_down=0
-  if ! webui_ok; then
+  # A UI that was already down cannot be "waited for" into existence, and the
+  # only thing this answer can do then is warn — so do not spend the full
+  # restart deadline on it.
+  local ui_deadline="$WEBUI_TIMEOUT"
+  (( ui_before )) || ui_deadline="$PRECHECK_TIMEOUT"
+  if ! webui_ok "$ui_deadline"; then
     if (( ! ui_before )); then
       ui_still_down=1
       # Already down before this run touched anything, so rolling back cannot

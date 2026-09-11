@@ -992,6 +992,104 @@ class AFailedStashStopsTheRewind(unittest.TestCase):
                       "a failed stash must stop the caller rewinding")
 
 
+class ABadImagePinAppliesWhenTheCodeMovesToo(unittest.TestCase):
+    """The pin was only consulted on the code-is-current path. A week that
+    brought BOTH a new commit and a broken image looped forever: the commit is
+    not pinned (the image is to blame), the rollback rewinds the code, so next
+    week the commit is "new" again, the early exit never runs, and the same
+    broken image is pulled, fails and force-recreates every Monday."""
+
+    def _run(self, pinned):
+        d = tempfile.mkdtemp()
+        try:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write("sha=OLD\n" + ("badimg=sha256:broken\n" if pinned else ""))
+            setup = (
+                f'STATE={shlex.quote(state)}; '
+                'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+                'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+                'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+                'smoke() { return 0; }; stash_local_edits() { :; }; '
+                'compose() { case "$1" in pull) echo "PULLED";; esac; return 0; }; '
+                'local_image_digest() { echo sha256:old; }; '
+                'remote_image_digest() { echo sha256:broken; }; '
+                'git() { case "$*" in *"merge-base --is-ancestor"*) return 1;; '
+                '*"rev-parse HEAD"*) echo OLD;; *rev-parse*) echo NEW;; esac; return 0; }'
+            )
+            r = run_real(setup, 'cmd_update')
+            return r.stdout + r.stderr
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_pinned_image_is_not_pulled_even_on_a_code_move(self):
+        out = self._run(pinned=True)
+        self.assertNotIn("PULLED", out,
+                         "the known-broken image was pulled again")
+        self.assertIn("skipping the open-webui pull", out)
+
+    def test_an_unpinned_image_is_still_pulled(self):
+        out = self._run(pinned=False)
+        self.assertIn("PULLED", out)
+
+
+class ImagePinsAreNotDuplicated(unittest.TestCase):
+    def test_the_same_digest_is_pinned_once(self):
+        """A repeating weekly failure appended the same digest every run."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        fn = body[body.index("chat_ui_failed() {"):body.index("cmd_update() {")]
+        self.assertIn('! is_pinned_bad_image "$webui_after"', fn,
+                      "nothing stops the same pin being appended weekly")
+
+
+class EveryDeadlineKnobHonoursTheEnvironment(unittest.TestCase):
+    """The save/restore block exists so an explicit `KNOB=x ./update.sh` beats
+    .env. PRECHECK_TIMEOUT was read after .env but left out of the list, so
+    for that one knob the inversion was still live."""
+
+    KNOBS = ("BONSAI_SMOKE_TIMEOUT", "BONSAI_SMOKE_SWEEP_MAX",
+             "BONSAI_HEALTH_TIMEOUT", "BONSAI_WEBUI_TIMEOUT",
+             "BONSAI_SMOKE_RETRY_SLEEP", "BONSAI_PRECHECK_TIMEOUT")
+
+    def test_precheck_beats_dot_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "docker"))
+            copy = os.path.join(d, "bonsai-update.TESTY")
+            shutil.copy(UPDATE_SH, copy)
+            with open(os.path.join(d, ".env"), "w") as fh:
+                fh.write("BONSAI_API_KEY=k\nBONSAI_PRECHECK_TIMEOUT=77\n")
+            script = (
+                'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+                f'export BONSAI_UPDATE_REEXEC={shlex.quote(copy)}; '
+                f'export BONSAI_UPDATE_ROOT={shlex.quote(d)}; '
+                'export BONSAI_PRECHECK_TIMEOUT=5; '
+                f'source {shlex.quote(copy)}; echo "P=$PRECHECK_TIMEOUT"'
+            )
+            r = subprocess.run(["bash", "-c", script], capture_output=True,
+                               text=True)
+            self.assertIn("P=5", r.stdout, r.stderr)
+
+    def test_every_knob_is_saved_and_restored(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        for knob in self.KNOBS:
+            with self.subTest(knob=knob):
+                self.assertEqual(body.count(f'_pre_'), body.count('_pre_'))
+                self.assertIn(f'{knob}="$_pre', body,
+                              f"{knob} is not restored over .env")
+
+    def test_every_knob_is_documented(self):
+        with open(os.path.join(ROOT, ".env.example")) as fh:
+            env_example = fh.read()
+        with open(os.path.join(ROOT, "docs", "updating.md")) as fh:
+            docs = fh.read()
+        for knob in self.KNOBS:
+            with self.subTest(knob=knob):
+                self.assertIn(knob, env_example)
+                self.assertIn(knob, docs)
+
+
 class PreflightAsksTheDaemon(unittest.TestCase):
     """preflight checked that the docker BINARY exists, not that the daemon
     answers. With dockerd down, record_rollback_point still ran: `docker image
@@ -1051,11 +1149,22 @@ class ThePreCheckDoesNotWaitOutARestart(unittest.TestCase):
     def test_the_post_restart_waits_keep_the_long_deadline(self):
         with open(UPDATE_SH) as fh:
             body = fh.read()
+        # Just the health wait: the chat-UI deadline below it deliberately
+        # drops to the short one when the UI was already down, since no amount
+        # of waiting starts a stopped container.
         post = body[body.index('log "waiting for health"'):
-                    body.index('log "smoke testing every model"')]
+                    body.index('log "checking the chat UI"')]
         self.assertIn("wait_for_health ||", post,
                       "the post-restart wait must keep the full deadline")
         self.assertNotIn("PRECHECK_TIMEOUT", post)
+
+    def test_a_ui_already_down_is_not_waited_for(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        ui = body[body.index('log "checking the chat UI"'):
+                  body.index('log "smoke testing every model"')]
+        self.assertIn('(( ui_before )) || ui_deadline="$PRECHECK_TIMEOUT"', ui,
+                      "15 minutes spent on a verdict already known")
 
 
 class ABadImageIsPinnedToo(unittest.TestCase):
