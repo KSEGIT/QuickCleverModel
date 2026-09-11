@@ -161,7 +161,19 @@ if not isinstance(msg, dict):
 # inside its reasoning block, arriving as content="" with the text in
 # reasoning_content. That is a healthy generation, not a failure — scoring it
 # as one would roll back a stack that works.
-text = (msg.get("content") or "") + (msg.get("reasoning_content") or "")
+# str(), because content can arrive as a LIST in the OpenAI content-parts
+# shape, and list + str raises TypeError — which exits non-zero and reads as
+# a dead model: rollback AND pin. choices[0] and message are already guarded
+# above for the same reason; this was the one unchecked member.
+# (No backticks in this comment: shellcheck reads them as command
+# substitution even inside the single-quoted python.)
+def _text(v):
+    if isinstance(v, str):
+        return v
+    return "" if v is None else str(v)
+
+
+text = _text(msg.get("content")) + _text(msg.get("reasoning_content"))
 sys.exit(0 if text.strip() else 1)'
 }
 
@@ -293,13 +305,17 @@ transient_reply() {
   return 1
 }
 
+webui_answers_now() {
+  # One attempt. Open WebUI serves /health without auth (verified on the box:
+  # 200). Split out so --rollback can find out whether the UI is up without
+  # waiting out the whole polling window first.
+  curl -fsS -m 5 -o /dev/null "$WEBUI_URL/health" 2>/dev/null
+}
+
 webui_ok() {
-  # Open WebUI serves /health without auth (verified on the box: 200).
   local deadline=$(( SECONDS + WEBUI_TIMEOUT ))
   while (( SECONDS < deadline )); do
-    if curl -fsS -m 5 -o /dev/null "$WEBUI_URL/health" 2>/dev/null; then
-      return 0
-    fi
+    webui_answers_now && return 0
     sleep 3
   done
   return 1
@@ -527,6 +543,17 @@ API="http://${LLAMA_BIND:-127.0.0.1}:8080"
 # compose returning 0, every model answering, and the run logging "update
 # complete and verified" while the chat UI was down.
 WEBUI_URL="http://${WEBUI_BIND:-127.0.0.1}:9090"
+
+# Whether the chat UI answered BEFORE this run touched anything, so
+# do_rollback can tell "the UI died" from "the UI was already down".
+#
+# Defined HERE, at global scope, because only cmd_update used to set it —
+# `./update.sh --rollback` never did, and under `set -u` the test at the end
+# of do_rollback aborted the shell with "UI_WAS_UP: unbound variable" partway
+# through a rollback, so the operator got a raw bash error instead of the
+# verdict the whole script exists to produce. The --rollback dispatcher probes
+# the UI and overwrites this; 0 is the safe default if that probe is skipped.
+UI_WAS_UP=0
 
 # Per-model smoke request. Generous: /health answering says nothing about
 # whether a model is loaded, and in router mode the first request pays the
@@ -1353,7 +1380,15 @@ fi
 case "${1:-}" in
   "")         cmd_update;;
   --check)    cmd_check;;
-  --rollback) preflight rollback; take_lock; do_rollback;;
+  --rollback)
+    preflight rollback
+    take_lock
+    # Find out whether the UI is up BEFORE rewinding, so the verdict at the
+    # end can tell "the rollback did not bring it back" from "it was already
+    # down". One attempt, not the polling loop: a manual rollback should not
+    # wait out WEBUI_TIMEOUT before it starts.
+    webui_answers_now && UI_WAS_UP=1
+    do_rollback;;
   -h|--help)  usage;;
   *)          usage >&2; exit 2;;
 esac

@@ -1141,6 +1141,88 @@ class ABadRequestIsNotADeadModel(unittest.TestCase):
         self.assertIn("rc=1", self._smoke(500))
 
 
+class ManualRollbackRunsWithoutPreSeeding(unittest.TestCase):
+    """UI_WAS_UP was only ever assigned inside cmd_update, so
+    `./update.sh --rollback` hit `(( UI_WAS_UP ))` with the variable unset —
+    and under `set -u` that aborts the shell mid-rollback. The operator got a
+    raw "unbound variable" instead of the verdict the script exists to
+    produce, with neither the restore summary nor the final line printed.
+
+    Every existing test injected UI_WAS_UP itself, which is exactly why the
+    suite was green while the real entry point was broken.
+    """
+
+    def _rollback_without_seeding(self, ui_answers):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write("sha=\nwebui=\nllama=\nverified=1\n")
+            setup = (
+                f'ROOT={shlex.quote(d)}; STATE={shlex.quote(state)}; '
+                'docker() { return 0; }; compose() { return 0; }; '
+                'wait_for_health() { return 0; }; smoke() { return 0; }; '
+                f'webui_ok() {{ return {0 if ui_answers else 1}; }}'
+            )
+            return run_real(setup, 'do_rollback')
+
+    def test_it_does_not_abort_on_an_unbound_variable(self):
+        r = self._rollback_without_seeding(ui_answers=False)
+        out = r.stdout + r.stderr
+        self.assertNotIn("unbound variable", out,
+                         "the shell died partway through the rollback")
+        self.assertIn("rc=", r.stdout, "do_rollback never returned")
+
+    def test_it_still_reaches_its_verdict(self):
+        r = self._rollback_without_seeding(ui_answers=True)
+        self.assertIn("rc=", r.stdout, r.stderr)
+
+    def test_the_default_is_defined_at_global_scope(self):
+        with open(UPDATE_SH) as fh:
+            lines = fh.read().splitlines()
+        # Unindented means global scope — inside a function it would not help
+        # the --rollback path, which is the one that was aborting.
+        self.assertIn("UI_WAS_UP=0", lines,
+                      "only cmd_update set it, so --rollback ran with it unset")
+
+    def test_the_manual_path_probes_the_ui_first(self):
+        """So the verdict can tell "the rollback did not bring it back" from
+        "it was already down" — with one attempt, not the polling window."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        arm = body[body.index("  --rollback)"):body.index("  -h|--help)")]
+        self.assertIn("webui_answers_now && UI_WAS_UP=1", arm)
+        self.assertLess(arm.index("UI_WAS_UP=1"), arm.index("do_rollback"),
+                        "the probe must happen before the rewind")
+
+
+class ContentPartsDoNotLookLikeADeadModel(unittest.TestCase):
+    def _ok(self, body):
+        r = subprocess.run(
+            ["bash", "-c",
+             f'export BONSAI_UPDATE_LIB=1; source "{UPDATE_SH}"; smoke_ok'],
+            input=body, capture_output=True, text=True)
+        return r.returncode == 0, r.stderr
+
+    def test_a_list_content_is_a_real_generation(self):
+        """The OpenAI content-parts shape. `list + str` raises TypeError,
+        which exits non-zero and reads as a dead model: rollback AND pin."""
+        body = json.dumps({"choices": [{"message": {
+            "content": [{"type": "text", "text": "OK"}]}}]})
+        ok, err = self._ok(body)
+        self.assertTrue(ok, f"a healthy reply scored as dead: {err}")
+        self.assertNotIn("TypeError", err)
+
+    def test_a_null_content_with_reasoning_still_passes(self):
+        body = json.dumps({"choices": [{"message": {
+            "content": None, "reasoning_content": "thinking"}}]})
+        ok, err = self._ok(body)
+        self.assertTrue(ok, err)
+
+    def test_an_empty_reply_is_still_a_failure(self):
+        ok, _ = self._ok(json.dumps({"choices": [{"message": {"content": ""}}]}))
+        self.assertFalse(ok)
+
+
 class RollbackDoesNotBlameItselfForAStoppedUi(unittest.TestCase):
     def test_a_ui_down_beforehand_is_not_a_failed_rollback(self):
         """Saying "ROLLBACK DID NOT RECOVER THE STACK" contradicted the same
@@ -2046,10 +2128,10 @@ class PinningIsNarrow(unittest.TestCase):
         # The dispatcher's rollback call must not pass `pin`: a deliberate
         # rollback of a working commit would otherwise blacklist it, and the
         # next update would refuse it claiming a smoke test that never ran.
-        line = [l for l in body.splitlines() if l.strip().startswith("--rollback)")]
-        self.assertEqual(len(line), 1, "expected one --rollback dispatch")
-        self.assertIn("do_rollback;;", line[0])
-        self.assertNotIn("do_rollback pin", line[0])
+        arm = body[body.index("  --rollback)"):body.index("  -h|--help)")]
+        self.assertIn("do_rollback;;", arm)
+        self.assertNotIn("do_rollback pin", arm)
+        self.assertNotIn('do_rollback "$pin_arg"', arm)
 
 
 class SignalHandling(unittest.TestCase):
@@ -2466,7 +2548,10 @@ class OneWriterAtATime(unittest.TestCase):
         with open(UPDATE_SH) as fh:
             body = fh.read()
         self.assertIn("preflight update\n  take_lock", body)
-        self.assertIn("preflight rollback; take_lock", body)
+        # The --rollback arm is multi-line now; read the whole case block.
+        arm = body[body.index("  --rollback)"):body.index("  -h|--help)")]
+        self.assertIn("preflight rollback", arm)
+        self.assertIn("take_lock", arm)
         self.assertNotIn("preflight check; take_lock", body,
                          "--check writes nothing and must not block on a lock")
 
