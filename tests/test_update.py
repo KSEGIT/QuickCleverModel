@@ -707,17 +707,32 @@ class PinningIsNarrow(unittest.TestCase):
     """The refusal message says a commit 'already failed its smoke test'. That
     has to be true, so only the smoke-failure path may pin."""
 
-    def test_only_the_smoke_failure_path_pins(self):
+    def test_only_evidence_of_a_bad_commit_pins(self):
+        """Two paths pin, and both are evidence about the CODE.
+
+        A failed smoke test is a model that will not answer. A failed health
+        wait comes after a clean build and a clean compose up, and
+        llama-server binds /health before loading any model — so 180s of
+        silence is the commit, not a transient. Without that second pin, a
+        commit that crash-loops the container is re-applied every week,
+        which is what README and docs/updating.md already promised it would
+        not do.
+        """
         with open(UPDATE_SH) as fh:
             body = fh.read()
-        self.assertEqual(body.count("do_rollback pin"), 1,
-                         "exactly one call site may pin a commit")
-        # build / compose up / health failures are infrastructure, not proof
-        # of a bad commit — compose.linux.yaml warns that a bind can lose a
-        # race with tailscaled at boot.
+        self.assertEqual(body.count("do_rollback pin"), 2,
+                         "smoke failure and health failure pin; nothing else")
+        self.assertIn('warn "never became healthy"; do_rollback pin;', body)
+
+    def test_infrastructure_failures_do_not_pin(self):
+        """A build that lost the network, or a compose up that lost a race
+        with tailscaled bringing up LLAMA_BIND2 (compose.linux.yaml warns
+        about exactly this), says nothing about the commit — and a wrong pin
+        blocks every future update until a human clears it."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
         for site in ('warn "build failed"; do_rollback;',
-                     'warn "compose up failed"; do_rollback;',
-                     'warn "never became healthy"; do_rollback;'):
+                     'warn "compose up failed"; do_rollback;'):
             self.assertIn(site, body, f"{site!r} must roll back WITHOUT pinning")
 
     def test_manual_rollback_does_not_pin(self):
@@ -824,6 +839,124 @@ class RecordRollbackPointRuns(unittest.TestCase):
         self.assertIn("verified=0", body)
 
 
+class VerifiedPointIsNotTradedAway(unittest.TestCase):
+    """A run whose smoke returns "could not ask" leaves the update applied and
+    deliberately does not roll back — so HEAD can sit on a broken commit while
+    the state still names the last good one. Recording unconditionally on the
+    next run overwrote that good sha and retagged :rollback to the broken
+    image, and --rollback would then faithfully restore the breakage."""
+
+    STUBS = (
+        'git() { case "$*" in *"rev-parse HEAD"*) echo newbrokencommit;; esac; return 0; }; '
+        'docker() { case "$1" in image) echo "sha256:newimage";; esac; return 0; }'
+    )
+
+    def _record(self, existing, verified):
+        d = tempfile.mkdtemp()
+        state = os.path.join(d, "update-state")
+        with open(state, "w") as fh:
+            fh.write(existing)
+        r = run_real(f'{self.STUBS}; STATE={shlex.quote(state)}',
+                     f'record_rollback_point {verified}')
+        with open(state) as fh:
+            body = fh.read()
+        shutil.rmtree(d, ignore_errors=True)
+        return r, body
+
+    def test_an_unverified_run_keeps_the_proven_point(self):
+        r, body = self._record("sha=goodcommit\nllama=sha256:goodimage\nverified=1\n", 0)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertIn("sha=goodcommit", body,
+                      "the proven rollback point was overwritten with an "
+                      "unproven one — the only way back is gone")
+        self.assertNotIn("newbrokencommit", body)
+
+    def test_a_verified_run_does_replace_the_point(self):
+        r, body = self._record("sha=goodcommit\nverified=1\n", 1)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertIn("sha=newbrokencommit", body,
+                      "a proven new point should advance the rollback target")
+
+    def test_an_unverified_run_replaces_an_unverified_point(self):
+        """Nothing to protect, so keep the most recent."""
+        r, body = self._record("sha=oldcommit\nverified=0\n", 0)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertIn("sha=newbrokencommit", body)
+
+
+class EnvIsReadBeforeItsSettingsAreUsed(unittest.TestCase):
+    def test_smoke_timeout_from_env_takes_effect(self):
+        """CHAT_TIMEOUT used to be read ~200 lines above the .env block, so
+        BONSAI_SMOKE_TIMEOUT in .env — which .env.example calls the one source
+        of truth, and which the timeout warning tells the operator to raise —
+        was silently ignored. LLAMA_BIND worked only by sitting below it."""
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "repo")
+            os.makedirs(repo)
+            with open(os.path.join(repo, ".env"), "w") as fh:
+                fh.write("BONSAI_SMOKE_TIMEOUT=1234\nLLAMA_BIND=10.1.2.3\n")
+            copy = os.path.join(d, "bonsai-update.TEST01")
+            shutil.copy(UPDATE_SH, copy)
+            script = (
+                'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+                f'export BONSAI_UPDATE_REEXEC={shlex.quote(copy)}; '
+                f'export BONSAI_UPDATE_ROOT={shlex.quote(repo)}; '
+                f'source {shlex.quote(copy)}; echo "T=$CHAT_TIMEOUT A=$API"'
+            )
+            r = subprocess.run(["bash", "-c", script], capture_output=True,
+                               text=True)
+            self.assertIn("T=1234", r.stdout, r.stderr)
+            # The bind address already worked; prove it still does.
+            self.assertIn("A=http://10.1.2.3:8080", r.stdout)
+
+
+class ApiKeyStaysOutOfTheProcessTable(unittest.TestCase):
+    """`curl -H "Authorization: Bearer $KEY"` puts the key in argv, readable
+    by any local user with `ps` for as long as the request runs — up to
+    CHAT_TIMEOUT per model, per alias, weekly. The box has several accounts."""
+
+    def test_ask_does_not_pass_the_key_as_an_argument(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        fn = body[body.index("ask() {"):body.index("# Exit status, and it has")]
+        self.assertNotIn("Bearer $BONSAI_API_KEY", fn,
+                         "the key must not appear in curl's argv")
+        self.assertIn('--config "$CURL_CONF"', fn)
+
+    def test_the_config_file_is_private_and_cleaned_up(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn('chmod 600 "$CURL_CONF"', body)
+        self.assertIn('rm -f -- "$CURL_CONF"', body)
+        self.assertIn("cleanup", body)
+
+    def test_sourcing_and_exiting_leaves_no_key_file_behind(self):
+        """Library mode installs no other traps, so a sourced smoke() used to
+        leave a key-bearing file in /tmp permanently."""
+        with tempfile.TemporaryDirectory() as d:
+            script = (
+                f'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+                f'source "{UPDATE_SH}"; BONSAI_API_KEY=secret; '
+                f'TMPDIR={shlex.quote(d)}; curl_conf; echo made'
+            )
+            r = subprocess.run(["bash", "-c", script], capture_output=True,
+                               text=True)
+            self.assertIn("made", r.stdout, r.stderr)
+            left = [f for f in os.listdir(d) if f.startswith("bonsai-curlcfg.")]
+            self.assertEqual(left, [],
+                             f"a file holding the API key survived exit: {left}")
+
+    def test_the_config_file_really_gets_mode_600(self):
+        d = tempfile.mkdtemp()
+        # Inspect it from inside the run: the EXIT trap now removes it.
+        r = run_real(f'BONSAI_API_KEY=secret; TMPDIR={shlex.quote(d)}',
+                     'curl_conf && { stat -c "%a" "$CURL_CONF" 2>/dev/null '
+                     '|| stat -f "%Lp" "$CURL_CONF"; cat "$CURL_CONF"; }')
+        self.assertIn("600", r.stdout, r.stderr)
+        self.assertIn("Bearer secret", r.stdout)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 class PreflightModesRun(unittest.TestCase):
     """Also executed. --check and --rollback are the commands you reach for
     when the stack is dark, so their gates matter most when things are broken."""
@@ -848,6 +981,30 @@ class PreflightModesRun(unittest.TestCase):
         r = run_real(setup, f'preflight {mode}')
         shutil.rmtree(d, ignore_errors=True)
         return r
+
+    def test_check_does_not_need_a_dotenv_at_all(self):
+        """A fresh clone has no .env yet. The file checks used to sit above
+        the check early-return, so the documented read-only command died."""
+        d = tempfile.mkdtemp()
+        setup = (
+            f'{_TOOLS_PRESENT}; running_working_dir() {{ printf ""; }}; '
+            f'ROOT={shlex.quote(d)}; COMPOSE_FILE={shlex.quote(d)}/nope.yaml; '
+            f'ENV_FILE={shlex.quote(d)}/nope.env; unset BONSAI_API_KEY'
+        )
+        r = run_real(setup, 'preflight check')
+        shutil.rmtree(d, ignore_errors=True)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+
+    def test_update_still_needs_a_dotenv(self):
+        d = tempfile.mkdtemp()
+        setup = (
+            f'{_TOOLS_PRESENT}; running_working_dir() {{ printf ""; }}; '
+            f'ROOT={shlex.quote(d)}; COMPOSE_FILE={shlex.quote(d)}/nope.yaml; '
+            f'ENV_FILE={shlex.quote(d)}/nope.env'
+        )
+        r = run_real(setup, 'preflight update')
+        shutil.rmtree(d, ignore_errors=True)
+        self.assertNotIn("rc=0", r.stdout)
 
     def test_check_does_not_need_an_api_key(self):
         """cmd_check runs git fetch, rev-list and a registry HEAD. It never

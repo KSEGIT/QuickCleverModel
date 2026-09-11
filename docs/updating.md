@@ -61,10 +61,19 @@ from pulling the same commit again.
 Without a pin, one bad commit upstream takes the machine down every week:
 pull, fail, undo, wait, pull the same commit, fail again.
 
-So when `update.sh` undoes an update, it writes the failed commit to
+So when the new code itself fails, `update.sh` writes that commit to
 `run/update-state` as `bad=`. The next run stops if the newest commit
 upstream is still that one. It starts working again on its own as soon as a
 newer commit lands.
+
+Two failures count as proof the commit is bad:
+
+- a model cannot answer, or
+- the stack never becomes healthy after a clean build and start.
+
+Other failures do not pin. A build that lost the network, or a start that
+lost a race with the second network address, says nothing about the commit.
+A wrong pin would stop every later update until a person cleared it.
 
 To try the same commit again anyway:
 

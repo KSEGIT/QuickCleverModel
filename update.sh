@@ -52,14 +52,23 @@ LLAMA_IMAGE="bonsai-llama:cuda"
 ROLLBACK_IMAGE="bonsai-llama:rollback"
 WEBUI_IMAGE="ghcr.io/open-webui/open-webui:main"
 LLAMA_CONTAINER="bonsai-llama-1"
-# Per-model smoke request. Generous: /health answering says nothing about
-# whether a model is loaded, and in router mode the first request pays the
-# whole cold load. Override on a slow box with BONSAI_SMOKE_TIMEOUT.
-CHAT_TIMEOUT="${BONSAI_SMOKE_TIMEOUT:-900}"
 
 log()  { printf '%s  %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 warn() { printf '%s  WARN %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die()  { printf '%s  FAIL %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; exit 1; }
+
+cleanup() {
+  # The curl config holds the API key; it must not outlive the run.
+  [[ -n "${CURL_CONF:-}" ]] && rm -f -- "$CURL_CONF"
+  return 0
+}
+
+# Installed unconditionally, including library mode, because the file it
+# removes carries the API key and library mode installs no other traps — a
+# sourced smoke() left one behind in /tmp for good. The re-exec block below
+# replaces this with a fuller handler that also removes the temp copy; a later
+# trap on the same signal supersedes an earlier one.
+trap 'cleanup' EXIT
 
 # --- pure helpers, unit-tested in tests/test_update.py -----------------------
 
@@ -137,10 +146,25 @@ sys.exit(0 if text.strip() else 1)'
 # for an empty body and a multi-line one alike.
 ASK_CODE=""
 ASK_BODY=""
+CURL_CONF=""
+
+# The Authorization header goes in a 0600 config file, not in argv.
+# `curl -H "Authorization: Bearer $KEY"` is readable by every local user with
+# `ps` for as long as the request runs — up to CHAT_TIMEOUT per model, once
+# per alias, every week. This box has several human accounts on it.
+curl_conf() {
+  [[ -n "$CURL_CONF" && -f "$CURL_CONF" ]] && return 0
+  CURL_CONF="$(mktemp "${TMPDIR:-/tmp}/bonsai-curlcfg.XXXXXX")" || return 1
+  chmod 600 "$CURL_CONF" || return 1
+  printf 'header = "Authorization: Bearer %s"\n' "$BONSAI_API_KEY" > "$CURL_CONF" \
+    || return 1
+}
+
 ask() {
   local url="$1"; shift
   local out rc
-  out="$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $BONSAI_API_KEY" \
+  curl_conf || { warn "could not write the curl config"; return 1; }
+  out="$(curl -sS -w $'\n%{http_code}' --config "$CURL_CONF" \
         "$@" "$url" 2>/dev/null)"; rc=$?
   ASK_CODE="${out##*$'\n'}"
   ASK_BODY="${out%$'\n'*}"
@@ -252,10 +276,11 @@ fi
 # SIGKILL arrives. The signal handler has to exit.
 if [[ -z "${BONSAI_UPDATE_LIB:-}" ]]; then
   if looks_like_temp_copy; then
-    trap 'rm -f -- "$SELF"' EXIT
-    trap 'warn "interrupted — stopping"; rm -f -- "$SELF"; exit 143' INT TERM
+    trap 'cleanup; rm -f -- "$SELF"' EXIT
+    trap 'warn "interrupted — stopping"; cleanup; rm -f -- "$SELF"; exit 143' INT TERM
   else
-    trap 'warn "interrupted — stopping"; exit 143' INT TERM
+    trap 'cleanup' EXIT
+    trap 'warn "interrupted — stopping"; cleanup; exit 143' INT TERM
   fi
 fi
 
@@ -271,6 +296,17 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 set +a
 API="http://${LLAMA_BIND:-127.0.0.1}:8080"
+
+# Per-model smoke request. Generous: /health answering says nothing about
+# whether a model is loaded, and in router mode the first request pays the
+# whole cold load. Override on a slow box with BONSAI_SMOKE_TIMEOUT.
+#
+# Set HERE, after .env is sourced. It used to sit with the other constants
+# 200 lines above, so a BONSAI_SMOKE_TIMEOUT in .env — which .env.example
+# calls "the one source of truth for the whole stack", and which the timeout
+# warning tells the operator to raise — was read before .env existed and
+# silently ignored. LLAMA_BIND worked only because it is read below this.
+CHAT_TIMEOUT="${BONSAI_SMOKE_TIMEOUT:-900}"
 
 compose() { docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
@@ -403,14 +439,14 @@ preflight() {
     die "missing required tool(s): ${missing[*]}
 This is the Linux/Docker path; macOS uses ./stack.sh"
   fi
-  [[ -f "$COMPOSE_FILE" ]] || die "no compose file at $COMPOSE_FILE"
-  [[ -f "$ENV_FILE" ]]     || die "no .env at $ENV_FILE"
-
   # --check only reads: git fetch, rev-list and a registry HEAD. It never
-  # touches $API, so it must not demand a key — and dying here would break it
-  # at exactly the moment someone reaches for it, when the stack is dark.
+  # calls compose(), never touches $API and never needs a key, so none of the
+  # gates below apply to it — including the file checks. A fresh clone with no
+  # .env yet should still be able to ask what it is behind.
   [[ "$mode" == "check" ]] && return 0
 
+  [[ -f "$COMPOSE_FILE" ]] || die "no compose file at $COMPOSE_FILE"
+  [[ -f "$ENV_FILE" ]]     || die "no .env at $ENV_FILE"
   [[ -n "${BONSAI_API_KEY:-}" ]] || die "BONSAI_API_KEY is not set in $ENV_FILE"
 
   # A rollback restores code and images, not weights. Refusing to run it
@@ -456,6 +492,21 @@ record_rollback_point() {
   local verified="${1:-0}"
   mkdir -p "$(dirname "$STATE")" \
     || die "cannot create $(dirname "$STATE") — refusing to update with no way back"
+
+  # Never trade a PROVEN rollback point for an unproven one.
+  #
+  # A run whose smoke returned "could not ask" leaves the update applied and
+  # deliberately does not roll back, so HEAD can sit on a broken commit while
+  # the state still names the last good one. Recording unconditionally on the
+  # next run would overwrite that good sha and retag :rollback to the broken
+  # image — and --rollback would then faithfully restore the breakage. The
+  # one way back would be gone.
+  if [[ "$verified" != "1" ]] \
+     && [[ "$(sed -n 's/^verified=//p' "$STATE" 2>/dev/null)" == "1" ]]; then
+    local kept; kept="$(sed -n 's/^sha=//p' "$STATE" 2>/dev/null)"
+    log "keeping the proven rollback point ${kept:0:12} — this run could not prove the current state"
+    return 0
+  fi
   local sha webui llama pins
   sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   webui="$(docker image inspect "$WEBUI_IMAGE" --format '{{.Id}}' 2>/dev/null)"
@@ -678,7 +729,12 @@ To try it again anyway:
   compose up -d || { warn "compose up failed"; do_rollback; exit 1; }
 
   log "waiting for health"
-  wait_for_health || { warn "never became healthy"; do_rollback; exit 1; }
+  # This one DOES pin. Build and compose up both succeeded, so the container
+  # started; llama-server binds /health before it loads any model, so failing
+  # to answer for 180s after a clean start is the code, not a transient bind
+  # race (that would have failed compose up). Without a pin, a commit that
+  # crash-loops the container is re-applied every week, forever.
+  wait_for_health || { warn "never became healthy"; do_rollback pin; exit 1; }
 
   log "smoke testing every model"
   smoke; local verdict=$?
