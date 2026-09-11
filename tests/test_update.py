@@ -66,6 +66,8 @@ GOOD_CONTENT = json.dumps({
     "object": "chat.completion",
 })
 
+MODELS_LIST_ONE = json.dumps({"data": [{"id": "bonsai-27b-1bit"}]})
+
 # Trimmed from the real /v1/models on the box: three aliases, one router.
 MODELS_LIST = json.dumps({
     "data": [
@@ -703,6 +705,134 @@ class CheckNeverGuesses(unittest.TestCase):
         self.assertIn("no upstream for HEAD", body)
 
 
+class BusyIsNotBroken(unittest.TestCase):
+    """The router holds ONE model at a time (--models-max defaults to 1), so a
+    request for a second alias while the first is busy is refused. Observed on
+    the box by firing two aliases at once:
+
+        500 {"error":{"code":500,"message":"model limit reached, try again later"}}
+
+    It is HTTP 500, not 503, so a status-code allowlist alone misses it. Left
+    unhandled, a person chatting while the weekly timer runs makes smoke score
+    a healthy model as dead — which rolls the stack back AND pins a good
+    commit, blocking every future update.
+    """
+
+    # Verbatim from firesand-worker, 2026-09-11.
+    BUSY = ('{"error":{"code":500,"message":"model limit reached, try again '
+            'later","type":"server_error"}}')
+
+    def _smoke(self, chat_bodies):
+        """chat_bodies: list of (code, body) handed out one call at a time."""
+        cases = "".join(
+            f'{i}) ASK_CODE={c}; ASK_BODY={shlex.quote(b)};; '
+            for i, (c, b) in enumerate(chat_bodies, start=1))
+        stub = (
+            'N=0; ask() { case "$1" in '
+            f'*models) ASK_CODE=200; ASK_BODY={shlex.quote(MODELS_LIST_ONE)};; '
+            f'*) N=$((N+1)); case "$N" in {cases} esac;; '
+            'esac; return 0; }'
+        )
+        script = (
+            'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+            'export BONSAI_SMOKE_RETRY_SLEEP=0; '
+            f'source "{UPDATE_SH}"; API=http://stub; BONSAI_API_KEY=k; '
+            f'{stub}; smoke; echo "rc=$?"'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        return r.stdout + r.stderr
+
+    def test_a_busy_router_is_retried_and_then_passes(self):
+        out = self._smoke([(500, self.BUSY), (200, GOOD_CONTENT)])
+        self.assertIn("rc=0", out, out)
+        self.assertIn("is busy", out, "the retry should be announced")
+
+    def test_a_persistently_busy_router_cannot_be_judged(self):
+        """rc=2, never rc=1: busy says nothing about the commit, and rc=1
+        would roll back and pin it."""
+        out = self._smoke([(500, self.BUSY)] * 3)
+        self.assertIn("rc=2", out, out)
+        self.assertNotIn("rc=1", out)
+
+    def test_a_loading_model_is_not_a_dead_model(self):
+        loading = '{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}'
+        out = self._smoke([(503, loading), (200, GOOD_CONTENT)])
+        self.assertIn("rc=0", out, out)
+
+    def test_a_real_load_failure_is_still_a_failure(self):
+        """The outage this script exists for must still score as rc=1."""
+        out = self._smoke([(500, FAILED_LOAD)] * 3)
+        self.assertIn("rc=1", out, out)
+        self.assertIn("failed to load", out)
+
+
+class AnyPinCounts(unittest.TestCase):
+    def _is_pinned(self, state_body, target):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write(state_body)
+            r = run_real(f'STATE={shlex.quote(state)}', f'is_pinned_bad {target}')
+            return "rc=0" in r.stdout
+
+    def test_an_older_pin_still_blocks(self):
+        """Pins accumulate. Checking only the newest let a maintainer
+        rewinding origin to an older already-failed commit walk the box
+        straight back onto it."""
+        body = "sha=x\nbad=oldbad\nbad=newbad\n"
+        self.assertTrue(self._is_pinned(body, "oldbad"))
+        self.assertTrue(self._is_pinned(body, "newbad"))
+
+    def test_an_unpinned_commit_is_allowed(self):
+        self.assertFalse(self._is_pinned("sha=x\nbad=oldbad\n", "somethingelse"))
+
+    def test_no_pins_allows_everything(self):
+        self.assertFalse(self._is_pinned("sha=x\n", "anything"))
+
+
+class NothingToDoIsCheap(unittest.TestCase):
+    """A fetch that fails only warns, so target ends up equal to HEAD and the
+    merge is a no-op — but the run would still do a pre-update smoke sweep, a
+    rebuild, a restart and a post-update sweep. With --models-max 1 and three
+    aliases that is six cold 27B loads to prove nothing changed."""
+
+    def test_it_returns_early_without_building_or_smoking(self):
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; '
+            'git() { case "$*" in *"rev-parse HEAD"*) echo SAMECOMMIT;; '
+            '*rev-parse*) echo SAMECOMMIT;; esac; return 0; }; '
+            'is_pinned_bad() { return 1; }; pinned_bad() { printf ""; }; '
+            'local_image_digest() { echo sha256:same; }; '
+            'remote_image_digest() { echo sha256:same; }; '
+            'smoke() { echo "SMOKE RAN"; return 0; }; '
+            'compose() { echo "COMPOSE RAN"; return 0; }; '
+            'wait_for_health() { echo "HEALTH RAN"; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("rc=0", out, out)
+        self.assertIn("already up to date", out)
+        for ran in ("SMOKE RAN", "COMPOSE RAN", "HEALTH RAN"):
+            self.assertNotIn(ran, out, f"{ran} — the expensive path was entered")
+
+    def test_an_image_behind_still_triggers_work(self):
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; '
+            'git() { case "$*" in *"rev-parse HEAD"*) echo SAMECOMMIT;; '
+            '*rev-parse*) echo SAMECOMMIT;; esac; return 0; }; '
+            'is_pinned_bad() { return 1; }; pinned_bad() { printf ""; }; '
+            'local_image_digest() { echo sha256:old; }; '
+            'remote_image_digest() { echo sha256:new; }; '
+            'wait_for_health() { return 0; }; smoke() { echo "SMOKE RAN"; return 0; }; '
+            'record_rollback_point() { :; }; '
+            'compose() { echo "COMPOSE RAN"; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("SMOKE RAN", out,
+                      "a stale image must still get an update run")
+
+
 class PinningIsNarrow(unittest.TestCase):
     """The refusal message says a commit 'already failed its smoke test'. That
     has to be true, so only the smoke-failure path may pin."""
@@ -955,6 +1085,47 @@ class ApiKeyStaysOutOfTheProcessTable(unittest.TestCase):
         self.assertIn("600", r.stdout, r.stderr)
         self.assertIn("Bearer secret", r.stdout)
         shutil.rmtree(d, ignore_errors=True)
+
+
+class AFailedWriteDoesNotEatTheRollbackPoint(unittest.TestCase):
+    """A group command exits with the status of its LAST command. Both obvious
+    spellings get this wrong:
+
+        { printf; [[ -n "$pins" ]] && printf; }      -> 1 when pins is empty
+        { printf; if [[ -n "$pins" ]]; then ...; fi } -> 0 even if printf failed
+
+    The first aborted every update on a healthy box. The second masked a
+    write that failed on a full disk, and `mv -f` then replaced a good
+    rollback point with a truncated one — leaving the update to proceed with
+    no way back.
+    """
+
+    STUBS = (
+        'git() { case "$*" in *"rev-parse HEAD"*) echo newcommit;; esac; return 0; }; '
+        'docker() { case "$1" in image) echo "sha256:img";; esac; return 0; }'
+    )
+
+    def test_enospc_does_not_replace_a_good_state_file(self):
+        if not os.path.exists("/dev/full"):
+            self.skipTest("/dev/full is Linux-only")
+        d = tempfile.mkdtemp()
+        try:
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write("sha=goodcommit\nllama=sha256:goodimage\nverified=1\n")
+            # The script writes to "$STATE.new"; point that at a device that
+            # accepts the open and then fails every write.
+            os.symlink("/dev/full", state + ".new")
+            r = run_real(f'{self.STUBS}; STATE={shlex.quote(state)}',
+                         'record_rollback_point 1')
+            self.assertNotIn("rc=0", r.stdout,
+                             "a write that failed was reported as success")
+            self.assertIn("refusing to update", r.stderr)
+            with open(state) as fh:
+                self.assertIn("sha=goodcommit", fh.read(),
+                              "the good rollback point was destroyed")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 class PreflightModesRun(unittest.TestCase):

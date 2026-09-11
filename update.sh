@@ -103,9 +103,18 @@ for m in d.get("data", []):
 }
 
 pinned_bad() {
-  # The last commit that failed its smoke test here, if any. do_rollback
-  # appends, so the newest pin is the one that counts.
+  # The most recent pin, for messages.
   sed -n 's/^bad=//p' "$STATE" 2>/dev/null | tail -1
+}
+
+is_pinned_bad() {
+  # Whether THIS commit is pinned — matched against every recorded pin, not
+  # just the newest. Pins accumulate (do_rollback appends, and a rewrite
+  # preserves them), so checking only the last one let a maintainer rewinding
+  # origin to an older already-failed commit walk the box straight back onto
+  # it.
+  [[ -n "${1:-}" ]] || return 1
+  grep -qxF "bad=$1" "$STATE" 2>/dev/null
 }
 
 smoke_ok() {
@@ -153,11 +162,19 @@ CURL_CONF=""
 # `ps` for as long as the request runs — up to CHAT_TIMEOUT per model, once
 # per alias, every week. This box has several human accounts on it.
 curl_conf() {
-  [[ -n "$CURL_CONF" && -f "$CURL_CONF" ]] && return 0
-  CURL_CONF="$(mktemp "${TMPDIR:-/tmp}/bonsai-curlcfg.XXXXXX")" || return 1
-  chmod 600 "$CURL_CONF" || return 1
-  printf 'header = "Authorization: Bearer %s"\n' "$BONSAI_API_KEY" > "$CURL_CONF" \
-    || return 1
+  # -s, not -f: mktemp creates the file first, so a chmod or write that fails
+  # afterwards used to leave CURL_CONF naming an existing but EMPTY file. The
+  # cache check then short-circuited on every later call and curl sent
+  # unauthenticated requests — which come back 401, read as "cannot judge",
+  # and send the operator chasing a model failure that was really a full disk.
+  [[ -n "$CURL_CONF" && -s "$CURL_CONF" ]] && return 0
+  CURL_CONF="$(mktemp "${TMPDIR:-/tmp}/bonsai-curlcfg.XXXXXX")" || { CURL_CONF=""; return 1; }
+  if ! chmod 600 "$CURL_CONF" \
+     || ! printf 'header = "Authorization: Bearer %s"\n' "$BONSAI_API_KEY" > "$CURL_CONF"; then
+    rm -f -- "$CURL_CONF"
+    CURL_CONF=""
+    return 1
+  fi
 }
 
 ask() {
@@ -169,6 +186,27 @@ ask() {
   ASK_CODE="${out##*$'\n'}"
   ASK_BODY="${out%$'\n'*}"
   return "$rc"
+}
+
+transient_reply() {
+  # Momentary router answers that say nothing about the commit.
+  #
+  # start-server.sh runs with --models-max ${BONSAI_MODELS_MAX:-1}, so the
+  # router holds ONE child at a time and a request for a second alias while
+  # the first is busy is refused. Observed on the box, firing two aliases at
+  # once:
+  #   HTTP 500 {"error":{"code":500,"message":"model limit reached, try again later"}}
+  # Note it is 500, not 503 — a status-code allowlist alone does not catch it.
+  # llama.cpp also answers 503 while a model is still loading.
+  #
+  # Scoring either as a dead model rolls the stack back AND pins the commit,
+  # which blocks every future update until something newer lands upstream. A
+  # person chatting while the weekly timer runs is enough to trigger it.
+  case "$1" in
+    *"model limit reached"*|*"try again later"*|*"Loading model"*|*unavailable_error*)
+      return 0;;
+  esac
+  return 1
 }
 
 # Exit status, and it has three meanings, not two:
@@ -191,30 +229,48 @@ smoke() {
   ids="$(printf '%s' "$ASK_BODY" | parse_model_ids)"
   [[ -n "$ids" ]] || { warn "/v1/models listed no models"; return 2; }
 
+  local attempt busy
   while read -r id; do
     [[ -n "$id" ]] || continue
     log "  smoke: $id"
-    ask "$API/v1/chat/completions" -m "$CHAT_TIMEOUT" \
-      -H "Content-Type: application/json" \
-      -d "{\"model\":\"$id\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"max_tokens\":8}"; rc=$?
-    if (( rc != 0 )); then
-      # /health answering does not mean a model is loaded: in router mode the
-      # first request carries the whole cold load. A timeout is ambiguous — a
-      # wedged model looks the same as a very slow first read — so it stays
-      # "cannot judge" and never triggers a rollback on its own.
-      if (( rc == 28 )); then
-        warn "  smoke: $id timed out after ${CHAT_TIMEOUT}s — a cold load can exceed this; raise BONSAI_SMOKE_TIMEOUT if the box is slow"
-      else
-        warn "  smoke: $id — curl failed (exit $rc); cannot judge the stack"
+    busy=0
+    for attempt in 1 2 3; do
+      busy=0
+      ask "$API/v1/chat/completions" -m "$CHAT_TIMEOUT" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\":\"$id\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"max_tokens\":8}"; rc=$?
+      if (( rc != 0 )); then
+        # /health answering does not mean a model is loaded: in router mode
+        # the first request carries the whole cold load. A timeout is
+        # ambiguous — a wedged model looks the same as a very slow first read
+        # — so it stays "cannot judge" and never rolls back on its own.
+        if (( rc == 28 )); then
+          warn "  smoke: $id timed out after ${CHAT_TIMEOUT}s — a cold load can exceed this; raise BONSAI_SMOKE_TIMEOUT if the box is slow"
+        else
+          warn "  smoke: $id — curl failed (exit $rc); cannot judge the stack"
+        fi
+        return 2
       fi
+      case "$ASK_CODE" in
+        401|403|404)
+          # Our credentials or our URL, not the model.
+          warn "  smoke: $id returned HTTP $ASK_CODE — cannot judge the stack"
+          return 2;;
+        429|502|503|504) busy=1;;
+      esac
+      transient_reply "$ASK_BODY" && busy=1
+      (( busy )) || break
+      if (( attempt < 3 )); then
+        warn "  smoke: $id is busy (HTTP $ASK_CODE) — retrying in $(( attempt * RETRY_SLEEP ))s"
+        sleep $(( attempt * RETRY_SLEEP ))
+      fi
+    done
+    if (( busy )); then
+      # Still busy after three tries. Someone is using the box, or a model is
+      # still loading; either way this run cannot judge it, and must not pin.
+      warn "  smoke: $id still busy after 3 tries — cannot judge the stack"
       return 2
     fi
-    case "$ASK_CODE" in
-      401|403|404)
-        # Our credentials or our URL, not the model.
-        warn "  smoke: $id returned HTTP $ASK_CODE — cannot judge the stack"
-        return 2;;
-    esac
     if printf '%s' "$ASK_BODY" | smoke_ok; then
       log "  smoke: $id OK"
     else
@@ -307,6 +363,10 @@ API="http://${LLAMA_BIND:-127.0.0.1}:8080"
 # warning tells the operator to raise — was read before .env existed and
 # silently ignored. LLAMA_BIND worked only because it is read below this.
 CHAT_TIMEOUT="${BONSAI_SMOKE_TIMEOUT:-900}"
+
+# Backoff between retries of a busy model, multiplied by the attempt number.
+# Set to 0 to retry immediately (the test suite does this).
+RETRY_SLEEP="${BONSAI_SMOKE_RETRY_SLEEP:-15}"
 
 compose() { docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
@@ -416,7 +476,8 @@ take_lock() {
   local dir lock
   dir="$(dirname "$STATE")"
   lock="$dir/update.lock"
-  mkdir -p "$dir" || return 0
+  mkdir -p "$dir" || {
+    warn "could not create $dir; running without a lock"; return 0; }
   exec 9>"$lock" || {
     warn "could not open the lock file; running without a lock"; return 0; }
   flock -n 9 || die "another update or rollback is already running
@@ -531,15 +592,27 @@ record_rollback_point() {
   # destroyed the previous sha, images and pins, and only then announced it
   # was "refusing to update with no way back", by which point there was none.
   local new="$STATE.new"
-  # `if`, not `[[ ... ]] && printf`: a group command exits with the status of
-  # its LAST command, so on a box with no pins — every healthy box — the
-  # failed test returned 1, the group returned 1, and die fired even though
-  # the file had been written correctly. That aborted every single update.
+  # An explicit flag, because every concise spelling of this is wrong. A
+  # compound command exits with the status of its LAST command, so:
+  #   { printf; [[ -n "$pins" ]] && printf; }   returns 1 when pins is empty,
+  #     which aborted every update on every healthy box;
+  #   { printf; if [[ -n "$pins" ]]; then printf; fi; }   returns 0 from the
+  #     false if, masking a printf that failed on ENOSPC/EDQUOT/EIO;
+  #   ( set -e; printf; [[ -z "$pins" ]] || printf ) > f || die
+  #     ALSO masks it: bash disables errexit inside a subshell that is the
+  #     left operand of ||, so the trailing true [[ ]] becomes the status.
+  #     Verified on Linux against /dev/full — this one looked right and was
+  #     not, which is why the test below writes to a device that fails.
+  # A group command is not a subshell, so the flag survives into this scope.
+  local ok=1
   {
     printf 'sha=%s\nwebui=%s\nllama=%s\nverified=%s\n' \
-      "$sha" "$webui" "$llama" "$verified"
-    if [[ -n "$pins" ]]; then printf '%s\n' "$pins"; fi
-  } > "$new" || die "cannot write $new — refusing to update with no way back"
+      "$sha" "$webui" "$llama" "$verified" || ok=0
+    if [[ -n "$pins" ]]; then
+      printf '%s\n' "$pins" || ok=0
+    fi
+  } > "$new" || ok=0
+  (( ok )) || die "cannot write $new — refusing to update with no way back"
   mv -f "$new" "$STATE" \
     || die "cannot replace $STATE — refusing to update with no way back"
   log "rollback point: ${sha:0:12} / ${webui:0:19} (verified=$verified)"
@@ -692,12 +765,31 @@ cmd_update() {
     || die "no upstream for HEAD (detached, or no tracking branch) — nothing to update to"
   [[ -n "$target" ]] || die "could not resolve the upstream commit"
   bad="$(pinned_bad)"
-  if [[ -n "$bad" && "$target" == "$bad" ]]; then
+  if is_pinned_bad "$target"; then
     die "upstream is still at ${target:0:12}, which already failed its smoke test
 here and was rolled back. Nothing to do until a newer commit lands.
 
 To try it again anyway:
   sed -i '/^bad=/d' $STATE"
+  fi
+
+  # Nothing to do? Stop before the expensive part.
+  #
+  # A fetch that fails only warns, after which @{u} resolves to the stale ref,
+  # target equals HEAD, and the merge is a no-op — but the run would still do
+  # a pre-update smoke sweep, a rebuild, a restart and a post-update sweep.
+  # With --models-max 1 and three aliases each sweep forces three cold 27B
+  # loads, so a box whose fetch is persistently broken would spend most of an
+  # hour every Monday evicting the resident model to prove nothing changed.
+  local head_sha have want
+  head_sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
+  if [[ "$target" == "$head_sha" ]]; then
+    have="$(local_image_digest "$WEBUI_IMAGE")"
+    want="$(remote_image_digest "$WEBUI_IMAGE")"
+    if [[ -n "$have" && -n "$want" && "$have" == "$want" ]]; then
+      log "already up to date (code ${head_sha:0:12}, images current) — nothing to do"
+      return 0
+    fi
   fi
 
   # --rollback promises the last version that WORKED. A point recorded on a
