@@ -270,7 +270,7 @@ transient_reply() {
 
 webui_ok() {
   # Open WebUI serves /health without auth (verified on the box: 200).
-  local deadline=$(( SECONDS + HEALTH_TIMEOUT ))
+  local deadline=$(( SECONDS + WEBUI_TIMEOUT ))
   while (( SECONDS < deadline )); do
     if curl -fsS -m 5 -o /dev/null "$WEBUI_URL/health" 2>/dev/null; then
       return 0
@@ -493,6 +493,13 @@ RETRY_SLEEP="${BONSAI_SMOKE_RETRY_SLEEP:-15}"
 # the commit, so a slow disk plus nvidia-runtime init on a cold recreate must
 # not be able to blacklist good code.
 HEALTH_TIMEOUT="${BONSAI_HEALTH_TIMEOUT:-180}"
+
+# Open WebUI gets its own, longer deadline. Its first start after a :main pull
+# runs database migrations, which outlast a llama restart on a slow disk — and
+# blowing this deadline rolls back an otherwise-good update, so quietly
+# borrowing BONSAI_HEALTH_TIMEOUT left the operator with no documented knob
+# pointing at the cause.
+WEBUI_TIMEOUT="${BONSAI_WEBUI_TIMEOUT:-300}"
 
 # Ceiling on one whole smoke sweep. The per-alias retry loop would otherwise
 # multiply the worst case by three, and the systemd unit's time budget is
@@ -978,6 +985,16 @@ cmd_update() {
   head_sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   log "checking the current stack before changing anything"
   if wait_for_health; then smoke; pre_verdict=$?; else pre_verdict=1; fi
+  # The UI belongs in the PRE-update check too, not only after an update.
+  # Without it, the common case — code current, images current — returned 0
+  # having proved only that the models answer, so a UI stopped or
+  # crash-looping since a host reboot went unnoticed every Monday. It also
+  # made record_rollback_point write verified=1 from a models-only proof,
+  # which is half of what --rollback promises.
+  if (( pre_verdict == 0 )) && ! webui_ok; then
+    warn "models answer but the chat UI at $WEBUI_URL does not"
+    pre_verdict=1
+  fi
   case "$pre_verdict" in
     0) verified=1;;
     2) # Could not ASK — a busy router, a rotated key. Not proof of anything,
@@ -1024,6 +1041,14 @@ To try it again anyway:
     if [[ -n "$have" && -n "$want" && "$have" == "$want" ]]; then
       if (( verified )); then
         log "already up to date (code ${head_sha:0:12} contains ${target:0:12}, images current) — nothing to do"
+        return 0
+      fi
+      if (( pre_verdict == 2 )); then
+        # Could not ask — a busy router, a rotated key. Failing the unit here
+        # asserts an outage nobody observed, every week, whenever someone is
+        # chatting inside the timer's 04:00-08:00 window.
+        warn "already up to date (code ${head_sha:0:12}, images current); the
+stack could not be judged this run — see the warnings above"
         return 0
       fi
       warn "already up to date (code ${head_sha:0:12}, images current), but the
@@ -1113,7 +1138,10 @@ touch the running stack"
   fi
 
   log "pulling open-webui"
+  local webui_before webui_after
+  webui_before="$(local_image_digest "$WEBUI_IMAGE")"
   compose pull open-webui || warn "pull failed; keeping the current image"
+  webui_after="$(local_image_digest "$WEBUI_IMAGE")"
 
   log "restarting stack"
   compose up -d || { warn "compose up failed"; do_rollback; exit 1; }
@@ -1131,10 +1159,23 @@ recreate containers, raise BONSAI_HEALTH_TIMEOUT in .env before the next run"
 
   log "checking the chat UI"
   if ! webui_ok; then
-    # Not the commit's fault — this is whatever :main resolved to today — so
-    # it rolls back without pinning.
-    warn "the chat UI at $WEBUI_URL did not answer after the update"
-    do_rollback ""
+    # Whether this is the commit's fault depends on whether a NEW image
+    # arrived. The open-webui SERVICE — its environment, ports and volumes —
+    # is defined in docker/compose.linux.yaml, which is version-controlled, so
+    # a commit adding a bad WEBUI_* variable or a colliding port breaks the UI
+    # with no new image involved. Refusing to pin there let exactly that
+    # commit be fetched, rebuilt (~45 min of CUDA) and rolled back every
+    # single week, forever — the loop the pin exists to break.
+    local ui_pin=""
+    if [[ -n "$webui_before" && "$webui_before" == "$webui_after" ]]; then
+      ui_pin="$pin_arg"
+      warn "the chat UI at $WEBUI_URL did not answer, and no new image was
+pulled — so this is the commit, not the registry"
+    else
+      warn "the chat UI at $WEBUI_URL did not answer after a new image was
+pulled — not blaming the commit for it"
+    fi
+    do_rollback "$ui_pin"
     exit 1
   fi
 

@@ -875,6 +875,128 @@ class MovedAndPinnableAreDifferentQuestions(unittest.TestCase):
                          "an image-only run must not touch the checkout")
 
 
+class TheWeeklyCheckCoversTheUi(unittest.TestCase):
+    """webui_ok was only wired to the POST-update path, so the common case —
+    code current, images current — returned 0 having proved only that the
+    models answer. A UI stopped or crash-looping since a host reboot went
+    unnoticed every Monday, and record_rollback_point wrote verified=1 from a
+    models-only proof."""
+
+    BASE = (
+        'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+        'is_pinned_bad() { return 1; }; wait_for_health() { return 0; }; '
+        'compose() { echo "COMPOSE RAN"; return 0; }; '
+        'record_rollback_point() { echo "RECORD verified=$1"; }; '
+        'local_image_digest() { echo same; }; remote_image_digest() { echo same; }; '
+        'git() { case "$*" in *"merge-base --is-ancestor"*) return 0;; '
+        '*rev-parse*) echo SAME;; esac; return 0; }'
+    )
+
+    def test_a_dead_ui_is_noticed_even_with_nothing_to_update(self):
+        r = run_real(f'{self.BASE}; smoke() {{ return 0; }}; '
+                     'webui_ok() { echo "WEBUI CHECKED"; return 1; }', 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("WEBUI CHECKED", out,
+                      "the weekly run never looked at the chat UI")
+        self.assertNotIn("rc=0", out, "a dead UI must not report success")
+        self.assertIn("RECORD verified=0", out,
+                      "a models-only proof must not be recorded as verified")
+
+    def test_a_healthy_box_still_reports_nothing_to_do(self):
+        r = run_real(f'{self.BASE}; smoke() {{ return 0; }}; '
+                     'webui_ok() { return 0; }', 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("rc=0", out, out)
+        self.assertIn("already up to date", out)
+        self.assertIn("RECORD verified=1", out)
+
+    def test_could_not_judge_is_not_a_weekly_false_alarm(self):
+        """Someone chatting inside the 04:00-08:00 window makes the router
+        answer "model limit reached" to every alias, so smoke returns 2. The
+        unit used to fail every week asserting an outage nobody observed."""
+        r = run_real(f'{self.BASE}; smoke() {{ return 2; }}; '
+                     'webui_ok() { return 0; }', 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("rc=0", out, "an unjudgeable run must not fail the unit")
+        self.assertIn("could not be judged", out)
+        self.assertNotIn("did NOT pass its check", out,
+                         "that asserts a failure that was never observed")
+
+    def test_a_genuinely_dead_stack_still_fails(self):
+        r = run_real(f'{self.BASE}; smoke() {{ return 1; }}; '
+                     'webui_ok() { return 0; }', 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertNotIn("rc=0", out)
+        self.assertIn("did NOT pass its check", out)
+
+
+class AChatUiBrokenByTheCommitDoesPin(unittest.TestCase):
+    """docker/compose.linux.yaml defines the open-webui service — its
+    environment, ports and volumes — and is version-controlled. A commit
+    adding a bad WEBUI_* variable or a colliding port breaks the UI with no
+    new image involved. Refusing to pin there let that commit be fetched,
+    rebuilt (~45 min of CUDA) and rolled back every week, forever."""
+
+    def _run(self, image_changed):
+        # A marker FILE, not a counter: local_image_digest is called inside
+        # command substitution, so a shell variable bumped there lives in a
+        # subshell and never advances. The compose stub drops the marker on
+        # `pull`, which is exactly when a new image would arrive.
+        d = tempfile.mkdtemp()
+        try:
+            marker = shlex.quote(os.path.join(d, "pulled"))
+            pull = f'touch {marker}' if image_changed else ':'
+            setup = (
+                'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+                'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+                'wait_for_health() { return 0; }; smoke() { return 0; }; '
+                f'compose() {{ case "$1" in pull) {pull};; esac; return 0; }}; '
+                'stash_local_edits() { :; }; '
+                'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }; '
+                # passes the pre-check, fails after the update
+                'W=0; webui_ok() { W=$((W+1)); [ "$W" = 1 ] && return 0; return 1; }; '
+                f'local_image_digest() {{ if [ -e {marker} ]; then echo new; '
+                'else echo same; fi; }; '
+                'remote_image_digest() { echo other; }; '
+                'git() { case "$*" in *"merge-base --is-ancestor"*) return 1;; '
+                '*"rev-parse HEAD"*) echo OLD;; *rev-parse*) echo NEW;; esac; return 0; }'
+            )
+            r = run_real(setup, 'cmd_update')
+            return r.stdout + r.stderr
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_no_new_image_means_the_commit_is_to_blame(self):
+        out = self._run(image_changed=False)
+        self.assertIn("ROLLBACK pin=[pin]", out,
+                      "a UI broken with no new image is the commit's doing")
+        self.assertIn("no new image was", out)
+
+    def test_a_new_image_is_not_the_commits_fault(self):
+        out = self._run(image_changed=True)
+        self.assertIn("ROLLBACK pin=[]", out,
+                      ":main moved under us; do not blacklist the commit")
+        self.assertIn("after a new image was", out)
+
+
+class TheUiHasItsOwnDeadline(unittest.TestCase):
+    def test_webui_uses_its_own_timeout(self):
+        """Open WebUI's first start after a :main pull runs DB migrations,
+        which outlast a llama restart. Borrowing BONSAI_HEALTH_TIMEOUT left
+        the operator with no documented knob for a rollback it caused."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        fn = body[body.index("webui_ok() {"):body.index("# Exit status, and it has")]
+        self.assertIn("WEBUI_TIMEOUT", fn)
+        self.assertNotIn("HEALTH_TIMEOUT", fn)
+
+    def test_the_knob_is_documented(self):
+        for rel in ((".env.example",), ("docs", "updating.md")):
+            with open(os.path.join(ROOT, *rel)) as fh:
+                self.assertIn("BONSAI_WEBUI_TIMEOUT", fh.read(),
+                              f"{'/'.join(rel)} does not mention the knob")
+
+
 class CheckFailsLoudWhenItCannotFetch(unittest.TestCase):
     def test_a_failed_fetch_is_not_up_to_date(self):
         """rev-list counts against the stale ref and returns 0, so --check

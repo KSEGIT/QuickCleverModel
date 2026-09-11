@@ -97,7 +97,8 @@ Four settings in `.env` control this. See `.env.example` for each one:
 |---|---|---|
 | `BONSAI_SMOKE_TIMEOUT` | 900s | One model's answer |
 | `BONSAI_SMOKE_SWEEP_MAX` | 4x the above | One whole sweep, retries included |
-| `BONSAI_HEALTH_TIMEOUT` | 180s | Waiting for `/health` after a restart |
+| `BONSAI_HEALTH_TIMEOUT` | 180s | Waiting for llama's `/health` after a restart |
+| `BONSAI_WEBUI_TIMEOUT` | 300s | Waiting for the chat UI, which runs database migrations on first start |
 | `BONSAI_SMOKE_RETRY_SLEEP` | 15s | Backoff when the router says it is busy |
 
 If you raise the first two, raise `TimeoutStartSec` in
