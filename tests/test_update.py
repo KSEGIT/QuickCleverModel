@@ -797,13 +797,13 @@ class AlreadyBrokenDoesNotBlameTheCommit(unittest.TestCase):
         out = self._run(pre_ok="2", post_ok=False)
         self.assertIn("ROLLBACK pin=[pin]", out,
                       "an unjudgeable pre-check must not disarm the pin")
-        self.assertIn("could not judge the stack before", out,
+        self.assertIn("could not judge the models before", out,
                       "and must not claim the stack was not serving")
 
     def test_the_message_matches_what_was_actually_observed(self):
         out = self._run(pre_ok=False, post_ok=False)
-        self.assertIn("is NOT serving before", out)
-        self.assertNotIn("could not judge the stack before", out)
+        self.assertIn("are NOT serving before", out)
+        self.assertNotIn("could not judge the models before", out)
 
 
 class MovedAndPinnableAreDifferentQuestions(unittest.TestCase):
@@ -1020,11 +1020,14 @@ class AUiAlreadyDownIsNotTheCommitsFault(unittest.TestCase):
         r = run_real(setup, 'cmd_update')
         return r.stdout + r.stderr
 
-    def test_a_ui_already_down_does_not_pin(self):
+    def test_a_ui_already_down_does_not_roll_back_at_all(self):
+        """Rolling back cannot start a container that was already stopped —
+        and aborting there skipped the model smoke test, letting a commit that
+        killed llama escape unpinned behind the stopped UI."""
         out = self._run(ui_before_ok=False)
-        self.assertIn("ROLLBACK pin=[]", out,
-                      "blamed the commit for a UI that was already dead")
-        self.assertIn("not answering\nbefore this update either", out)
+        self.assertIn("not rolling back for it", out)
+        self.assertIn("smoke testing every model", out,
+                      "the run must carry on to the models")
 
     def test_a_ui_that_was_up_and_then_died_does_pin(self):
         out = self._run(ui_before_ok=True)
@@ -1033,8 +1036,144 @@ class AUiAlreadyDownIsNotTheCommitsFault(unittest.TestCase):
 
     def test_the_ui_is_probed_even_when_smoke_cannot_judge(self):
         out = self._run(ui_before_ok=False)
-        self.assertIn("does not answer either", out,
+        self.assertIn("is not answering either", out,
                       "the UI must be probed regardless of smoke's verdict")
+
+
+class ADeadUiDoesNotShieldABadCommit(unittest.TestCase):
+    """The pre-check used to overload one variable: a chat UI that was merely
+    stopped forced the "already failing" branch, which then disarmed the pin
+    for a genuine MODEL outage. A commit that killed llama was rolled back
+    UNPINNED and walked onto again every Monday — until someone happened to
+    start the UI container."""
+
+    def _run(self, ui_up, models_pre, models_post):
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+            'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+            'wait_for_health() { return 0; }; compose() { return 0; }; '
+            'stash_local_edits() { :; }; '
+            'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }; '
+            f'webui_ok() {{ return {0 if ui_up else 1}; }}; '
+            f'N=0; smoke() {{ N=$((N+1)); [ "$N" = 1 ] && return {models_pre}; '
+            f'return {models_post}; }}; '
+            'local_image_digest() { echo same; }; remote_image_digest() { echo other; }; '
+            'git() { case "$*" in *"merge-base --is-ancestor"*) return 1;; '
+            '*"rev-parse HEAD"*) echo OLD;; *rev-parse*) echo NEW;; esac; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        return r.stdout + r.stderr
+
+    def test_a_stopped_ui_does_not_disarm_the_model_pin(self):
+        out = self._run(ui_up=False, models_pre=0, models_post=1)
+        self.assertIn("ROLLBACK pin=[pin]", out,
+                      "a stopped chat UI shielded a commit that killed llama")
+
+    def test_models_proven_dead_beforehand_still_disarms_it(self):
+        out = self._run(ui_up=True, models_pre=1, models_post=1)
+        self.assertIn("ROLLBACK pin=[]", out)
+
+    def test_a_healthy_stack_broken_by_the_update_pins(self):
+        out = self._run(ui_up=True, models_pre=0, models_post=1)
+        self.assertIn("ROLLBACK pin=[pin]", out)
+
+
+class ADefinitelyDeadUiFailsTheRun(unittest.TestCase):
+    """On the nothing-to-do path, models_verdict 2 returns 0 — but the UI
+    answer is never ambiguous. With smoke unable to judge AND the UI down, the
+    weekly unit succeeded and nobody learned the chat interface was dead."""
+
+    def _run(self, ui_up, models):
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+            'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+            'wait_for_health() { return 0; }; compose() { return 0; }; '
+            f'webui_ok() {{ return {0 if ui_up else 1}; }}; '
+            f'smoke() {{ return {models}; }}; '
+            'local_image_digest() { echo same; }; remote_image_digest() { echo same; }; '
+            'git() { case "$*" in *"merge-base --is-ancestor"*) return 0;; '
+            '*rev-parse*) echo SAME;; esac; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        return r.stdout + r.stderr
+
+    def test_unjudgeable_models_plus_a_dead_ui_fails(self):
+        out = self._run(ui_up=False, models=2)
+        self.assertNotIn("rc=0", out,
+                         "the unit succeeded while the chat UI was down")
+        self.assertIn("chat UI", out)
+
+    def test_unjudgeable_models_with_a_live_ui_still_passes(self):
+        out = self._run(ui_up=True, models=2)
+        self.assertIn("rc=0", out, out)
+
+    def test_everything_healthy_passes(self):
+        out = self._run(ui_up=True, models=0)
+        self.assertIn("rc=0", out, out)
+        self.assertIn("already up to date", out)
+
+
+class ABadRequestIsNotADeadModel(unittest.TestCase):
+    """400 is by definition client-side — a llama.cpp release tightening
+    validation, or an alias the router will not serve for this body. Falling
+    through to smoke_ok scored it as a dead model: rollback AND pin."""
+
+    def _smoke(self, code):
+        one = json.dumps({"data": [{"id": "a"}]})
+        body = '{"error":{"message":"invalid request"}}'
+        stub = (
+            'ask() { case "$1" in '
+            f'*models) ASK_CODE=200; ASK_BODY={shlex.quote(one)};; '
+            f'*) ASK_CODE={code}; ASK_BODY={shlex.quote(body)};; '
+            'esac; return 0; }'
+        )
+        r = run_real(f'API=http://stub; BONSAI_API_KEY=k; {stub}', 'smoke')
+        return r.stdout + r.stderr
+
+    def test_400_cannot_be_judged(self):
+        self.assertIn("rc=2", self._smoke(400),
+                      "a bad request must not blacklist a commit")
+
+    def test_401_is_still_cannot_judge(self):
+        self.assertIn("rc=2", self._smoke(401))
+
+    def test_500_is_still_a_real_failure(self):
+        self.assertIn("rc=1", self._smoke(500))
+
+
+class RollbackDoesNotBlameItselfForAStoppedUi(unittest.TestCase):
+    def test_a_ui_down_beforehand_is_not_a_failed_rollback(self):
+        """Saying "ROLLBACK DID NOT RECOVER THE STACK" contradicted the same
+        run's own "not blaming the commit for the UI", and pointed the
+        operator at the rollback path instead of the stopped container."""
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write("sha=\nwebui=\nllama=\nverified=1\n")
+            setup = (
+                f'ROOT={shlex.quote(d)}; STATE={shlex.quote(state)}; '
+                'UI_WAS_UP=0; docker() { return 0; }; compose() { return 0; }; '
+                'wait_for_health() { return 0; }; smoke() { return 0; }; '
+                'webui_ok() { return 1; }'
+            )
+            r = run_real(setup, 'do_rollback')
+            out = r.stdout + r.stderr
+            self.assertIn("still down, as it was", out)
+            self.assertNotIn("DID NOT RECOVER", out)
+
+    def test_a_ui_that_was_up_and_did_not_come_back_is_a_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write("sha=\nwebui=\nllama=\nverified=1\n")
+            setup = (
+                f'ROOT={shlex.quote(d)}; STATE={shlex.quote(state)}; '
+                'UI_WAS_UP=1; docker() { return 0; }; compose() { return 0; }; '
+                'wait_for_health() { return 0; }; smoke() { return 0; }; '
+                'webui_ok() { return 1; }'
+            )
+            r = run_real(setup, 'do_rollback')
+            self.assertIn("does not", r.stdout + r.stderr)
 
 
 class EnvironmentBeatsDotEnv(unittest.TestCase):
@@ -1165,7 +1304,7 @@ class TheWeeklyCheckCoversTheUi(unittest.TestCase):
         out = r.stdout + r.stderr
         self.assertIn("rc=0", out, "an unjudgeable run must not fail the unit")
         self.assertIn("could not be judged", out)
-        self.assertNotIn("did NOT pass its check", out,
+        self.assertNotIn("did NOT pass their check", out,
                          "that asserts a failure that was never observed")
 
     def test_a_genuinely_dead_stack_still_fails(self):
@@ -1173,7 +1312,7 @@ class TheWeeklyCheckCoversTheUi(unittest.TestCase):
                      'webui_ok() { return 0; }', 'cmd_update')
         out = r.stdout + r.stderr
         self.assertNotIn("rc=0", out)
-        self.assertIn("did NOT pass its check", out)
+        self.assertIn("did NOT pass their check", out)
 
 
 class AChatUiBrokenByTheCommitDoesPin(unittest.TestCase):
@@ -1292,16 +1431,23 @@ class TheChatUiIsHalfTheStack(unittest.TestCase):
         '*rev-parse*) echo SAME;; esac; return 0; }'
     )
 
-    def test_a_dead_ui_rolls_back(self):
+    def test_a_ui_down_throughout_does_not_report_success(self):
+        """It was down before the run, so rolling back cannot start it — but
+        "verified" would be a lie while half the stack is dark, and exiting 0
+        tells the timer everything is fine."""
         r = run_real(f'{self.BASE}; webui_ok() {{ return 1; }}', 'cmd_update')
         out = r.stdout + r.stderr
-        self.assertIn("ROLLBACK", out, "a dead chat UI must not pass")
         self.assertNotIn("update complete and verified", out)
+        self.assertNotIn("rc=0", out, "the unit succeeded with the UI down")
+        self.assertIn("still down", out)
 
-    def test_a_dead_ui_does_not_pin_the_commit(self):
-        """The UI image is whatever :main resolved to today, not the code."""
+    def test_a_ui_down_throughout_does_not_roll_back(self):
+        """Rolling back cannot start a container that was already stopped, and
+        aborting there would skip the model smoke test."""
         r = run_real(f'{self.BASE}; webui_ok() {{ return 1; }}', 'cmd_update')
-        self.assertIn("ROLLBACK pin=[]", r.stdout + r.stderr)
+        out = r.stdout + r.stderr
+        self.assertNotIn("ROLLBACK", out)
+        self.assertIn("smoke testing every model", out)
 
     def test_a_live_ui_and_live_models_pass(self):
         r = run_real(f'{self.BASE}; webui_ok() {{ return 0; }}', 'cmd_update')
@@ -1837,7 +1983,7 @@ class NothingToDoIsCheap(unittest.TestCase):
         r = run_real(setup, 'cmd_update')
         out = r.stdout + r.stderr
         self.assertNotIn("rc=0", out, "a dark stack must not exit 0")
-        self.assertIn("did NOT pass its check", out)
+        self.assertIn("did NOT pass their check", out)
 
     def test_an_image_behind_still_triggers_work(self):
         setup = (

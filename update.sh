@@ -367,8 +367,12 @@ smoke() {
         break
       fi
       case "$ASK_CODE" in
-        401|403|404)
-          # Our credentials or our URL, not the model.
+        400|401|403|404)
+          # Our request, our credentials or our URL — not the model. 400 in
+          # particular is by definition client-side: a llama.cpp release
+          # tightening validation, or an alias the router will not serve for
+          # this body. Letting it fall through scored it as a dead model, so
+          # an innocent commit was rolled back AND blacklisted.
           warn "  smoke: $id returned HTTP $ASK_CODE — cannot judge it"
           this_unknown=1
           break;;
@@ -949,8 +953,17 @@ do_rollback() {
   local verdict=1
   if wait_for_health; then smoke; verdict=$?; fi
   if (( verdict == 0 )) && ! webui_ok; then
-    warn "models answer but the chat UI at $WEBUI_URL does not"
-    verdict=1
+    if (( UI_WAS_UP )); then
+      warn "models answer but the chat UI at $WEBUI_URL does not"
+      verdict=1
+    else
+      # It was already down before this run. Saying "ROLLBACK DID NOT RECOVER
+      # THE STACK" here contradicted the same run's own "not blaming the
+      # commit for the UI", and pointed the operator at the rollback path
+      # instead of at the stopped container.
+      warn "models answer; the chat UI at $WEBUI_URL is still down, as it was
+before this run — start it separately"
+    fi
   fi
 
   if (( ! restored )); then
@@ -1026,6 +1039,27 @@ cmd_check() {
   return "$rc"
 }
 
+# Reached only when the chat UI answered BEFORE this update and does not now.
+# Reads cmd_update's locals (ui_before, webui_before/after, pin_arg) through
+# bash's dynamic scoping; it exists to keep that decision out of the middle of
+# an already long function.
+chat_ui_failed() {
+  local ui_pin=""
+  if [[ -n "$webui_before" && "$webui_before" == "$webui_after" ]]; then
+    # No new image arrived, and the open-webui SERVICE — environment, ports,
+    # volumes — is defined in docker/compose.linux.yaml, which is
+    # version-controlled. So this is the commit, not the registry.
+    ui_pin="$pin_arg"
+    warn "the chat UI at $WEBUI_URL did not answer, and no new image was
+pulled — so this is the commit, not the registry"
+  else
+    warn "the chat UI at $WEBUI_URL did not answer after a new image was
+pulled — not blaming the commit for it"
+  fi
+  do_rollback "$ui_pin"
+  exit 1
+}
+
 cmd_update() {
   preflight update
   take_lock
@@ -1048,38 +1082,36 @@ cmd_update() {
   # upgrade or an OOM could leave every model dead while the timer logged
   # "nothing to do" and exited 0, week after week — and run/update-state was
   # never written, so --rollback had nothing to restore either.
-  local head_sha have want verified=0 pre_verdict
+  # THREE separate facts, because folding them into one variable kept
+  # producing wrong decisions:
+  #   models_verdict  0 answered / 1 proven dead / 2 could not ask
+  #   ui_before       did the chat UI answer beforehand (never ambiguous)
+  #   verified        the whole stack proven good, for the rollback point
+  #
+  # Overloading one verdict meant a chat UI that was merely stopped forced the
+  # "already failing" branch, which then disarmed the pin for a genuine MODEL
+  # outage — so a commit that killed llama was rolled back unpinned and walked
+  # onto again every week, until someone happened to start the UI container.
+  #
+  # The UI is probed unconditionally. Short-circuiting on the model verdict
+  # meant that when smoke returned 2 ("could not ask") the UI was never looked
+  # at, so one dead since last week's reboot was unknown to this run and the
+  # post-update check blamed the commit for it.
+  local head_sha have want verified=0 models_verdict ui_before=0
   head_sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   log "checking the current stack before changing anything"
-  if wait_for_health; then smoke; pre_verdict=$?; else pre_verdict=1; fi
-  # The UI belongs in the PRE-update check too, not only after an update.
-  # Without it, the common case — code current, images current — returned 0
-  # having proved only that the models answer, so a UI stopped or
-  # crash-looping since a host reboot went unnoticed every Monday. It also
-  # made record_rollback_point write verified=1 from a models-only proof,
-  # which is half of what --rollback promises.
-  # Probed unconditionally, not only when pre_verdict is 0. Short-circuiting
-  # meant that when smoke returned 2 ("could not ask") the UI was never looked
-  # at — so a UI dead since last week's reboot was unknown to this run, and
-  # the post-update check below would blame the commit for it.
-  local ui_before=0
-  if webui_ok; then
-    ui_before=1
-  elif (( pre_verdict == 0 )); then
-    warn "models answer but the chat UI at $WEBUI_URL does not"
-    pre_verdict=1
-  else
-    warn "the chat UI at $WEBUI_URL does not answer either"
-  fi
-  case "$pre_verdict" in
-    0) verified=1;;
-    2) # Could not ASK — a busy router, a rotated key. Not proof of anything,
-       # and in particular NOT proof the stack was broken.
-       warn "could not judge the stack before this update — recording the
+  if wait_for_health; then smoke; models_verdict=$?; else models_verdict=1; fi
+  if webui_ok; then ui_before=1; fi
+  UI_WAS_UP=$ui_before
+
+  case "$models_verdict" in
+    0) (( ui_before )) && verified=1;;
+    2) warn "could not judge the models before this update — recording the
 rollback point as unverified";;
-    *) warn "the stack is NOT serving before this update — recording the
+    *) warn "the models are NOT serving before this update — recording the
 rollback point as unverified";;
   esac
+  (( ui_before )) || warn "the chat UI at $WEBUI_URL is not answering either"
   record_rollback_point "$verified"
 
   # The pin check sits HERE, after the proof above, not before it. Placed
@@ -1119,7 +1151,16 @@ To try it again anyway:
         log "already up to date (code ${head_sha:0:12} contains ${target:0:12}, images current) — nothing to do"
         return 0
       fi
-      if (( pre_verdict == 2 )); then
+      if (( ! ui_before )); then
+        # Unlike smoke's verdict this one is never ambiguous: the UI either
+        # answered or it did not. Returning 0 here let the weekly unit succeed
+        # while the chat interface was definitively down.
+        warn "already up to date (code ${head_sha:0:12}, images current), but the
+chat UI at $WEBUI_URL is not answering — there is nothing to update that would
+fix it."
+        return 1
+      fi
+      if (( models_verdict == 2 )); then
         # Could not ask — a busy router, a rotated key. Failing the unit here
         # asserts an outage nobody observed, every week, whenever someone is
         # chatting inside the timer's 04:00-08:00 window.
@@ -1128,8 +1169,8 @@ stack could not be judged this run — see the warnings above"
         return 0
       fi
       warn "already up to date (code ${head_sha:0:12}, images current), but the
-stack did NOT pass its check above — there is nothing to update that would fix
-it. See the warnings above."
+models did NOT pass their check above — there is nothing to update that would
+fix it. See the warnings above."
       return 1
     fi
   fi
@@ -1156,7 +1197,7 @@ it. See the warnings above."
   if ! code_already_current "$target"; then
     moved=1
     pin_arg="pin"
-    if (( pre_verdict == 1 )); then
+    if (( models_verdict == 1 )); then
       # Only POSITIVE proof that the stack was already broken disarms the pin.
       # A driver upgrade, an OOM, or weights that moved would otherwise
       # blacklist an innocent commit, and is_pinned_bad would refuse every
@@ -1168,8 +1209,8 @@ it. See the warnings above."
       # the pin, so a genuinely crash-looping commit was rolled back unpinned
       # and the box walked onto it again the next week, and the next. That is
       # the exact loop the pin exists to break.
-      warn "the stack was already failing before this update, so this run will
-not blame the new commit if it fails"
+      warn "the models were already failing before this update, so this run
+will not blame the new commit if it fails"
       pin_arg=""
     fi
     log "moving to ${target:0:12}"
@@ -1238,29 +1279,20 @@ recreate containers, raise BONSAI_HEALTH_TIMEOUT in .env before the next run"
     do_rollback "$pin_arg"; exit 1; }
 
   log "checking the chat UI"
+  local ui_still_down=0
   if ! webui_ok; then
-    # Whether this is the commit's fault depends on whether a NEW image
-    # arrived. The open-webui SERVICE — its environment, ports and volumes —
-    # is defined in docker/compose.linux.yaml, which is version-controlled, so
-    # a commit adding a bad WEBUI_* variable or a colliding port breaks the UI
-    # with no new image involved. Refusing to pin there let exactly that
-    # commit be fetched, rebuilt (~45 min of CUDA) and rolled back every
-    # single week, forever — the loop the pin exists to break.
-    local ui_pin=""
     if (( ! ui_before )); then
-      # It was already down before this run touched anything.
-      warn "the chat UI at $WEBUI_URL did not answer, but it was not answering
-before this update either — not blaming the commit for it"
-    elif [[ -n "$webui_before" && "$webui_before" == "$webui_after" ]]; then
-      ui_pin="$pin_arg"
-      warn "the chat UI at $WEBUI_URL did not answer, and no new image was
-pulled — so this is the commit, not the registry"
+      ui_still_down=1
+      # Already down before this run touched anything, so rolling back cannot
+      # fix it — and aborting here would skip the model smoke test entirely,
+      # letting a commit that killed llama escape unpinned behind a stopped
+      # UI container. Say so, and carry on to the models.
+      warn "the chat UI at $WEBUI_URL still does not answer; it was already
+down before this update, so this run is not rolling back for it — start it
+separately"
     else
-      warn "the chat UI at $WEBUI_URL did not answer after a new image was
-pulled — not blaming the commit for it"
+      chat_ui_failed
     fi
-    do_rollback "$ui_pin"
-    exit 1
   fi
 
   log "smoke testing every model"
@@ -1275,6 +1307,17 @@ above, then run ./update.sh --rollback yourself if you want the old version."
     warn "smoke test failed after update — rolling back"
     do_rollback "$pin_arg"
     exit 1
+  fi
+
+  if (( ui_still_down )); then
+    # The models are proven and the update stands — rolling back would not
+    # start a container that was already stopped. But "verified" would be a
+    # lie while half the stack is dark, and exiting 0 would tell the timer
+    # everything is fine.
+    warn "update applied and the models are verified, but the chat UI at
+$WEBUI_URL is still down — it was down before this run too. Start it
+separately; nothing here will fix it."
+    return 1
   fi
 
   log "update complete and verified"
