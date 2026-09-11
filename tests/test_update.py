@@ -432,7 +432,23 @@ class SmokeHasThreeOutcomes(unittest.TestCase):
         with open(UPDATE_SH) as fh:
             body = fh.read()
         fn = body[body.index("ask() {"):body.index("smoke() {")]
-        self.assertNotIn(" -f", fn, "curl -f would discard the error body")
+        # Match the FLAG, not the substring: the function also contains
+        # `! -f "$CURL_ERR"`, which is a file test, not curl's --fail.
+        self.assertNotIn("curl -f", fn, "curl -f would discard the error body")
+        self.assertNotIn("-fsS", fn, "curl -f would discard the error body")
+        self.assertIn("curl -sS", fn)
+
+    def test_curl_stderr_is_kept(self):
+        """-S exists so curl explains the failure despite -s. Sending stderr
+        to /dev/null threw that away, and every transport failure logged a
+        bare "curl failed (exit 7)" with no reason."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        fn = body[body.index("ask() {"):body.index("smoke() {")]
+        self.assertIn('2>"$CURL_ERR"', fn)
+        self.assertIn("ASK_ERR=", fn)
+        self.assertIn("${ASK_ERR:-curl failed}", body,
+                      "the captured message must reach the warning")
 
 
 class NeverDeletesTheRealScript(unittest.TestCase):
@@ -723,6 +739,122 @@ class PinsOnlyWhatThisRunMoved(unittest.TestCase):
         out = self._run(head="OLDCOMMIT", target="NEWCOMMIT")
         self.assertIn("ROLLBACK pin=[pin]", out,
                       "this run introduced the commit, so it may be blamed")
+
+
+class AlreadyBrokenDoesNotBlameTheCommit(unittest.TestCase):
+    """cmd_update computes `verified` from the pre-update sweep but used not
+    to let it gate the pin. A driver upgrade, an OOM, or weights that moved —
+    every cause the script's own comment names — would blacklist an innocent
+    commit, and is_pinned_bad would then refuse every later run until
+    something newer landed, while the real outage went untouched."""
+
+    def _run(self, pre_ok, post_ok, head="OLD", target="NEW"):
+        pre = "0" if pre_ok else "1"
+        post = "0" if post_ok else "1"
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+            'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+            'wait_for_health() { return 0; }; compose() { return 0; }; '
+            'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }; '
+            f'N=0; smoke() {{ N=$((N+1)); [ "$N" = 1 ] && return {pre}; return {post}; }}; '
+            f'git() {{ case "$*" in *"rev-parse HEAD"*) echo {head};; '
+            f'*rev-parse*) echo {target};; esac; return 0; }}; '
+            'local_image_digest() { echo a; }; remote_image_digest() { echo b; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        return r.stdout + r.stderr
+
+    def test_dark_before_and_after_does_not_pin(self):
+        out = self._run(pre_ok=False, post_ok=False)
+        self.assertIn("ROLLBACK pin=[]", out,
+                      "a stack already failing before the update must not "
+                      "blame the new commit")
+        self.assertIn("already failing before this update", out)
+
+    def test_healthy_before_and_broken_after_does_pin(self):
+        out = self._run(pre_ok=True, post_ok=False)
+        self.assertIn("ROLLBACK pin=[pin]", out,
+                      "the update genuinely broke a working stack")
+
+
+class RollbackDoesNotEatLocalEdits(unittest.TestCase):
+    """The same data loss commit 4a2d9a8 fixed on the build path. An
+    image-only run whose new open-webui image fails calls do_rollback with a
+    recorded sha equal to HEAD — a reset that undoes nothing and can only
+    delete."""
+
+    def _repo(self, d):
+        def git(*a):
+            subprocess.run(["git", "-C", d, *a], check=True,
+                           capture_output=True)
+        subprocess.run(["git", "init", "-q", d], check=True,
+                       capture_output=True)
+        git("config", "user.email", "t@t"); git("config", "user.name", "t")
+        with open(os.path.join(d, "models.ini.in"), "w") as fh:
+            fh.write("committed\n")
+        git("add", "-A"); git("commit", "-qm", "base")
+        head = subprocess.run(["git", "-C", d, "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        return head
+
+    def _rollback(self, d, sha):
+        state = os.path.join(d, "update-state")
+        with open(state, "w") as fh:
+            fh.write(f"sha={sha}\nwebui=\nllama=\nverified=1\n")
+        setup = (
+            f'ROOT={shlex.quote(d)}; STATE={shlex.quote(state)}; '
+            'docker() { return 0; }; compose() { return 0; }; '
+            'wait_for_health() { return 0; }; smoke() { return 0; }'
+        )
+        return run_real(setup, 'do_rollback')
+
+    def test_an_uncommitted_edit_survives_a_no_op_rollback(self):
+        with tempfile.TemporaryDirectory() as d:
+            head = self._repo(d)
+            with open(os.path.join(d, "models.ini.in"), "w") as fh:
+                fh.write("MY UNCOMMITTED WORK\n")
+            r = self._rollback(d, head)          # sha == HEAD: nothing to undo
+            with open(os.path.join(d, "models.ini.in")) as fh:
+                self.assertEqual(fh.read(), "MY UNCOMMITTED WORK\n",
+                                 "a rollback that moved nothing deleted the "
+                                 f"operator's work: {r.stderr}")
+            self.assertIn("leaving it alone", r.stdout + r.stderr)
+
+    def test_a_real_rewind_stashes_instead_of_discarding(self):
+        with tempfile.TemporaryDirectory() as d:
+            first = self._repo(d)
+            with open(os.path.join(d, "other.txt"), "w") as fh:
+                fh.write("second commit\n")
+            subprocess.run(["git", "-C", d, "add", "-A"], check=True,
+                           capture_output=True)
+            subprocess.run(["git", "-C", d, "commit", "-qm", "second"],
+                           check=True, capture_output=True)
+            with open(os.path.join(d, "models.ini.in"), "w") as fh:
+                fh.write("MY UNCOMMITTED WORK\n")
+            r = self._rollback(d, first)          # a genuine rewind
+            stash = subprocess.run(["git", "-C", d, "stash", "list"],
+                                   capture_output=True, text=True).stdout
+            self.assertIn("update.sh rollback", stash,
+                          f"local edits were discarded, not stashed: {r.stderr}")
+
+
+class SweepDeadlineBoundsRetries(unittest.TestCase):
+    def test_the_ceiling_is_checked_per_attempt(self):
+        """Checked only between aliases, one alias's retry loop could run
+        3 x CHAT_TIMEOUT past the ceiling the systemd budget assumes."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        loop = body[body.index("for attempt in 1 2 3; do"):
+                    body.index("(( busy )) || break")]
+        self.assertIn("SECONDS > sweep_deadline", loop,
+                      "the retry loop must respect the sweep ceiling")
+
+    def test_the_default_ceiling_leaves_headroom(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn("CHAT_TIMEOUT * 4", body,
+                      "3x leaves nothing for /v1/models or backoff with "
+                      "three aliases, so the last one is skipped")
 
 
 class DeadOutranksUnknown(unittest.TestCase):
@@ -1334,21 +1466,61 @@ class ApiKeyStaysOutOfTheProcessTable(unittest.TestCase):
         self.assertIn('rm -f -- "$CURL_CONF"', body)
         self.assertIn("cleanup", body)
 
+    @staticmethod
+    def _leftovers(d):
+        found = []
+        for root, _dirs, files in os.walk(d):
+            found.extend(os.path.join(root, f) for f in files)
+        return found
+
     def test_sourcing_and_exiting_leaves_no_key_file_behind(self):
         """Library mode installs no other traps, so a sourced smoke() used to
-        leave a key-bearing file in /tmp permanently."""
+        leave a key-bearing file in /tmp permanently. Checks for ANY leftover
+        file, not a filename prefix — the prefix moved once already."""
         with tempfile.TemporaryDirectory() as d:
             script = (
                 f'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+                f'TMPDIR={shlex.quote(d)}; export TMPDIR; '
                 f'source "{UPDATE_SH}"; BONSAI_API_KEY=secret; '
-                f'TMPDIR={shlex.quote(d)}; curl_conf; echo made'
+                f'curl_conf; echo made'
             )
             r = subprocess.run(["bash", "-c", script], capture_output=True,
                                text=True)
             self.assertIn("made", r.stdout, r.stderr)
-            left = [f for f in os.listdir(d) if f.startswith("bonsai-curlcfg.")]
+            left = self._leftovers(d)
             self.assertEqual(left, [],
                              f"a file holding the API key survived exit: {left}")
+
+    def test_the_real_script_leaves_no_run_directory(self):
+        """`exec` replaces the process WITHOUT running its EXIT trap, so a
+        temp directory created before the re-exec leaked on every single run.
+        Measured on the box: one bonsai-run.* left per invocation."""
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, TMPDIR=d)
+            env.pop("BONSAI_UPDATE_REEXEC", None)
+            r = subprocess.run(["bash", UPDATE_SH, "--help"],
+                               capture_output=True, text=True, cwd=ROOT, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            left = sorted(os.listdir(d))
+            self.assertEqual(left, [], f"left behind in TMPDIR: {left}")
+
+    def test_no_key_file_survives_when_ask_runs_in_a_pipeline(self):
+        """The path is assigned lazily, so reaching `ask` through a pipeline
+        assigned it in a SUBSHELL — invisible to the parent's cleanup trap,
+        and the key file survived the run. Measured on the box before the
+        fix: one curl.conf and one curl.err left in /tmp."""
+        with tempfile.TemporaryDirectory() as d:
+            script = (
+                f'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+                f'TMPDIR={shlex.quote(d)}; export TMPDIR; '
+                f'source "{UPDATE_SH}"; API=http://127.0.0.1:9; '
+                f'BONSAI_API_KEY=secret; smoke 2>&1 | head -1'
+            )
+            subprocess.run(["bash", "-c", script], capture_output=True,
+                           text=True)
+            left = self._leftovers(d)
+            self.assertEqual(left, [],
+                             f"key material left behind: {left}")
 
     def test_the_config_file_really_gets_mode_600(self):
         d = tempfile.mkdtemp()

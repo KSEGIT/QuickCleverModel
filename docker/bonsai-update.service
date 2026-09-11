@@ -24,10 +24,11 @@ ExecStart=__ROOT__/update.sh
 
 # Must cover the WHOLE worst case, including the rollback, or systemd sends
 # SIGTERM in the middle of the one path whose job is to rescue the stack.
-# Budget. A smoke sweep is bounded by BONSAI_SMOKE_SWEEP_MAX (default 3 x
-# BONSAI_SMOKE_TIMEOUT = 2700s) plus at most one request already in flight
-# when the deadline passes, so 3600s covers a sweep INCLUDING its retries —
-# without that ceiling the per-alias retry loop tripled the worst case.
+# Budget. A smoke sweep is bounded by BONSAI_SMOKE_SWEEP_MAX (default 4 x
+# BONSAI_SMOKE_TIMEOUT = 3600s) plus at most one request already in flight
+# when the deadline passes, so 4500s covers a sweep INCLUDING its retries.
+# The ceiling is checked before every attempt, not only between aliases —
+# checked only between aliases, one alias could run 3 x CHAT_TIMEOUT past it.
 #
 # Every term the run actually executes, in order. An earlier version of this
 # comment omitted the pre-update health wait, the registry pull and the
@@ -35,16 +36,16 @@ ExecStart=__ROOT__/update.sh
 # throttled link on a run that also had to roll back would have taken SIGTERM
 # mid-rollback, the one thing this timeout exists to prevent.
 #   wait_for_health (pre)        180s
-#   smoke before update         3600s
+#   smoke before update         4500s
 #   compose build llama   up to 2700s  (Dockerfile builds llama.cpp + CUDA)
 #   compose pull open-webui     1800s  (multi-GB, throttled link)
 #   compose up -d                600s
 #   wait_for_health (post)       180s
-#   smoke after update          3600s
+#   smoke after update          4500s
 #   rollback: up + health + smoke
-#                               4380s
+#                               5280s
 #                              -------
-#                              17040s
+#                              19740s
 # 21600 leaves headroom without letting a wedged run sit all day. Raising
 # BONSAI_SMOKE_TIMEOUT or BONSAI_SMOKE_SWEEP_MAX means raising this too.
 TimeoutStartSec=21600

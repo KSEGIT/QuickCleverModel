@@ -58,8 +58,14 @@ warn() { printf '%s  WARN %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die()  { printf '%s  FAIL %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; exit 1; }
 
 cleanup() {
-  # The curl config holds the API key; it must not outlive the run.
+  # Remove the DIRECTORY, not the individual paths. The curl config holds the
+  # API key, and a path assigned lazily inside a subshell — `ask` reached
+  # through a pipeline, say — is invisible to this trap in the parent, so the
+  # key file survived the run. The directory is known before any subshell can
+  # exist, so removing it catches whatever was put inside.
+  [[ -n "${RUN_TMP:-}" ]] && rm -rf -- "$RUN_TMP"
   [[ -n "${CURL_CONF:-}" ]] && rm -f -- "$CURL_CONF"
+  [[ -n "${CURL_ERR:-}" ]] && rm -f -- "$CURL_ERR"
   return 0
 }
 
@@ -69,6 +75,7 @@ cleanup() {
 # replaces this with a fuller handler that also removes the temp copy; a later
 # trap on the same signal supersedes an earlier one.
 trap 'cleanup' EXIT
+RUN_TMP=""
 
 # --- pure helpers, unit-tested in tests/test_update.py -----------------------
 
@@ -150,7 +157,10 @@ sys.exit(0 if text.strip() else 1)'
 # for an empty body and a multi-line one alike.
 ASK_CODE=""
 ASK_BODY=""
+ASK_ERR=""
 CURL_CONF=""
+CURL_ERR=""
+
 
 # The Authorization header goes in a 0600 config file, not in argv.
 # `curl -H "Authorization: Bearer $KEY"` is readable by every local user with
@@ -163,7 +173,12 @@ curl_conf() {
   # unauthenticated requests — which come back 401, read as "cannot judge",
   # and send the operator chasing a model failure that was really a full disk.
   [[ -n "$CURL_CONF" && -s "$CURL_CONF" ]] && return 0
-  CURL_CONF="$(mktemp "${TMPDIR:-/tmp}/bonsai-curlcfg.XXXXXX")" || { CURL_CONF=""; return 1; }
+  if [[ -n "${RUN_TMP:-}" ]]; then
+    CURL_CONF="$RUN_TMP/curl.conf"
+    : > "$CURL_CONF" || { CURL_CONF=""; return 1; }
+  else
+    CURL_CONF="$(mktemp "${TMPDIR:-/tmp}/bonsai-curlcfg.XXXXXX")" || { CURL_CONF=""; return 1; }
+  fi
   # Quoted value, with the key escaped for it.
   #
   # curl un-escapes \\ and \" inside a double-quoted config value and ends the
@@ -193,8 +208,27 @@ ask() {
   local url="$1"; shift
   local out rc
   curl_conf || { warn "could not write the curl config"; return 1; }
-  out="$(curl -sS -w $'\n%{http_code}' --config "$CURL_CONF" \
-        "$@" "$url" 2>/dev/null)"; rc=$?
+  # Keep curl's own message. -S exists precisely so curl explains the failure
+  # despite -s, and sending stderr to /dev/null threw that away — every
+  # transport failure logged a bare "curl failed (exit 7)" and nothing about
+  # why. One reused file rather than one per request.
+  if [[ -z "$CURL_ERR" || ! -f "$CURL_ERR" ]]; then
+    if [[ -n "${RUN_TMP:-}" ]]; then
+      CURL_ERR="$RUN_TMP/curl.err"
+      : > "$CURL_ERR" || CURL_ERR=""
+    else
+      CURL_ERR="$(mktemp "${TMPDIR:-/tmp}/bonsai-curlerr.XXXXXX")" || CURL_ERR=""
+    fi
+  fi
+  if [[ -n "$CURL_ERR" ]]; then
+    out="$(curl -sS -w $'\n%{http_code}' --config "$CURL_CONF" \
+          "$@" "$url" 2>"$CURL_ERR")"; rc=$?
+    ASK_ERR="$(tr '\n' ' ' < "$CURL_ERR" | head -c 300)"
+  else
+    out="$(curl -sS -w $'\n%{http_code}' --config "$CURL_CONF" \
+          "$@" "$url" 2>/dev/null)"; rc=$?
+    ASK_ERR=""
+  fi
   ASK_CODE="${out##*$'\n'}"
   ASK_BODY="${out%$'\n'*}"
   return "$rc"
@@ -246,7 +280,7 @@ smoke() {
   local ids id rc failed=0 unknown=0
 
   ask "$API/v1/models" -m 15 || {
-    warn "could not reach $API/v1/models (curl failed)"; return 2; }
+    warn "could not reach $API/v1/models: ${ASK_ERR:-curl failed}"; return 2; }
   if [[ "$ASK_CODE" != "200" ]]; then
     warn "/v1/models returned HTTP $ASK_CODE — cannot judge the stack: ${ASK_BODY:0:200}"
     return 2
@@ -271,6 +305,15 @@ smoke() {
     this_unknown=0
     for attempt in 1 2 3; do
       busy=0
+      # Checked per ATTEMPT, not just per alias: the retry loop could
+      # otherwise carry one alias up to 3 x CHAT_TIMEOUT past the ceiling,
+      # and the systemd budget is written against the ceiling plus a single
+      # request in flight.
+      if (( attempt > 1 && SECONDS > sweep_deadline )); then
+        warn "  smoke: $id — sweep deadline passed; not retrying"
+        this_unknown=1
+        break
+      fi
       ask "$API/v1/chat/completions" -m "$CHAT_TIMEOUT" \
         -H "Content-Type: application/json" -d "$(smoke_body "$id")"; rc=$?
       if (( rc != 0 )); then
@@ -281,7 +324,7 @@ smoke() {
         if (( rc == 28 )); then
           warn "  smoke: $id timed out after ${CHAT_TIMEOUT}s — a cold load can exceed this; raise BONSAI_SMOKE_TIMEOUT if the box is slow"
         else
-          warn "  smoke: $id — curl failed (exit $rc); cannot judge the stack"
+          warn "  smoke: $id — ${ASK_ERR:-curl failed} (exit $rc); cannot judge it"
         fi
         this_unknown=1
         break
@@ -391,6 +434,14 @@ if [[ -z "${BONSAI_UPDATE_LIB:-}" ]]; then
   fi
 fi
 
+# Created HERE, after the re-exec above, and not before it: `exec` replaces
+# the process without running its EXIT trap, so a directory made by the parent
+# leaked every single run. Still early enough to be known before anything
+# calls ask, which is the point — a path assigned lazily inside a subshell is
+# invisible to the trap in this shell, and the file holds the API key.
+# 0700 from mktemp -d is what makes the fixed filenames inside it safe.
+RUN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/bonsai-run.XXXXXX" 2>/dev/null)" || RUN_TMP=""
+
 # --- everything below needs a real box ---------------------------------------
 
 # .env carries BONSAI_API_KEY and the bind addresses. Exported because compose
@@ -428,7 +479,10 @@ HEALTH_TIMEOUT="${BONSAI_HEALTH_TIMEOUT:-180}"
 # Ceiling on one whole smoke sweep. The per-alias retry loop would otherwise
 # multiply the worst case by three, and the systemd unit's time budget is
 # written against a sweep, not against an attempt.
-SMOKE_SWEEP_MAX="${BONSAI_SMOKE_SWEEP_MAX:-$(( CHAT_TIMEOUT * 3 ))}"
+# 4x, not 3x: with three aliases at the default per-model timeout, a 3x
+# ceiling leaves nothing for the /v1/models call or any backoff, so the last
+# alias is skipped and a healthy box degrades to "cannot judge".
+SMOKE_SWEEP_MAX="${BONSAI_SMOKE_SWEEP_MAX:-$(( CHAT_TIMEOUT * 4 ))}"
 
 compose() { docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
@@ -688,6 +742,22 @@ record_rollback_point() {
 # running --rollback deliberately must not blacklist a commit — the refusal
 # message says the commit "already failed its smoke test", and that has to
 # stay true.
+stash_local_edits() {
+  # A rewind is about to discard whatever is in the tree. `git merge --ff-only`
+  # refuses only when local edits COLLIDE with the merged files, so edits to
+  # untouched files reach this point alive — and a hard reset would erase
+  # them without a word. Park them instead; `git stash list` gets them back.
+  if git -C "$ROOT" diff --quiet && git -C "$ROOT" diff --cached --quiet \
+     && [[ -z "$(git -C "$ROOT" ls-files --others --exclude-standard)" ]]; then
+    return 0
+  fi
+  warn "uncommitted changes in the checkout — stashing them before the rewind
+(recover with: git -C $ROOT stash list)"
+  git -C "$ROOT" stash push -u -m "update.sh rollback" >/dev/null 2>&1 \
+    || warn "could not stash; the rewind may discard local edits"
+  return 0
+}
+
 do_rollback() {
   [[ -f "$STATE" ]] || die "no rollback point recorded at $STATE"
   local pin="${1:-}"
@@ -705,14 +775,26 @@ do_rollback() {
   bad="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
 
   log "rolling back to ${sha:0:12}"
+  local cur
+  cur="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   if [[ -z "$sha" ]]; then
     warn "no commit recorded; leaving the checkout where it is"
     restored=0
-  elif ! git -C "$ROOT" reset --hard "$sha"; then
-    # Silence here is how a rollback reports success with the broken code
-    # still checked out.
-    warn "git reset to $sha FAILED — the broken commit is STILL checked out"
-    restored=0
+  elif [[ "$sha" == "$cur" ]]; then
+    # Nothing to rewind. Without this, an image-only run whose new open-webui
+    # image failed would `git reset --hard` onto the commit already checked
+    # out — undoing nothing and silently deleting the operator's uncommitted
+    # work for a failure the code never caused. The build path was guarded
+    # for exactly this; the guard had not been carried here.
+    log "checkout is already at ${sha:0:12}; leaving it alone"
+  else
+    stash_local_edits
+    if ! git -C "$ROOT" reset --hard "$sha"; then
+      # Silence here is how a rollback reports success with the broken code
+      # still checked out.
+      warn "git reset to $sha FAILED — the broken commit is STILL checked out"
+      restored=0
+    fi
   fi
 
   local have
@@ -905,6 +987,17 @@ it. See the warnings above."
   local pin_arg=""
   if [[ "$target" != "$head_sha" ]]; then
     pin_arg="pin"
+    if (( ! verified )); then
+      # The stack failed its check BEFORE this update touched anything, so a
+      # failure afterwards proves nothing about the new commit. A driver
+      # upgrade, an OOM, or weights that moved — every cause named above —
+      # would otherwise blacklist an innocent commit, and is_pinned_bad would
+      # then refuse every later run until something newer landed, while the
+      # real outage went untouched.
+      warn "the stack was already failing before this update, so this run will
+not blame the new commit if it fails"
+      pin_arg=""
+    fi
     log "moving to ${target:0:12}"
     if ! git -C "$ROOT" merge --ff-only "$target"; then
       die "git merge --ff-only $target failed — the checkout has diverged, fix it by hand"
