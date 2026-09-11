@@ -55,6 +55,14 @@ cache-reuse = @CACHE_REUSE@
 cache-ram = @CACHE_RAM@
 metrics = true
 jinja = true
+; The template baked into the GGUF raises 'System message must be at the
+; beginning' for any system message after the first, and only ever renders
+; messages[0]. Codex sends two: one from `instructions` and one from its
+; `developer` input item, so every Codex request fails with a 400. This copy
+; renders the later system blocks instead of raising. It is byte-identical to
+; the GGUF template for every other message shape -- see
+; tests/test_chat_template.py.
+chat-template-file = @ROOT@/bonsai-chat-template.jinja
 temp = 0.5
 top-p = 0.85
 top-k = 20

@@ -1,8 +1,12 @@
 name: tests
 
-# The suite is stdlib-only and needs no .env, no weights and no running
-# services: the tests assert contract shape rather than standing up the stack.
-# That is what makes it safe to run on a bare runner.
+# The suite needs no .env, no weights and no running services: the tests
+# assert contract shape rather than standing up the stack. That is what makes
+# it safe to run on a bare runner.
+#
+# One exception to stdlib-only: tests/test_chat_template.py renders the chat
+# template, which needs jinja2. It skips without it, and a skip here would
+# report green while testing nothing -- so the step below installs it.
 on:
   push:
     branches: [main]
@@ -32,9 +36,11 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          # Matches the 3.11 used for local development. The suite imports
-          # nothing outside the stdlib, so there is no install step.
+          # Matches the 3.11 used for local development.
           python-version: '3.11'
+
+      - name: Install the one test dependency
+        run: python3 -m pip install --disable-pip-version-check jinja2
 
       - name: Run the unittest suite
         run: python3 -m unittest discover -s tests -v

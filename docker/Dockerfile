@@ -47,6 +47,6 @@ WORKDIR /app
 # Kept at this exact path so start-server.sh finds the binary unmodified
 # ($ROOT/src/llama.cpp-prism/build/bin/llama-server).
 COPY --from=build /app/src/llama.cpp-prism/build/bin /app/src/llama.cpp-prism/build/bin
-COPY start-server.sh models.ini.in /app/
+COPY start-server.sh models.ini.in bonsai-chat-template.jinja /app/
 
 ENTRYPOINT ["/app/start-server.sh"]
