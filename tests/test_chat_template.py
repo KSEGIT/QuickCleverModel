@@ -63,6 +63,29 @@ def read(path):
         return fh.read()
 
 
+def parse_models_ini(text):
+    """Section name -> {key: value}, comments dropped.
+
+    Splitting on the literal "[*]" is not good enough: the file's own header
+    comment mentions "[*]" and "[section]", so a naive split lands inside the
+    header and inspects a comment instead of the globals block. That is not
+    hypothetical -- it silently made this file's first draft pass.
+    """
+    sections, current = {}, None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(";") or stripped.startswith("#"):
+            continue
+        header = re.fullmatch(r"\[(.+)\]", stripped)
+        if header:
+            current = header.group(1)
+            sections.setdefault(current, {})
+        elif current is not None and "=" in stripped:
+            key, _, value = stripped.partition("=")
+            sections[current][key.strip()] = value.strip()
+    return sections
+
+
 def compile_template(source):
     """Compile the way the server does.
 
@@ -113,24 +136,22 @@ class Wiring(unittest.TestCase):
 
     def test_every_bonsai_section_sets_the_template(self):
         """Not [*]: that would cascade Bonsai's ChatML onto a future model."""
-        ini = read(MODELS_INI)
-        sections = re.findall(r"(?m)^\[([^\]*]+)\]", ini)
+        sections = parse_models_ini(read(MODELS_INI))
+        models = {name: keys for name, keys in sections.items() if name != "*"}
         self.assertEqual(
-            3, len(sections), f"expected three model sections, found {sections}"
+            3, len(models), f"expected three model sections, found {sorted(models)}"
         )
-        for section in sections:
-            body = ini.split(f"[{section}]", 1)[1].split("\n[", 1)[0]
-            self.assertIn(
-                "chat-template-file = @ROOT@/bonsai-chat-template.jinja",
-                body,
-                f"[{section}] must set chat-template-file itself",
+        for name, keys in models.items():
+            self.assertEqual(
+                "@ROOT@/bonsai-chat-template.jinja",
+                keys.get("chat-template-file"),
+                f"[{name}] must set chat-template-file itself",
             )
 
     def test_the_globals_block_does_not_set_the_template(self):
-        globals_block = read(MODELS_INI).split("[*]", 1)[1].split("\n[", 1)[0]
         self.assertNotIn(
             "chat-template-file",
-            globals_block,
+            parse_models_ini(read(MODELS_INI)).get("*", {}),
             "chat-template-file in [*] cascades onto every future section, "
             "overriding that model's own template with Bonsai's ChatML",
         )
