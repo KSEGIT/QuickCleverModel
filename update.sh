@@ -21,6 +21,29 @@ set -uo pipefail
 # compare against it.
 SELF="${BASH_SOURCE[0]}"
 
+# Sourced, or executed? BASH_SOURCE[0] differs from $0 only when sourced.
+#
+# This matters because BONSAI_UPDATE_LIB alone used to switch off the
+# self-copy and the signal traps, and the guard at the bottom is a `return` —
+# which is an ERROR at the top level of an executed script, not an exit. Bash
+# printed "can only `return' from a function or sourced script" and carried
+# straight on into cmd_update. So a leaked export — a shell where the suite
+# ran, a systemd Environment= line, a CI wrapper — made a real run execute
+# `git merge` and `git reset --hard` against the very file bash was reading
+# by byte offset, with no traps installed either. BONSAI_UPDATE_REEXEC was
+# hardened against this same leaked-environment class; this was not.
+SOURCED=0
+[[ "${BASH_SOURCE[0]}" != "$0" ]] && SOURCED=1
+LIB_MODE=0
+if [[ -n "${BONSAI_UPDATE_LIB:-}" ]]; then
+  if (( SOURCED )); then
+    LIB_MODE=1
+  else
+    printf '%s  WARN %s\n' "$(date -u +%H:%M:%S)" \
+      "BONSAI_UPDATE_LIB is set but this script was executed, not sourced — ignoring it" >&2
+  fi
+fi
+
 # True only when this process is one of our own temp copies.
 #
 # Two conditions, and the second is what makes it safe. Matching the variable
@@ -401,7 +424,7 @@ smoke() {
 # The test is "am I a copy", not "is the variable set". Keying on presence
 # meant any leaked value skipped the copy entirely, and `git pull` and `git
 # reset --hard` then rewrote the very file bash was reading by byte offset.
-if [[ -z "${BONSAI_UPDATE_LIB:-}" ]] && ! looks_like_temp_copy; then
+if (( ! LIB_MODE )) && ! looks_like_temp_copy; then
   # Backstop against an exec loop if TMPDIR ever lands where the name pattern
   # cannot match. Two attempts is one more than a healthy run needs.
   (( ${BONSAI_UPDATE_DEPTH:-0} >= 2 )) \
@@ -413,6 +436,9 @@ if [[ -z "${BONSAI_UPDATE_LIB:-}" ]] && ! looks_like_temp_copy; then
   cat "$SELF" > "$copy" || die "could not copy myself to $copy"
   chmod +x "$copy"
   # Carries the copy's PATH, not a flag — see looks_like_temp_copy above.
+  # Decided above that a leaked BONSAI_UPDATE_LIB is to be ignored; drop it so
+  # the copy does not repeat the warning.
+  unset BONSAI_UPDATE_LIB
   export BONSAI_UPDATE_REEXEC="$copy"
   export BONSAI_UPDATE_ROOT="$ROOT"
   export BONSAI_UPDATE_DEPTH=$(( ${BONSAI_UPDATE_DEPTH:-0} + 1 ))
@@ -436,7 +462,7 @@ fi
 # but bash also RESUMES after a non-EXIT handler returns, so a handler that
 # only cleans up would let the run carry on pulling and building until
 # SIGKILL arrives. The signal handler has to exit.
-if [[ -z "${BONSAI_UPDATE_LIB:-}" ]]; then
+if (( ! LIB_MODE )); then
   if looks_like_temp_copy; then
     trap 'cleanup; rm -f -- "$SELF"' EXIT
     trap 'warn "interrupted — stopping"; cleanup; rm -f -- "$SELF"; exit 143' INT TERM
@@ -492,7 +518,13 @@ RETRY_SLEEP="${BONSAI_SMOKE_RETRY_SLEEP:-15}"
 # BONSAI_SMOKE_TIMEOUT is: blowing this deadline rolls the stack back AND pins
 # the commit, so a slow disk plus nvidia-runtime init on a cold recreate must
 # not be able to blacklist good code.
-HEALTH_TIMEOUT="${BONSAI_HEALTH_TIMEOUT:-180}"
+# 900, not 180: install.sh:219 waits `wait_for "http://127.0.0.1:8080/health"
+# 900` for this exact endpoint on this exact stack, with the comment "15
+# minutes: model load on first request is genuinely slow". This is the one
+# path that PINS on failure, so a default contradicting the project's own
+# measurement would blacklist good commits on any box slower than the one
+# that number was picked on.
+HEALTH_TIMEOUT="${BONSAI_HEALTH_TIMEOUT:-900}"
 
 # Open WebUI gets its own, longer deadline. Its first start after a :main pull
 # runs database migrations, which outlast a llama restart on a slow disk — and
@@ -792,8 +824,15 @@ stash_local_edits() {
   fi
   warn "uncommitted changes in the checkout — stashing them before the rewind
 (recover with: git -C $ROOT stash list)"
-  git -C "$ROOT" stash push -u -m "update.sh rollback" >/dev/null 2>&1 \
-    || warn "could not stash; the rewind may discard local edits"
+  if ! git -C "$ROOT" stash push -u -m "update.sh rollback" >/dev/null 2>&1; then
+    # `git stash push` writes commits, so it needs a committer identity — on a
+    # service account with no user.email it simply fails. Returning 0 here let
+    # the caller hard-reset anyway and delete the work, with a WARN line as
+    # the only trace, while docs/updating.md promises "Nothing is deleted".
+    warn "could not stash the local changes (is git user.email set?) — NOT
+rewinding the checkout, because that would delete them"
+    return 1
+  fi
   return 0
 }
 
@@ -826,8 +865,10 @@ do_rollback() {
     # work for a failure the code never caused. The build path was guarded
     # for exactly this; the guard had not been carried here.
     log "checkout is already at ${sha:0:12}; leaving it alone"
+  elif ! stash_local_edits; then
+    warn "leaving the checkout on ${cur:0:12} to preserve uncommitted work"
+    restored=0
   else
-    stash_local_edits
     if ! git -C "$ROOT" reset --hard "$sha"; then
       # Silence here is how a rollback reports success with the broken code
       # still checked out.
@@ -1120,7 +1161,10 @@ not blame the new commit if it fails"
       # merge path had been left out. `git merge --ff-only` refuses only on
       # COLLIDING paths, so an uncommitted edit to a file the commit does not
       # touch reaches here alive and would be erased without a word.
-      stash_local_edits
+      if ! stash_local_edits; then
+        warn "leaving the checkout on ${target:0:12} to preserve uncommitted work"
+        exit 1
+      fi
       # Guarded by pin_arg, which is set only when the merge above actually
       # ran. Unconditional, this reset fired on image-only runs too — where
       # it reset to the commit already checked out and silently deleted any
@@ -1217,7 +1261,11 @@ USAGE
 # record_rollback_point, do_rollback, cmd_check and cmd_update existed, so
 # their tests could only grep the source text. A group-command exit-status
 # bug that aborted every update passed a green suite that way.
-[[ -n "${BONSAI_UPDATE_LIB:-}" ]] && return 0
+# `return` only runs when genuinely sourced — see SOURCED above. Guarded, so
+# it can no longer emit an error and fall through into the dispatcher.
+if (( LIB_MODE )); then
+  return 0
+fi
 
 case "${1:-}" in
   "")         cmd_update;;

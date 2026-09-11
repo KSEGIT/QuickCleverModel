@@ -16,6 +16,7 @@ import json
 import shlex
 import shutil
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -873,6 +874,122 @@ class MovedAndPinnableAreDifferentQuestions(unittest.TestCase):
         self.assertIn("nothing to undo", out)
         self.assertFalse(os.path.exists(marker),
                          "an image-only run must not touch the checkout")
+
+
+class LeakedLibraryFlagIsIgnored(unittest.TestCase):
+    """BONSAI_UPDATE_LIB alone used to switch off the self-copy and the signal
+    traps, and the guard at the bottom is a `return` — an ERROR at the top
+    level of an executed script, not an exit. Bash printed "can only `return'
+    from a function or sourced script" and carried straight on into
+    cmd_update. A leaked export therefore made a real run execute `git merge`
+    and `git reset --hard` against the very file bash was reading by byte
+    offset, with no traps installed either."""
+
+    def test_an_executed_script_ignores_the_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            copy = os.path.join(d, "update.sh")
+            shutil.copy(UPDATE_SH, copy)
+            os.chmod(copy, 0o755)
+            env = dict(os.environ, BONSAI_UPDATE_LIB="1", TMPDIR=d)
+            r = subprocess.run(["bash", copy, "--help"], capture_output=True,
+                               text=True, cwd=d, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("ignoring it", r.stderr)
+            self.assertNotIn("can only `return'", r.stderr,
+                             "the library guard fell through into the dispatcher")
+            self.assertIn("--rollback", r.stdout)
+
+    def test_the_warning_is_said_once_not_twice(self):
+        with tempfile.TemporaryDirectory() as d:
+            copy = os.path.join(d, "update.sh")
+            shutil.copy(UPDATE_SH, copy)
+            os.chmod(copy, 0o755)
+            env = dict(os.environ, BONSAI_UPDATE_LIB="1", TMPDIR=d)
+            r = subprocess.run(["bash", copy, "--help"], capture_output=True,
+                               text=True, cwd=d, env=env)
+            self.assertEqual(r.stderr.count("ignoring it"), 1,
+                             "the re-exec'd copy repeated the warning")
+
+    def test_sourcing_still_works(self):
+        r = subprocess.run(
+            ["bash", "-c",
+             f'export BONSAI_UPDATE_LIB=1; source "{UPDATE_SH}"; '
+             'declare -F cmd_update >/dev/null && echo DEFINED'],
+            capture_output=True, text=True)
+        self.assertIn("DEFINED", r.stdout, r.stderr)
+        self.assertNotIn("ignoring it", r.stderr)
+
+
+class HealthDeadlineMatchesTheInstaller(unittest.TestCase):
+    def test_the_default_matches_install_sh(self):
+        """install.sh waits 900s for this exact endpoint on this exact stack
+        ("model load on first request is genuinely slow"). This is the one
+        path that PINS on failure, so a shorter default would blacklist good
+        commits on any box slower than the one 180 was picked on."""
+        with open(os.path.join(ROOT, "install.sh")) as fh:
+            installer = fh.read()
+        m = re.search(r'wait_for "http://[^"]*:8080/health"\s+(\d+)', installer)
+        self.assertIsNotNone(m, "install.sh no longer waits on :8080/health")
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn(f"BONSAI_HEALTH_TIMEOUT:-{m.group(1)}", body,
+                      "update.sh disagrees with install.sh about the same "
+                      "endpoint, and this one pins on failure")
+
+
+class AFailedStashStopsTheRewind(unittest.TestCase):
+    """`git stash push` writes commits, so it needs a committer identity — on
+    a service account with no user.email it simply fails. Returning 0 let the
+    caller hard-reset anyway and delete the work, with a WARN line as the only
+    trace, while docs/updating.md promises "Nothing is deleted"."""
+
+    def _repo(self, d):
+        subprocess.run(["git", "init", "-q", d], check=True, capture_output=True)
+        for k, v in (("user.email", "t@t"), ("user.name", "t")):
+            subprocess.run(["git", "-C", d, "config", k, v], check=True,
+                           capture_output=True)
+        with open(os.path.join(d, "f.txt"), "w") as fh:
+            fh.write("committed\n")
+        subprocess.run(["git", "-C", d, "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", d, "commit", "-qm", "one"], check=True,
+                       capture_output=True)
+        first = subprocess.run(["git", "-C", d, "rev-parse", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+        with open(os.path.join(d, "f.txt"), "w") as fh:
+            fh.write("two\n")
+        subprocess.run(["git", "-C", d, "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", d, "commit", "-qm", "two"], check=True,
+                       capture_output=True)
+        return first
+
+    def test_the_checkout_is_left_alone_when_the_stash_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            first = self._repo(d)
+            with open(os.path.join(d, "f.txt"), "w") as fh:
+                fh.write("MY UNCOMMITTED WORK\n")
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write(f"sha={first}\nwebui=\nllama=\nverified=1\n")
+            setup = (
+                f'ROOT={shlex.quote(d)}; STATE={shlex.quote(state)}; '
+                'docker() { return 0; }; compose() { return 0; }; '
+                'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+                'smoke() { return 0; }; '
+                # the failure mode: stash refuses
+                'stash_local_edits() { warn "could not stash"; return 1; }'
+            )
+            r = run_real(setup, 'do_rollback')
+            with open(os.path.join(d, "f.txt")) as fh:
+                self.assertEqual(fh.read(), "MY UNCOMMITTED WORK\n",
+                                 f"the rewind deleted the work: {r.stderr}")
+            self.assertIn("preserve uncommitted work", r.stderr)
+
+    def test_stash_failure_returns_nonzero(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        fn = body[body.index("stash_local_edits() {"):body.index("do_rollback() {")]
+        self.assertIn("return 1", fn,
+                      "a failed stash must stop the caller rewinding")
 
 
 class TheWeeklyCheckCoversTheUi(unittest.TestCase):

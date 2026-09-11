@@ -35,22 +35,22 @@ ExecStart=__ROOT__/update.sh
 # restart, and left only ~540s of slack for a multi-GB GHCR pull — so a
 # throttled link on a run that also had to roll back would have taken SIGTERM
 # mid-rollback, the one thing this timeout exists to prevent.
-#   wait_for_health (pre)        180s
+#   wait_for_health (pre)        900s  (matches install.sh's own budget)
 #   smoke before update         4500s
 #   webui_ok (pre)               300s
 #   compose build llama   up to 2700s  (Dockerfile builds llama.cpp + CUDA)
 #   compose pull open-webui     1800s  (multi-GB, throttled link)
 #   compose up -d                600s
-#   wait_for_health (post)       180s
+#   wait_for_health (post)       900s
 #   smoke after update          4500s
 #   webui_ok (post)              300s
 #   rollback: up + health + smoke + webui
-#                               5580s
+#                               6300s
 #                              -------
-#                              20640s
-# 21600 leaves headroom without letting a wedged run sit all day. Raising
+#                              22800s
+# 27000 leaves headroom without letting a wedged run sit all day. Raising
 # BONSAI_SMOKE_TIMEOUT or BONSAI_SMOKE_SWEEP_MAX means raising this too.
-TimeoutStartSec=21600
+TimeoutStartSec=27000
 
 # Deprioritizes THIS unit: the git work, the smoke sweeps and the compose
 # client. It does NOT reach the image build — `docker compose build` only

@@ -91,13 +91,13 @@ sed -i '/^bad=/d' run/update-state
 remembers the commit when the code is to blame. So a deadline that is too
 short on a slow machine blocks good code until a person clears it.
 
-Four settings in `.env` control this. See `.env.example` for each one:
+Five settings in `.env` control this. See `.env.example` for each one:
 
 | Setting | Default | What it bounds |
 |---|---|---|
 | `BONSAI_SMOKE_TIMEOUT` | 900s | One model's answer |
 | `BONSAI_SMOKE_SWEEP_MAX` | 4x the above | One whole sweep, retries included |
-| `BONSAI_HEALTH_TIMEOUT` | 180s | Waiting for llama's `/health` after a restart |
+| `BONSAI_HEALTH_TIMEOUT` | 900s | Waiting for llama's `/health` after a restart |
 | `BONSAI_WEBUI_TIMEOUT` | 300s | Waiting for the chat UI, which runs database migrations on first start |
 | `BONSAI_SMOKE_RETRY_SLEEP` | 15s | Backoff when the router says it is busy |
 
