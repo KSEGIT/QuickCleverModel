@@ -81,11 +81,21 @@ Other failures do not pin. A build that lost the network, or a start that
 lost a race with the second network address, says nothing about the commit.
 A wrong pin would stop every later update until a person cleared it.
 
-To try the same commit again anyway:
+A bad Open WebUI **image** is remembered too, as `badimg=`. If the chat UI
+stops answering right after a new image arrives, that image is not pulled
+again until upstream publishes a different one. Without this the machine
+would pull the same broken image every week, fail, and restart the stack —
+throwing the loaded model out each time.
+
+Clear either kind of pin the same way:
 
 ```bash
-sed -i '/^bad=/d' run/update-state
+sed -i '/^bad=/d;/^badimg=/d' run/update-state
 ```
+
+To try the same commit again anyway:
+
+
 
 ## Tuning the deadlines
 

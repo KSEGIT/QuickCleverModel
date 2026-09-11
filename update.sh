@@ -132,6 +132,19 @@ for m in d.get("data", []):
         print(m["id"])'
 }
 
+is_pinned_bad_image() {
+  # Whether THIS open-webui image digest already broke the chat UI here.
+  #
+  # Only code was ever pinned, so a permanently broken upstream :main looped
+  # forever: the rollback retags the old image, so next week the local digest
+  # differs from the registry again, the "nothing to do" exit is skipped, and
+  # the run rebuilds, pulls the same broken image, fails, and force-recreates
+  # — evicting the resident 27B model and forcing a second cold smoke sweep,
+  # every Monday, with nothing in the journal to say it is a loop.
+  [[ -n "${1:-}" ]] || return 1
+  grep -qxF "badimg=$1" "$STATE" 2>/dev/null
+}
+
 is_pinned_bad() {
   # Whether THIS commit is pinned — matched against every recorded pin, not
   # just the newest. Pins accumulate (do_rollback appends, and a rewrite
@@ -170,7 +183,21 @@ if not isinstance(msg, dict):
 def _text(v):
     if isinstance(v, str):
         return v
-    return "" if v is None else str(v)
+    if isinstance(v, list):
+        # OpenAI content-parts: pull the text out rather than stringify the
+        # container.
+        out = []
+        for part in v:
+            if isinstance(part, str):
+                out.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                out.append(part["text"])
+        return "".join(out)
+    # Anything else is not text. NOT str(v): that turned [] into "[]", {} into
+    # "{}", 0 into "0" and False into "False" — all non-empty, so a reply with
+    # no content at all scored as a real generation. The one check this whole
+    # script exists to perform would have called a dead model healthy.
+    return ""
 
 
 text = _text(msg.get("content")) + _text(msg.get("reasoning_content"))
@@ -313,7 +340,7 @@ webui_answers_now() {
 }
 
 webui_ok() {
-  local deadline=$(( SECONDS + WEBUI_TIMEOUT ))
+  local deadline=$(( SECONDS + ${1:-$WEBUI_TIMEOUT} ))
   while (( SECONDS < deadline )); do
     webui_answers_now && return 0
     sleep 3
@@ -590,6 +617,13 @@ HEALTH_TIMEOUT="${BONSAI_HEALTH_TIMEOUT:-900}"
 # both: wrong, and reassuring.
 WEBUI_TIMEOUT="${BONSAI_WEBUI_TIMEOUT:-900}"
 
+# The PRE-update probes ask what the stack is doing right now; the long
+# deadlines above are for waiting out a restart. Using those for the pre-check
+# meant a run against a deliberately-stopped stack idled ~30 minutes before
+# doing anything. The --rollback path already used a single attempt for
+# exactly this reason.
+PRECHECK_TIMEOUT="${BONSAI_PRECHECK_TIMEOUT:-30}"
+
 # Ceiling on one whole smoke sweep. The per-alias retry loop would otherwise
 # multiply the worst case by three, and the systemd unit's time budget is
 # written against a sweep, not against an attempt.
@@ -754,6 +788,16 @@ This is the Linux/Docker path; macOS uses ./stack.sh"
   [[ -f "$ENV_FILE" ]]     || die "no .env at $ENV_FILE"
   [[ -n "${BONSAI_API_KEY:-}" ]] || die "BONSAI_API_KEY is not set in $ENV_FILE"
 
+  # The BINARY existing is not the daemon answering. Without this,
+  # record_rollback_point still ran: `docker image inspect` returned empty for
+  # both images and wrote blank ids, silently disarming the image half of
+  # --rollback even though bonsai-llama:rollback was still valid on disk. The
+  # run then died at `compose build` anyway. cmd_check already probes the
+  # daemon; update and rollback did not.
+  docker version --format '{{.Server.Version}}' >/dev/null 2>&1 \
+    || die "cannot reach the docker daemon (is it running, and are you in the
+docker group?)"
+
   # A rollback restores code and images, not weights. Refusing to run it
   # because the weights are missing takes away the one tool that helps when
   # the stack is already down.
@@ -782,8 +826,9 @@ Stop it from the checkout that owns it, then start it from here:
 
 wait_for_health() {
   # Condition polling, not a fixed sleep: a cold 27B load off a spinning disk
-  # is minutes, a warm restart is seconds.
-  local deadline=$((SECONDS + HEALTH_TIMEOUT))
+  # is minutes, a warm restart is seconds. $1 overrides the deadline for the
+  # pre-update probe, which is not waiting for anything to start.
+  local deadline=$((SECONDS + ${1:-$HEALTH_TIMEOUT}))
   while (( SECONDS < deadline )); do
     if curl -fsS -m 5 "$API/health" 2>/dev/null | grep -q '"ok"'; then
       return 0
@@ -828,7 +873,7 @@ record_rollback_point() {
     warn "no $LLAMA_IMAGE present to save"
   fi
   # do_rollback appends bad= pins here; a plain truncate would drop them.
-  pins="$(grep '^bad=' "$STATE" 2>/dev/null)"
+  pins="$(grep -E '^bad(img)?=' "$STATE" 2>/dev/null)"
   # An unwritten rollback point is only discovered when it is needed, which
   # is after the stack is already broken. Fail now instead.
   # Write beside it and rename. `> "$STATE"` truncates when the redirect is
@@ -850,8 +895,8 @@ record_rollback_point() {
   # A group command is not a subshell, so the flag survives into this scope.
   local ok=1
   {
-    printf 'sha=%s\nwebui=%s\nllama=%s\nverified=%s\n' \
-      "$sha" "$webui" "$llama" "$verified" || ok=0
+    printf 'sha=%s\nwebui=%s\nllama=%s\nverified=%s\nui=%s\n' \
+      "$sha" "$webui" "$llama" "$verified" "${UI_WAS_UP:-0}" || ok=0
     if [[ -n "$pins" ]]; then
       printf '%s\n' "$pins" || ok=0
     fi
@@ -910,7 +955,7 @@ do_rollback() {
   bad="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
 
   log "rolling back to ${sha:0:12}"
-  local cur
+  local cur span
   cur="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   if [[ -z "$sha" ]]; then
     warn "no commit recorded; leaving the checkout where it is"
@@ -926,6 +971,14 @@ do_rollback() {
     warn "leaving the checkout on ${cur:0:12} to preserve uncommitted work"
     restored=0
   else
+    # Say how far back this goes. The recorded point can predate this run's
+    # own change, and a nine-week rewind logged as "rollback verified" is the
+    # kind of success nobody wants to discover later.
+    span="$(git -C "$ROOT" rev-list --count "$sha..$cur" 2>/dev/null)"
+    if [[ -n "$span" ]] && (( span > 1 )); then
+      warn "this rewinds $span commits (${cur:0:12} -> ${sha:0:12}) — more than
+this run introduced, because the recorded point predates it"
+    fi
     if ! git -C "$ROOT" reset --hard "$sha"; then
       # Silence here is how a rollback reports success with the broken code
       # still checked out.
@@ -1082,6 +1135,12 @@ pulled — so this is the commit, not the registry"
   else
     warn "the chat UI at $WEBUI_URL did not answer after a new image was
 pulled — not blaming the commit for it"
+    # Pin the IMAGE instead, so the same broken :main is not pulled again
+    # every week. Written before the rollback, which retags the old image.
+    if [[ -n "$webui_after" ]]; then
+      printf 'badimg=%s\n' "$webui_after" >> "$STATE" \
+        || warn "could not pin the failed image; it may be retried next week"
+    fi
   fi
   do_rollback "$ui_pin"
   exit 1
@@ -1127,12 +1186,24 @@ cmd_update() {
   local head_sha have want verified=0 models_verdict ui_before=0
   head_sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   log "checking the current stack before changing anything"
-  if wait_for_health; then smoke; models_verdict=$?; else models_verdict=1; fi
-  if webui_ok; then ui_before=1; fi
+  if wait_for_health "$PRECHECK_TIMEOUT"; then
+    smoke; models_verdict=$?
+  else
+    models_verdict=1
+  fi
+  if webui_ok "$PRECHECK_TIMEOUT"; then ui_before=1; fi
   UI_WAS_UP=$ui_before
 
   case "$models_verdict" in
-    0) (( ui_before )) && verified=1;;
+    # The MODELS alone, deliberately. A rollback restores code and images, so
+    # the models are what it can bring back. Requiring the UI too meant that
+    # on a box where Open WebUI is deliberately stopped, verified never became
+    # 1 again — and the keep-the-proven-point guard then froze the rollback
+    # target at the last fully-verified run while updates kept applying week
+    # after week. A failure in week 10 would rewind nine weeks of commits it
+    # never introduced and call it "rollback verified". The UI state is
+    # recorded separately, below.
+    0) verified=1;;
     2) warn "could not judge the models before this update — recording the
 rollback point as unverified";;
     *) warn "the models are NOT serving before this update — recording the
@@ -1164,6 +1235,14 @@ To try it again anyway:
   if code_already_current "$target"; then
     have="$(local_image_digest "$WEBUI_IMAGE")"
     want="$(remote_image_digest "$WEBUI_IMAGE")"
+    # An image already known to break the chat UI here is not a reason to
+    # rebuild and restart either. Without this the loop above repeats weekly
+    # until upstream publishes something different.
+    if [[ -n "$want" ]] && is_pinned_bad_image "$want"; then
+      log "the newest open-webui image already broke the chat UI here and was
+rolled back; nothing to do until a newer one is published"
+      want="$have"
+    fi
     # An unreadable registry digest is NOT a reason to rebuild and restart.
     # cmd_check refuses to guess in this situation and so must this: the code
     # is provably current, and guessing "behind" tears the stack down and
@@ -1174,25 +1253,27 @@ To try it again anyway:
       want="$have"
     fi
     if [[ -n "$have" && -n "$want" && "$have" == "$want" ]]; then
-      if (( verified )); then
-        log "already up to date (code ${head_sha:0:12} contains ${target:0:12}, images current) — nothing to do"
-        return 0
-      fi
+      # The UI first. `verified` now reflects the MODELS only, so checking
+      # it first would return 0 with the chat interface down — the bug this
+      # ordering was introduced to fix in the first place.
       if (( ! ui_before )); then
         # Unlike smoke's verdict this one is never ambiguous: the UI either
-        # answered or it did not. Returning 0 here let the weekly unit succeed
-        # while the chat interface was definitively down.
+        # answered or it did not.
         warn "already up to date (code ${head_sha:0:12}, images current), but the
 chat UI at $WEBUI_URL is not answering — there is nothing to update that would
 fix it."
         return 1
+      fi
+      if (( verified )); then
+        log "already up to date (code ${head_sha:0:12} contains ${target:0:12}, images current) — nothing to do"
+        return 0
       fi
       if (( models_verdict == 2 )); then
         # Could not ask — a busy router, a rotated key. Failing the unit here
         # asserts an outage nobody observed, every week, whenever someone is
         # chatting inside the timer's 04:00-08:00 window.
         warn "already up to date (code ${head_sha:0:12}, images current); the
-stack could not be judged this run — see the warnings above"
+models could not be judged this run — see the warnings above"
         return 0
       fi
       warn "already up to date (code ${head_sha:0:12}, images current), but the

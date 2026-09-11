@@ -992,6 +992,214 @@ class AFailedStashStopsTheRewind(unittest.TestCase):
                       "a failed stash must stop the caller rewinding")
 
 
+class PreflightAsksTheDaemon(unittest.TestCase):
+    """preflight checked that the docker BINARY exists, not that the daemon
+    answers. With dockerd down, record_rollback_point still ran: `docker image
+    inspect` returned empty for both images and wrote blank ids, silently
+    disarming the image half of --rollback even though bonsai-llama:rollback
+    was still valid on disk. The run then died at `compose build` anyway."""
+
+    def _preflight(self, mode, daemon_ok):
+        d = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(d, "docker"))
+            compose = os.path.join(d, "docker", "compose.linux.yaml")
+            env = os.path.join(d, ".env")
+            open(compose, "w").close()
+            open(env, "w").close()
+            sub = os.path.join(d, "models", "g")
+            os.makedirs(sub)
+            open(os.path.join(sub, "w.gguf"), "w").close()
+            rc = 0 if daemon_ok else 1
+            setup = (
+                f'{_TOOLS_PRESENT}; running_working_dir() {{ printf ""; }}; '
+                f'docker() {{ case "$*" in *version*) return {rc};; esac; return 0; }}; '
+                f'ROOT={shlex.quote(d)}; COMPOSE_FILE={shlex.quote(compose)}; '
+                f'ENV_FILE={shlex.quote(env)}; BONSAI_API_KEY=k'
+            )
+            return run_real(setup, f'preflight {mode}')
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_update_refuses_when_the_daemon_is_down(self):
+        r = self._preflight("update", daemon_ok=False)
+        self.assertNotIn("rc=0", r.stdout)
+        self.assertIn("cannot reach the docker daemon", r.stderr)
+
+    def test_rollback_refuses_when_the_daemon_is_down(self):
+        r = self._preflight("rollback", daemon_ok=False)
+        self.assertNotIn("rc=0", r.stdout)
+
+    def test_update_proceeds_when_the_daemon_answers(self):
+        r = self._preflight("update", daemon_ok=True)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+
+
+class ThePreCheckDoesNotWaitOutARestart(unittest.TestCase):
+    def test_it_uses_the_short_deadline(self):
+        """The pre-update probes ask what the stack is doing NOW. Using the
+        restart deadlines meant a run against a deliberately-stopped stack
+        idled ~30 minutes before doing anything."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        # The CALL, not the definition: the definition sits above this.
+        pre = body[body.index('log "checking the current stack before'):
+                   body.index('record_rollback_point "$verified"')]
+        self.assertIn('wait_for_health "$PRECHECK_TIMEOUT"', pre)
+        self.assertIn('webui_ok "$PRECHECK_TIMEOUT"', pre)
+
+    def test_the_post_restart_waits_keep_the_long_deadline(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        post = body[body.index('log "waiting for health"'):
+                    body.index('log "smoke testing every model"')]
+        self.assertIn("wait_for_health ||", post,
+                      "the post-restart wait must keep the full deadline")
+        self.assertNotIn("PRECHECK_TIMEOUT", post)
+
+
+class ABadImageIsPinnedToo(unittest.TestCase):
+    """Only code was ever pinned, so a permanently broken upstream :main
+    looped forever: the rollback retags the old image, so next week the local
+    digest differs from the registry again, the "nothing to do" exit is
+    skipped, and the run rebuilds, pulls the same broken image, fails, and
+    force-recreates — evicting the resident 27B model and forcing a second
+    cold smoke sweep. Every Monday, with nothing saying it is a loop."""
+
+    def _pinned(self, state_body, digest):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write(state_body)
+            r = run_real(f'STATE={shlex.quote(state)}',
+                         f'is_pinned_bad_image {shlex.quote(digest)}')
+            return "rc=0" in r.stdout
+
+    def test_a_pinned_digest_is_recognised(self):
+        self.assertTrue(self._pinned("sha=x\nbadimg=sha256:abc\n", "sha256:abc"))
+
+    def test_an_unpinned_digest_is_not(self):
+        self.assertFalse(self._pinned("sha=x\nbadimg=sha256:abc\n", "sha256:zzz"))
+
+    def test_a_code_pin_is_not_an_image_pin(self):
+        """bad= and badimg= must not be confused for one another."""
+        self.assertFalse(self._pinned("sha=x\nbad=sha256:abc\n", "sha256:abc"))
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write("sha=x\nbadimg=deadbeef\n")
+            r = run_real(f'STATE={shlex.quote(state)}', 'is_pinned_bad deadbeef')
+            self.assertNotIn("rc=0", r.stdout,
+                             "an image pin was read as a commit pin")
+
+    def test_both_pin_kinds_survive_a_state_rewrite(self):
+        d = tempfile.mkdtemp()
+        try:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write("sha=old\nbad=commit1\nbadimg=sha256:img1\n")
+            stubs = (
+                'git() { case "$*" in *"rev-parse HEAD"*) echo new;; esac; return 0; }; '
+                'docker() { case "$1" in image) echo "sha256:i";; esac; return 0; }'
+            )
+            run_real(f'{stubs}; STATE={shlex.quote(state)}',
+                     'record_rollback_point 1')
+            with open(state) as fh:
+                body = fh.read()
+            self.assertIn("bad=commit1", body)
+            self.assertIn("badimg=sha256:img1", body,
+                          "the image pin was dropped by the rewrite")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_pinned_image_stops_the_weekly_rebuild(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write("sha=SAME\nbadimg=sha256:broken\n")
+            setup = (
+                f'STATE={shlex.quote(state)}; '
+                'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+                'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+                'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+                'smoke() { return 0; }; compose() { echo "COMPOSE RAN"; return 0; }; '
+                'local_image_digest() { echo sha256:old; }; '
+                'remote_image_digest() { echo sha256:broken; }; '
+                'git() { case "$*" in *"merge-base --is-ancestor"*) return 0;; '
+                '*rev-parse*) echo SAME;; esac; return 0; }'
+            )
+            r = run_real(setup, 'cmd_update')
+            out = r.stdout + r.stderr
+            self.assertIn("rc=0", out, out)
+            self.assertIn("already broke the chat UI here", out)
+            self.assertNotIn("COMPOSE RAN", out,
+                             "it rebuilt and pulled the known-broken image again")
+
+
+class TheStateFileRecordsTheUiSeparately(unittest.TestCase):
+    """verified tracks the models, because that is what a rollback restores.
+    The UI answer is kept beside it so the diagnosis is not lost."""
+
+    STUBS = (
+        'git() { case "$*" in *"rev-parse HEAD"*) echo abc123;; esac; return 0; }; '
+        'docker() { case "$1" in image) echo "sha256:img";; esac; return 0; }'
+    )
+
+    def _record(self, ui_was_up):
+        d = tempfile.mkdtemp()
+        try:
+            state = os.path.join(d, "s")
+            run_real(f'{self.STUBS}; STATE={shlex.quote(state)}; '
+                     f'UI_WAS_UP={ui_was_up}', 'record_rollback_point 1')
+            with open(state) as fh:
+                return fh.read()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_live_ui_is_recorded(self):
+        self.assertIn("ui=1", self._record(1))
+
+    def test_a_dead_ui_is_recorded(self):
+        body = self._record(0)
+        self.assertIn("ui=0", body)
+        self.assertIn("verified=1", body,
+                      "the models were proven; the UI is a separate fact")
+
+
+class ABigRewindIsAnnounced(unittest.TestCase):
+    def test_rolling_back_more_than_one_commit_says_so(self):
+        """The recorded point can predate this run's own change, and a
+        multi-week rewind logged as "rollback verified" is the kind of success
+        nobody wants to discover later."""
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(["git", "init", "-q", d], check=True, capture_output=True)
+            for k, v in (("user.email", "t@t"), ("user.name", "t")):
+                subprocess.run(["git", "-C", d, "config", k, v], check=True,
+                               capture_output=True)
+            shas = []
+            for i in range(4):
+                with open(os.path.join(d, "f.txt"), "w") as fh:
+                    fh.write(f"{i}\n")
+                subprocess.run(["git", "-C", d, "add", "-A"], check=True,
+                               capture_output=True)
+                subprocess.run(["git", "-C", d, "commit", "-qm", f"c{i}"],
+                               check=True, capture_output=True)
+                shas.append(subprocess.run(["git", "-C", d, "rev-parse", "HEAD"],
+                                           capture_output=True, text=True).stdout.strip())
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write(f"sha={shas[0]}\nwebui=\nllama=\nverified=1\nui=1\n")
+            setup = (
+                f'ROOT={shlex.quote(d)}; STATE={shlex.quote(state)}; '
+                'docker() { return 0; }; compose() { return 0; }; '
+                'wait_for_health() { return 0; }; smoke() { return 0; }; '
+                'webui_ok() { return 0; }; stash_local_edits() { return 0; }'
+            )
+            r = run_real(setup, 'do_rollback')
+            self.assertIn("rewinds 3 commits", r.stderr,
+                          f"a 3-commit rewind went unannounced: {r.stderr}")
+
+
 class AUiAlreadyDownIsNotTheCommitsFault(unittest.TestCase):
     """webui_ok was probed only when pre_verdict == 0, so a run where smoke
     returned 2 never looked at the UI — and the post-update check then blamed
@@ -1222,6 +1430,32 @@ class ContentPartsDoNotLookLikeADeadModel(unittest.TestCase):
         ok, _ = self._ok(json.dumps({"choices": [{"message": {"content": ""}}]}))
         self.assertFalse(ok)
 
+    def test_structurally_empty_content_is_not_a_generation(self):
+        """The str() fallback that fixed the list crash turned [] into "[]",
+        {} into "{}", 0 into "0" and False into "False" — all non-empty, so a
+        reply with no content at all scored as a real generation. The one
+        check this whole script exists to perform would have reported a dead
+        model as healthy."""
+        for empty in ([], {}, 0, False):
+            body = json.dumps({"choices": [{"message": {"content": empty}}]})
+            with self.subTest(content=empty):
+                ok, err = self._ok(body)
+                self.assertFalse(ok, f"{empty!r} scored as a real generation")
+                self.assertNotIn("Traceback", err)
+
+    def test_content_parts_with_no_text_is_not_a_generation(self):
+        body = json.dumps({"choices": [{"message": {
+            "content": [{"type": "image_url", "image_url": {"url": "x"}}]}}]})
+        ok, _ = self._ok(body)
+        self.assertFalse(ok, "a reply with no text scored as a generation")
+
+    def test_multiple_content_parts_are_joined(self):
+        body = json.dumps({"choices": [{"message": {"content": [
+            {"type": "text", "text": "OK"},
+            {"type": "text", "text": " then"}]}}]})
+        ok, err = self._ok(body)
+        self.assertTrue(ok, err)
+
 
 class RollbackDoesNotBlameItselfForAStoppedUi(unittest.TestCase):
     def test_a_ui_down_beforehand_is_not_a_failed_rollback(self):
@@ -1366,8 +1600,13 @@ class TheWeeklyCheckCoversTheUi(unittest.TestCase):
         self.assertIn("WEBUI CHECKED", out,
                       "the weekly run never looked at the chat UI")
         self.assertNotIn("rc=0", out, "a dead UI must not report success")
-        self.assertIn("RECORD verified=0", out,
-                      "a models-only proof must not be recorded as verified")
+        # verified reflects the MODELS, which is what a rollback can restore.
+        # Requiring the UI too froze the rollback target on a box where Open
+        # WebUI is deliberately stopped: it never became 1 again, the
+        # keep-the-proven-point guard held the old commit, and updates kept
+        # applying — so a failure weeks later rewound every commit since. The
+        # UI is recorded separately, as ui=.
+        self.assertIn("RECORD verified=1", out)
 
     def test_a_healthy_box_still_reports_nothing_to_do(self):
         r = run_real(f'{self.BASE}; smoke() {{ return 0; }}; '
@@ -2188,6 +2427,12 @@ def run_real(setup, call):
         # Aim at a dead port unless the test says otherwise, so nothing can
         # reach the operator's live box through LLAMA_BIND/WEBUI_BIND in .env.
         'API=http://127.0.0.1:9; WEBUI_URL=http://127.0.0.1:9; '
+        # And isolate the state file. Without this, any test that reached
+        # record_rollback_point or a pin wrote to the REPO's own
+        # run/update-state — so pins leaked from one test into the next and
+        # into the working tree. RUN_TMP is created by update.sh and removed
+        # by its EXIT trap, so this cleans itself up.
+        'STATE="${RUN_TMP:-/tmp}/update-state"; '
         f'{setup}; {call}; echo "rc=$?"'
     )
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
@@ -2458,7 +2703,11 @@ class PreflightModesRun(unittest.TestCase):
             open(os.path.join(sub, "w.gguf"), "w").close()
         key = 'BONSAI_API_KEY=k' if with_key else 'unset BONSAI_API_KEY'
         setup = (
+            # preflight now probes the DAEMON, not just the binary; without
+            # a stub the real docker CLI blocks for minutes on a machine
+            # with none running.
             f'{_TOOLS_PRESENT}; running_working_dir() {{ printf ""; }}; '
+            'docker() { return 0; }; '
             f'ROOT={shlex.quote(d)}; COMPOSE_FILE={shlex.quote(compose)}; '
             f'ENV_FILE={shlex.quote(env)}; {key}'
         )
@@ -2471,7 +2720,11 @@ class PreflightModesRun(unittest.TestCase):
         the check early-return, so the documented read-only command died."""
         d = tempfile.mkdtemp()
         setup = (
+            # preflight now probes the DAEMON, not just the binary; without
+            # a stub the real docker CLI blocks for minutes on a machine
+            # with none running.
             f'{_TOOLS_PRESENT}; running_working_dir() {{ printf ""; }}; '
+            'docker() { return 0; }; '
             f'ROOT={shlex.quote(d)}; COMPOSE_FILE={shlex.quote(d)}/nope.yaml; '
             f'ENV_FILE={shlex.quote(d)}/nope.env; unset BONSAI_API_KEY'
         )
@@ -2482,7 +2735,11 @@ class PreflightModesRun(unittest.TestCase):
     def test_update_still_needs_a_dotenv(self):
         d = tempfile.mkdtemp()
         setup = (
+            # preflight now probes the DAEMON, not just the binary; without
+            # a stub the real docker CLI blocks for minutes on a machine
+            # with none running.
             f'{_TOOLS_PRESENT}; running_working_dir() {{ printf ""; }}; '
+            'docker() { return 0; }; '
             f'ROOT={shlex.quote(d)}; COMPOSE_FILE={shlex.quote(d)}/nope.yaml; '
             f'ENV_FILE={shlex.quote(d)}/nope.env'
         )
