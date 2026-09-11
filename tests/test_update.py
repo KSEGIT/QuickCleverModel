@@ -1090,6 +1090,156 @@ class EveryDeadlineKnobHonoursTheEnvironment(unittest.TestCase):
                 self.assertIn(knob, docs)
 
 
+class AHealthTimeoutIsNotProofOfDeath(unittest.TestCase):
+    """The pre-check deadline is 30s, and /health silence at 30s is ambiguous:
+    a box that rebooted shortly before the timer is still doing a cold 27B
+    load. Mapping it to verdict 1 ("proven dead") cleared pin_arg, so a
+    genuinely crash-looping commit was rolled back UNPINNED and fast-forwarded
+    onto again the next week, forever."""
+
+    def _run(self, health_ok):
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+            'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+            f'wait_for_health() {{ return {0 if health_ok else 1}; }}; '
+            'webui_ok() { return 0; }; compose() { return 0; }; '
+            'stash_local_edits() { :; }; '
+            'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }; '
+            'smoke() { return 1; }; '
+            'local_image_digest() { echo same; }; remote_image_digest() { echo other; }; '
+            'git() { case "$*" in *"merge-base --is-ancestor"*) return 1;; '
+            '*"rev-parse HEAD"*) echo OLD;; *rev-parse*) echo NEW;; esac; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        return r.stdout + r.stderr
+
+    def test_a_precheck_health_timeout_does_not_disarm_the_pin(self):
+        out = self._run(health_ok=False)
+        self.assertIn("ROLLBACK pin=[pin]", out,
+                      "a 30s health timeout was treated as proof the models "
+                      "were dead, so a crash-looping commit escaped the pin")
+        self.assertIn("not as proof they are dead", out)
+
+    def test_models_answering_with_errors_still_disarms_it(self):
+        """smoke returning 1 IS proof, and must still disarm."""
+        out = self._run(health_ok=True)
+        self.assertIn("ROLLBACK pin=[]", out)
+
+
+class APinnedImageWithNoLocalCopyStops(unittest.TestCase):
+    """`compose up -d` pulls whatever is missing, so skipping the explicit
+    pull is not enough: after a `docker system prune -a` the known-broken
+    image gets pulled anyway, fails the UI check, force-recreates, and repeats
+    every week."""
+
+    def _run(self, have):
+        d = tempfile.mkdtemp()
+        try:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write("sha=SAME\nbadimg=sha256:broken\n")
+            setup = (
+                f'STATE={shlex.quote(state)}; '
+                'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+                'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+                'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+                'smoke() { return 0; }; compose() { echo "COMPOSE RAN"; return 0; }; '
+                f'local_image_digest() {{ printf "%s" {shlex.quote(have)}; }}; '
+                'remote_image_digest() { echo sha256:broken; }; '
+                'git() { case "$*" in *"merge-base --is-ancestor"*) return 0;; '
+                '*rev-parse*) echo SAME;; esac; return 0; }'
+            )
+            r = run_real(setup, 'cmd_update')
+            return r.stdout + r.stderr
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_no_local_copy_refuses_rather_than_pulling_it_again(self):
+        out = self._run(have="")
+        self.assertNotIn("COMPOSE RAN", out,
+                         "compose up would have pulled the known-broken image")
+        self.assertIn("no local copy to fall back on", out)
+        self.assertNotIn("rc=0", out)
+
+    def test_a_local_copy_means_nothing_to_do(self):
+        out = self._run(have="sha256:old")
+        self.assertIn("rc=0", out, out)
+        self.assertNotIn("COMPOSE RAN", out)
+
+
+class UnknownDigestsPinNothing(unittest.TestCase):
+    def test_it_does_not_claim_a_new_image_arrived(self):
+        """The else branch asserted "a new image was pulled" even when both
+        digests were unknown — logging a wrong reason and pinning nothing, so
+        a commit that genuinely broke the UI escaped."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        fn = body[body.index("chat_ui_failed() {"):body.index("cmd_update() {")]
+        self.assertIn('if [[ -z "$webui_before" || -z "$webui_after" ]]; then', fn)
+        self.assertIn("cannot tell", fn)
+
+
+class CheckRespectsThePins(unittest.TestCase):
+    """--check reported drift and exited 1 forever after a pin, while
+    ./update.sh said "nothing to do" and exited 0 — so a monitoring cron on
+    --check alerted permanently on a settled state."""
+
+    def _check(self, pinned_commit=False, pinned_image=False):
+        d = tempfile.mkdtemp()
+        try:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                if pinned_commit:
+                    fh.write("bad=UPSTREAM\n")
+                if pinned_image:
+                    fh.write("badimg=sha256:new\n")
+            setup = (
+                f'{_TOOLS_PRESENT}; STATE={shlex.quote(state)}; ROOT=/tmp; '
+                'docker() { return 0; }; '
+                'local_image_digest() { echo sha256:old; }; '
+                'remote_image_digest() { echo sha256:new; }; '
+                'git() { case "$*" in *rev-list*) echo 3;; '
+                '*rev-parse*) echo UPSTREAM;; esac; return 0; }'
+            )
+            r = run_real(setup, 'cmd_check')
+            return r.stdout + r.stderr
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_pinned_commit_is_not_drift(self):
+        out = self._check(pinned_commit=True, pinned_image=True)
+        self.assertIn("rc=0", out, out)
+        self.assertIn("is pinned", out)
+
+    def test_unpinned_drift_is_still_reported(self):
+        out = self._check()
+        self.assertNotIn("rc=0", out)
+        self.assertIn("behind origin by 3", out)
+
+
+class RollbackDoesNotRecreateForNothing(unittest.TestCase):
+    def test_nothing_restored_means_no_force_recreate(self):
+        """Force-recreating when every restore step was a no-op is a
+        multi-minute outage and an eviction of the resident model, in exchange
+        for nothing."""
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s")
+            with open(state, "w") as fh:
+                fh.write("sha=\nwebui=\nllama=\nverified=1\nui=1\n")
+            setup = (
+                f'ROOT={shlex.quote(d)}; STATE={shlex.quote(state)}; '
+                'docker() { return 1; }; '
+                'compose() { echo "COMPOSE RAN"; return 0; }; '
+                'wait_for_health() { return 0; }; smoke() { return 0; }; '
+                'webui_ok() { return 0; }'
+            )
+            r = run_real(setup, 'do_rollback')
+            out = r.stdout + r.stderr
+            self.assertNotIn("COMPOSE RAN", out,
+                             "recreated the stack having restored nothing")
+            self.assertIn("nothing was actually restored", out)
+
+
 class PreflightAsksTheDaemon(unittest.TestCase):
     """preflight checked that the docker BINARY exists, not that the daemon
     answers. With dockerd down, record_rollback_point still ran: `docker image

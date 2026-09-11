@@ -897,7 +897,10 @@ record_rollback_point() {
   # A group command is not a subshell, so the flag survives into this scope.
   local ok=1
   {
-    printf 'sha=%s\nwebui=%s\nllama=%s\nverified=%s\nui=%s\n' \
+    # ui= is written for a human reading run/update-state, not for the script:
+  # it records whether the chat UI was answering when this point was taken, so
+  # "verified=1 ui=0" reads as "the models were proven, the UI was not up".
+  printf 'sha=%s\nwebui=%s\nllama=%s\nverified=%s\nui=%s\n' \
       "$sha" "$webui" "$llama" "$verified" "${UI_WAS_UP:-0}" || ok=0
     if [[ -n "$pins" ]]; then
       printf '%s\n' "$pins" || ok=0
@@ -943,7 +946,11 @@ rewinding the checkout, because that would delete them"
 do_rollback() {
   [[ -f "$STATE" ]] || die "no rollback point recorded at $STATE"
   local pin="${1:-}"
-  local sha webui llama verified bad restored=1
+  # `changed` is not `restored`. restored says whether everything that SHOULD
+  # have come back did; changed says whether anything on disk actually moved.
+  # Recreating when nothing moved is a guaranteed multi-minute outage and an
+  # eviction of the resident 27B model, in exchange for nothing.
+  local sha webui llama verified bad restored=1 changed=0
   sha="$(sed -n 's/^sha=//p' "$STATE")"
   webui="$(sed -n 's/^webui=//p' "$STATE")"
   llama="$(sed -n 's/^llama=//p' "$STATE")"
@@ -986,6 +993,8 @@ this run introduced, because the recorded point predates it"
       # still checked out.
       warn "git reset to $sha FAILED — the broken commit is STILL checked out"
       restored=0
+    else
+      changed=1
     fi
   fi
 
@@ -1005,8 +1014,11 @@ this run introduced, because the recorded point predates it"
     warn "$ROLLBACK_IMAGE is ${have:0:19}, not the recorded ${llama:0:19} — not restoring it"
     restored=0
   else
-    docker tag "$ROLLBACK_IMAGE" "$LLAMA_IMAGE" \
-      || { warn "could not restore $LLAMA_IMAGE"; restored=0; }
+    if docker tag "$ROLLBACK_IMAGE" "$LLAMA_IMAGE"; then
+      changed=1
+    else
+      warn "could not restore $LLAMA_IMAGE"; restored=0
+    fi
   fi
   if [[ -z "$webui" ]]; then
     # Nothing was recorded because there WAS nothing to record — true on a box
@@ -1021,6 +1033,8 @@ this run introduced, because the recorded point predates it"
   elif ! docker tag "$webui" "$WEBUI_IMAGE"; then
     warn "could not restore $WEBUI_IMAGE"
     restored=0
+  else
+    changed=1
   fi
 
   # Appended after the reset so the pin survives even when the reset failed.
@@ -1029,8 +1043,13 @@ this run introduced, because the recorded point predates it"
       || warn "could not pin the failed commit; it may be retried next week"
   fi
 
-  compose up -d --force-recreate \
-    || { warn "compose failed during rollback"; restored=0; }
+  if (( changed )); then
+    compose up -d --force-recreate \
+      || { warn "compose failed during rollback"; restored=0; }
+  else
+    warn "nothing was actually restored, so the stack is left running as it is
+— recreating it would be an outage in exchange for no change"
+  fi
 
   local verdict=1
   if wait_for_health; then smoke; verdict=$?; fi
@@ -1069,7 +1088,12 @@ before this run — start it separately"
 
 cmd_check() {
   preflight check
-  local behind rc=0
+  local behind rc=0 target
+  # --check must respect the updater's own decisions. Without this it reported
+  # "behind origin by N" and exited 1 on every run FOREVER after a pin, while
+  # ./update.sh correctly said "nothing to do" and exited 0 — so a monitoring
+  # cron on --check, which is its documented job ("exit 1 if behind"), alerted
+  # permanently on a state the updater had deliberately settled.
   # rc=1, not just a warning: without the fetch, rev-list counts against a
   # stale ref and happily returns 0, so --check printed "code up to date" and
   # exited 0 during a DNS or GHCR outage. The unresolvable-upstream and
@@ -1085,8 +1109,14 @@ cmd_check() {
     warn "no upstream for HEAD (detached, or no tracking branch) — commit drift unknown"
     rc=1
   elif (( behind > 0 )); then
-    log "behind origin by $behind commit(s)"
-    rc=1
+    target="$(git -C "$ROOT" rev-parse '@{u}' 2>/dev/null)"
+    if is_pinned_bad "$target"; then
+      log "behind origin by $behind commit(s), but ${target:0:12} already failed
+its smoke test here and is pinned — not counting that as drift"
+    else
+      log "behind origin by $behind commit(s)"
+      rc=1
+    fi
   elif (( fetched )); then
     log "code up to date"
   else
@@ -1113,10 +1143,15 @@ cmd_check() {
     warn "could not read the registry digest; image drift unknown"
     rc=1
   elif [[ "$have" != "$want" ]]; then
-    log "open-webui image is behind"
-    log "  local  $have"
-    log "  remote $want"
-    rc=1
+    if is_pinned_bad_image "$want"; then
+      log "open-webui image is behind, but ${want:0:19} already broke the chat
+UI here and is pinned — not counting that as drift"
+    else
+      log "open-webui image is behind"
+      log "  local  $have"
+      log "  remote $want"
+      rc=1
+    fi
   else
     log "open-webui image up to date"
   fi
@@ -1129,7 +1164,17 @@ cmd_check() {
 # an already long function.
 chat_ui_failed() {
   local ui_pin=""
-  if [[ -n "$webui_before" && "$webui_before" == "$webui_after" ]]; then
+  if [[ -z "$webui_before" || -z "$webui_after" ]]; then
+    # Neither digest is known, so "a new image arrived" is not a claim this
+    # run can make. The else branch used to assert it anyway: with both empty
+    # it logged a wrong reason and pinned nothing, letting a commit that
+    # genuinely broke the UI escape; with only before empty — a first-ever
+    # run — it pinned an innocent upstream digest for a failure that could
+    # just as easily be a port clash.
+    warn "the chat UI at $WEBUI_URL did not answer, and this run cannot tell
+whether the image changed (before='${webui_before:-unknown}',
+after='${webui_after:-unknown}') — pinning neither the commit nor the image"
+  elif [[ "$webui_before" == "$webui_after" ]]; then
     # No new image arrived, and the open-webui SERVICE — environment, ports,
     # volumes — is defined in docker/compose.linux.yaml, which is
     # version-controlled. So this is the commit, not the registry.
@@ -1194,7 +1239,16 @@ cmd_update() {
   if wait_for_health "$PRECHECK_TIMEOUT"; then
     smoke; models_verdict=$?
   else
-    models_verdict=1
+    # 2, not 1. The pre-check deadline is 30s and /health silence at 30s is
+    # ambiguous — a box that rebooted shortly before the timer is still doing
+    # a cold 27B load. Calling that "proven dead" cleared pin_arg, so a
+    # genuinely crash-looping commit was rolled back UNPINNED and fast-forwarded
+    # onto again the next week, forever: the exact loop the pin exists to
+    # break. Everywhere else a timeout maps to "could not ask"; this was the
+    # one place it did not.
+    warn "the stack did not answer /health within ${PRECHECK_TIMEOUT}s — treating
+this run as unable to judge the models, not as proof they are dead"
+    models_verdict=2
   fi
   if webui_ok "$PRECHECK_TIMEOUT"; then ui_before=1; fi
   UI_WAS_UP=$ui_before
@@ -1244,6 +1298,20 @@ To try it again anyway:
     # rebuild and restart either. Without this the loop above repeats weekly
     # until upstream publishes something different.
     if [[ -n "$want" ]] && is_pinned_bad_image "$want"; then
+      if [[ -z "$have" ]]; then
+        # No local copy to fall back on, and `compose up -d` pulls whatever is
+        # missing — so proceeding would pull the known-broken image despite
+        # the skip below, fail the UI check, force-recreate, and do it again
+        # next week. A prune after a pin (the script anticipates one at
+        # record_rollback_point) is all it takes. Refuse instead of
+        # manufacturing that outage weekly.
+        die "the only open-webui image upstream offers (${want:0:19}) already
+broke the chat UI here, and there is no local copy to fall back on. Nothing
+this run can do without pulling it again.
+
+Wait for a newer image, or clear the pin:
+  sed -i '/^badimg=/d' $STATE"
+      fi
       log "the newest open-webui image already broke the chat UI here and was
 rolled back; nothing to do until a newer one is published"
       want="$have"
