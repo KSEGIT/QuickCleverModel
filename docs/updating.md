@@ -89,7 +89,9 @@ sed -i '/^bad=/d' run/update-state
   machines do not hit the registry at the same second.
 - `Persistent=true` means a machine that was off still updates when it
   starts again.
-- It runs at low priority, so it does not fight the model server for the CPU.
+- It runs the update script at low priority. Note this does not slow the
+  image build itself: Docker builds inside its own daemon, which the timer
+  cannot reach.
 
 Install both files as shown in the README. Check it with
 `systemctl list-timers bonsai-update.timer`.

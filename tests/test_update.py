@@ -269,42 +269,22 @@ class RollbackIsSticky(unittest.TestCase):
     """A rolled-back branch is a plain ancestor of origin, so the next run
     fast-forwards straight back onto the commit that just failed. Without a
     pin the box goes dark every week on the same commit, and the only signal
-    is a line in the journal."""
+    is a line in the journal.
 
-    def _pinned_bad(self, state_body):
-        with tempfile.TemporaryDirectory() as d:
-            state = os.path.join(d, "update-state")
-            with open(state, "w") as fh:
-                fh.write(state_body)
-            script = (
-                'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
-                f'source "{UPDATE_SH}"; STATE="{state}"; pinned_bad'
-            )
-            r = subprocess.run(["bash", "-c", script], capture_output=True,
-                               text=True)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            return r.stdout.strip()
+    The pin VALUES are covered by AnyPinCounts, which drives is_pinned_bad —
+    the real gate. pinned_bad() was removed: it was assigned and never read,
+    and a grep-based test was the only thing holding it in place.
+    """
 
-    def test_reads_the_pinned_commit(self):
-        self.assertEqual(
-            self._pinned_bad("sha=aaa\nwebui=bbb\nverified=1\nbad=deadbeef\n"),
-            "deadbeef")
-
-    def test_is_empty_when_nothing_is_pinned(self):
-        self.assertEqual(self._pinned_bad("sha=aaa\nwebui=bbb\nverified=1\n"), "")
-
-    def test_the_newest_pin_wins(self):
-        """do_rollback appends, so an old pin must not shadow a newer one."""
-        self.assertEqual(
-            self._pinned_bad("sha=aaa\nbad=oldbad\nbad=newbad\n"), "newbad")
-
-    def test_update_refuses_a_commit_that_already_failed(self):
+    def test_update_consults_the_pin_before_moving(self):
         with open(UPDATE_SH) as fh:
             body = fh.read()
-        self.assertIn('bad="$(pinned_bad)"', body,
-                      "cmd_update must consult the pin before pulling")
-        self.assertIn('already failed its smoke test', body,
+        self.assertIn('if is_pinned_bad "$target"; then', body,
+                      "cmd_update must consult the pin before merging")
+        self.assertIn("already failed its smoke test", body,
                       "and must say why it is refusing")
+        self.assertNotIn("pinned_bad()", body.replace("is_pinned_bad()", ""),
+                         "pinned_bad was dead code")
 
 
 class RollbackReportsHonestly(unittest.TestCase):
@@ -792,44 +772,66 @@ class AnyPinCounts(unittest.TestCase):
 
 class NothingToDoIsCheap(unittest.TestCase):
     """A fetch that fails only warns, so target ends up equal to HEAD and the
-    merge is a no-op — but the run would still do a pre-update smoke sweep, a
-    rebuild, a restart and a post-update sweep. With --models-max 1 and three
-    aliases that is six cold 27B loads to prove nothing changed."""
+    merge is a no-op — but the run would still rebuild, restart and sweep
+    again. With --models-max 1 and three aliases that is six cold 27B loads to
+    prove nothing changed.
 
-    def test_it_returns_early_without_building_or_smoking(self):
+    The check and the rollback-point write still happen first, though: on a
+    box that never drifts they are the only thing that would ever notice a
+    dark stack, and without them --rollback would have nothing to restore.
+    """
+
+    STUBS = (
+        'preflight() { :; }; take_lock() { :; }; '
+        'git() { case "$*" in *"rev-parse HEAD"*) echo SAMECOMMIT;; '
+        '*rev-parse*) echo SAMECOMMIT;; esac; return 0; }; '
+        'docker() { return 0; }; '
+        'is_pinned_bad() { return 1; }; '
+        'record_rollback_point() { echo "RECORDED verified=$1"; }; '
+        'wait_for_health() { return 0; }; '
+        'compose() { echo "COMPOSE RAN"; return 0; }'
+    )
+
+    def test_it_checks_the_stack_then_returns_without_rebuilding(self):
         setup = (
-            'preflight() { :; }; take_lock() { :; }; '
-            'git() { case "$*" in *"rev-parse HEAD"*) echo SAMECOMMIT;; '
-            '*rev-parse*) echo SAMECOMMIT;; esac; return 0; }; '
-            'is_pinned_bad() { return 1; }; pinned_bad() { printf ""; }; '
+            f'{self.STUBS}; smoke() {{ echo "SMOKE RAN"; return 0; }}; '
             'local_image_digest() { echo sha256:same; }; '
-            'remote_image_digest() { echo sha256:same; }; '
-            'smoke() { echo "SMOKE RAN"; return 0; }; '
-            'compose() { echo "COMPOSE RAN"; return 0; }; '
-            'wait_for_health() { echo "HEALTH RAN"; return 0; }'
+            'remote_image_digest() { echo sha256:same; }'
         )
         r = run_real(setup, 'cmd_update')
         out = r.stdout + r.stderr
         self.assertIn("rc=0", out, out)
         self.assertIn("already up to date", out)
-        for ran in ("SMOKE RAN", "COMPOSE RAN", "HEALTH RAN"):
-            self.assertNotIn(ran, out, f"{ran} — the expensive path was entered")
+        self.assertIn("SMOKE RAN", out,
+                      "the weekly check must still run — it is the only thing "
+                      "that would notice a dark stack on a box that never drifts")
+        self.assertIn("RECORDED verified=1", out,
+                      "--rollback needs a point even on a box that never drifts")
+        self.assertNotIn("COMPOSE RAN", out,
+                         "the expensive path was entered anyway")
 
-    def test_an_image_behind_still_triggers_work(self):
+    def test_a_dark_stack_is_reported_even_with_nothing_to_update(self):
+        """The failure mode this guards: a driver upgrade or an OOM kills every
+        model while HEAD equals origin, and the timer says 'nothing to do'."""
         setup = (
-            'preflight() { :; }; take_lock() { :; }; '
-            'git() { case "$*" in *"rev-parse HEAD"*) echo SAMECOMMIT;; '
-            '*rev-parse*) echo SAMECOMMIT;; esac; return 0; }; '
-            'is_pinned_bad() { return 1; }; pinned_bad() { printf ""; }; '
-            'local_image_digest() { echo sha256:old; }; '
-            'remote_image_digest() { echo sha256:new; }; '
-            'wait_for_health() { return 0; }; smoke() { echo "SMOKE RAN"; return 0; }; '
-            'record_rollback_point() { :; }; '
-            'compose() { echo "COMPOSE RAN"; return 0; }'
+            f'{self.STUBS}; smoke() {{ return 1; }}; '
+            'local_image_digest() { echo sha256:same; }; '
+            'remote_image_digest() { echo sha256:same; }'
         )
         r = run_real(setup, 'cmd_update')
         out = r.stdout + r.stderr
-        self.assertIn("SMOKE RAN", out,
+        self.assertNotIn("rc=0", out, "a dark stack must not exit 0")
+        self.assertIn("did NOT pass its check", out)
+
+    def test_an_image_behind_still_triggers_work(self):
+        setup = (
+            f'{self.STUBS}; smoke() {{ echo "SMOKE RAN"; return 0; }}; '
+            'local_image_digest() { echo sha256:old; }; '
+            'remote_image_digest() { echo sha256:new; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("COMPOSE RAN", out,
                       "a stale image must still get an update run")
 
 
@@ -852,7 +854,8 @@ class PinningIsNarrow(unittest.TestCase):
             body = fh.read()
         self.assertEqual(body.count("do_rollback pin"), 2,
                          "smoke failure and health failure pin; nothing else")
-        self.assertIn('warn "never became healthy"; do_rollback pin;', body)
+        self.assertIn("do_rollback pin; exit 1; }", body)
+        self.assertIn("never became healthy within", body)
 
     def test_infrastructure_failures_do_not_pin(self):
         """A build that lost the network, or a compose up that lost a race
@@ -861,9 +864,16 @@ class PinningIsNarrow(unittest.TestCase):
         blocks every future update until a human clears it."""
         with open(UPDATE_SH) as fh:
             body = fh.read()
-        for site in ('warn "build failed"; do_rollback;',
-                     'warn "compose up failed"; do_rollback;'):
-            self.assertIn(site, body, f"{site!r} must roll back WITHOUT pinning")
+        # compose up failure still rolls back (the stack WAS touched) but
+        # must not pin.
+        self.assertIn('warn "compose up failed"; do_rollback;', body,
+                      "compose up failure must roll back WITHOUT pinning")
+        # A failed build touched nothing, so it must not go near do_rollback:
+        # force-recreating would evict a resident 27B model over a transient
+        # build error, and resetting to the recorded sha could rewind past
+        # commits this run never introduced.
+        self.assertIn("the running stack was not touched", body)
+        self.assertNotIn('warn "build failed"; do_rollback', body)
 
     def test_manual_rollback_does_not_pin(self):
         with open(UPDATE_SH) as fh:

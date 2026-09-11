@@ -102,11 +102,6 @@ for m in d.get("data", []):
         print(m["id"])'
 }
 
-pinned_bad() {
-  # The most recent pin, for messages.
-  sed -n 's/^bad=//p' "$STATE" 2>/dev/null | tail -1
-}
-
 is_pinned_bad() {
   # Whether THIS commit is pinned — matched against every recorded pin, not
   # just the newest. Pins accumulate (do_rollback appends, and a rewrite
@@ -368,6 +363,12 @@ CHAT_TIMEOUT="${BONSAI_SMOKE_TIMEOUT:-900}"
 # Set to 0 to retry immediately (the test suite does this).
 RETRY_SLEEP="${BONSAI_SMOKE_RETRY_SLEEP:-15}"
 
+# How long to wait for /health after a restart. Tunable for the same reason
+# BONSAI_SMOKE_TIMEOUT is: blowing this deadline rolls the stack back AND pins
+# the commit, so a slow disk plus nvidia-runtime init on a cold recreate must
+# not be able to blacklist good code.
+HEALTH_TIMEOUT="${BONSAI_HEALTH_TIMEOUT:-180}"
+
 compose() { docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
 local_image_digest() {
@@ -539,7 +540,7 @@ Stop it from the checkout that owns it, then start it from here:
 wait_for_health() {
   # Condition polling, not a fixed sleep: a cold 27B load off a spinning disk
   # is minutes, a warm restart is seconds.
-  local deadline=$((SECONDS + 180))
+  local deadline=$((SECONDS + HEALTH_TIMEOUT))
   while (( SECONDS < deadline )); do
     if curl -fsS -m 5 "$API/health" 2>/dev/null | grep -q '"ok"'; then
       return 0
@@ -673,8 +674,11 @@ do_rollback() {
       || { warn "could not restore $LLAMA_IMAGE"; restored=0; }
   fi
   if [[ -z "$webui" ]]; then
-    warn "no open-webui image recorded; leaving the current one in place"
-    restored=0
+    # Nothing was recorded because there WAS nothing to record — true on a box
+    # that has not pulled open-webui yet. That is not a failed restore, and
+    # treating it as one made every later rollback report "NOT fully restored"
+    # and exit 1 even when the commit and the llama image both came back.
+    log "no open-webui image was recorded; leaving the current one in place"
   elif ! docker image inspect "$webui" >/dev/null 2>&1; then
     # `docker system prune -a` on a timer is common and takes the old layers.
     warn "recorded open-webui image ${webui:0:19} is gone (pruned?); leaving the current one"
@@ -759,12 +763,11 @@ cmd_update() {
   # this the rolled-back branch is a plain ancestor of origin, so next week's
   # run fast-forwards right back onto the bad commit, fails, rolls back, and
   # repeats — the box goes down every week with only a journal line to say so.
-  local target bad
+  local target
   git -C "$ROOT" fetch --quiet 2>/dev/null || warn "fetch failed; using what is already here"
   target="$(git -C "$ROOT" rev-parse '@{u}' 2>/dev/null)" \
     || die "no upstream for HEAD (detached, or no tracking branch) — nothing to update to"
   [[ -n "$target" ]] || die "could not resolve the upstream commit"
-  bad="$(pinned_bad)"
   if is_pinned_bad "$target"; then
     die "upstream is still at ${target:0:12}, which already failed its smoke test
 here and was rolled back. Nothing to do until a newer commit lands.
@@ -773,28 +776,17 @@ To try it again anyway:
   sed -i '/^bad=/d' $STATE"
   fi
 
-  # Nothing to do? Stop before the expensive part.
+  # Prove the stack BEFORE anything else, and before deciding whether there
+  # is work to do.
   #
-  # A fetch that fails only warns, after which @{u} resolves to the stale ref,
-  # target equals HEAD, and the merge is a no-op — but the run would still do
-  # a pre-update smoke sweep, a rebuild, a restart and a post-update sweep.
-  # With --models-max 1 and three aliases each sweep forces three cold 27B
-  # loads, so a box whose fetch is persistently broken would spend most of an
-  # hour every Monday evicting the resident model to prove nothing changed.
-  local head_sha have want
+  # --rollback promises the last version that WORKED, so a point recorded on a
+  # dark stack would make that a lie. This is also the only weekly check a box
+  # that never drifts ever gets: returning early without it meant a driver
+  # upgrade or an OOM could leave every model dead while the timer logged
+  # "nothing to do" and exited 0, week after week — and run/update-state was
+  # never written, so --rollback had nothing to restore either.
+  local head_sha have want verified=0
   head_sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
-  if [[ "$target" == "$head_sha" ]]; then
-    have="$(local_image_digest "$WEBUI_IMAGE")"
-    want="$(remote_image_digest "$WEBUI_IMAGE")"
-    if [[ -n "$have" && -n "$want" && "$have" == "$want" ]]; then
-      log "already up to date (code ${head_sha:0:12}, images current) — nothing to do"
-      return 0
-    fi
-  fi
-
-  # --rollback promises the last version that WORKED. A point recorded on a
-  # stack that was already dark would make that a lie, so prove it first.
-  local verified=0
   log "checking the current stack before changing anything"
   if wait_for_health && smoke; then
     verified=1
@@ -802,6 +794,29 @@ To try it again anyway:
     warn "the stack is not serving BEFORE this update — recording the rollback point as unverified"
   fi
   record_rollback_point "$verified"
+
+  # Nothing to do? Stop before the EXPENSIVE part — the rebuild, the restart
+  # and the second smoke sweep. The check above has already run, so a dark
+  # stack is still reported and the rollback point still exists.
+  #
+  # This matters because a failed fetch only warns: @{u} then resolves to the
+  # stale ref and the merge is a no-op, but without this the run would still
+  # rebuild, restart and sweep again. With --models-max 1 and three aliases
+  # that is six cold 27B loads, every Monday, to prove nothing changed.
+  if [[ "$target" == "$head_sha" ]]; then
+    have="$(local_image_digest "$WEBUI_IMAGE")"
+    want="$(remote_image_digest "$WEBUI_IMAGE")"
+    if [[ -n "$have" && -n "$want" && "$have" == "$want" ]]; then
+      if (( verified )); then
+        log "already up to date (code ${head_sha:0:12}, images current) — nothing to do"
+        return 0
+      fi
+      warn "already up to date (code ${head_sha:0:12}, images current), but the
+stack did NOT pass its check above — there is nothing to update that would fix
+it. See the warnings above."
+      return 1
+    fi
+  fi
 
   # merge, not pull: `git pull` runs its OWN fetch, which can land on a commit
   # newer than the $target the pin was just checked against — including the
@@ -812,7 +827,20 @@ To try it again anyway:
   fi
 
   log "building llama image"
-  compose build llama || { warn "build failed"; do_rollback; exit 1; }
+  if ! compose build llama; then
+    # Undo only what this run did. Nothing has been replaced — :cuda still
+    # points at the running image and the containers were never touched — so
+    # do_rollback's `compose up -d --force-recreate` would evict a resident
+    # 27B model for minutes over a transient build error (a dropped network
+    # while the Dockerfile fetches CUDA packages is the usual one). It would
+    # also reset to the recorded sha, which after a "kept the proven point"
+    # run can be older than where this run started, rewinding past commits
+    # the update never introduced.
+    warn "build failed — undoing the code move; the running stack was not touched"
+    git -C "$ROOT" reset --hard "$head_sha" >/dev/null 2>&1 \
+      || warn "could not undo the merge; the checkout is left on ${target:0:12}"
+    exit 1
+  fi
 
   log "pulling open-webui"
   compose pull open-webui || warn "pull failed; keeping the current image"
@@ -826,7 +854,10 @@ To try it again anyway:
   # to answer for 180s after a clean start is the code, not a transient bind
   # race (that would have failed compose up). Without a pin, a commit that
   # crash-loops the container is re-applied every week, forever.
-  wait_for_health || { warn "never became healthy"; do_rollback pin; exit 1; }
+  wait_for_health || {
+    warn "never became healthy within ${HEALTH_TIMEOUT}s — if this box is slow to
+recreate containers, raise BONSAI_HEALTH_TIMEOUT in .env before the next run"
+    do_rollback pin; exit 1; }
 
   log "smoke testing every model"
   smoke; local verdict=$?
