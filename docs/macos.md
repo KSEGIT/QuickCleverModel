@@ -254,6 +254,7 @@ install.sh                          one-command Linux+NVIDIA installer (setup ->
 setup-nvidia.sh                     Ubuntu NVIDIA driver/Docker/toolkit installer (--check to dry-run)
 start-server.sh                     native Metal inference launcher (router mode)
 models.ini.in                       model preset template -> run/models.ini
+bonsai-chat-template.jinja          chat template served to the models (see architecture.md)
 fetch-models.sh                     weight downloader (make models)
 start-webui.sh                      native Open WebUI launcher (:9090)
 cache-viz.py                        live prompt-cache dashboard (:8090)

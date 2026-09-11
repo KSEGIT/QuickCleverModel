@@ -1,5 +1,6 @@
 # Build context for docker/Dockerfile is the repo root (compose.linux.yaml).
-# The image only COPYs start-server.sh + models.ini.in and clones the fork
+# The image only COPYs start-server.sh, models.ini.in and
+# bonsai-chat-template.jinja, and clones the fork
 # itself — shipping 16 GB of local artifacts to the daemon on every build
 # would be pure waste.
 models/

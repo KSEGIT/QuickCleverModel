@@ -55,29 +55,36 @@ cache-reuse = @CACHE_REUSE@
 cache-ram = @CACHE_RAM@
 metrics = true
 jinja = true
-; The template baked into the GGUF raises 'System message must be at the
-; beginning' for any system message after the first, and only ever renders
-; messages[0]. Codex sends two: one from `instructions` and one from its
-; `developer` input item, so every Codex request fails with a 400. This copy
-; renders the later system blocks instead of raising. It is byte-identical to
-; the GGUF template for every other message shape -- see
-; tests/test_chat_template.py.
-chat-template-file = @ROOT@/bonsai-chat-template.jinja
 temp = 0.5
 top-p = 0.85
 top-k = 20
 min-p = 0
 
+; Every Bonsai section sets chat-template-file. It is NOT in [*]: that block
+; cascades onto every section, so a future non-Bonsai model would be rendered
+; with Bonsai's ChatML tokens and produce silent garbage -- chat-template-file
+; overrides whatever template the GGUF carries.
+;
+; Why override at all: the template baked into the Bonsai GGUFs renders only
+; messages[0] as the system block and raises 'System message must be at the
+; beginning.' for any system message after it. Codex sends two, one from the
+; Responses API `instructions` field and one from a `developer` input item it
+; puts in every request, so every Codex call returned a 400. Our copy renders
+; the later blocks instead of raising and is otherwise the same template --
+; tests/test_chat_template.py compares whole renders against the GGUF original.
+
 ; 6.7 GB, 94.6% of FP16 per the model card. The default.
 [bonsai-27b-ternary]
 model = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-Q2_0.gguf
 mmproj = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-mmproj-Q8_0.gguf
+chat-template-file = @ROOT@/bonsai-chat-template.jinja
 load-on-startup = true
 
 ; 3.8 GB, 89.5% of FP16 per the model card. Loads on first request.
 [bonsai-27b-1bit]
 model = @ROOT@/models/Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf
 mmproj = @ROOT@/models/Bonsai-27B-gguf/Bonsai-27B-mmproj-Q8_0.gguf
+chat-template-file = @ROOT@/bonsai-chat-template.jinja
 load-on-startup = false
 
 ; Text-only: no mmproj. Vision loaded disables prompt cache / cache-reuse for
@@ -85,4 +92,5 @@ load-on-startup = false
 ; Without mmproj, multi-turn caching works again -- this is the agent/coding preset.
 [bonsai-27b-ternary-text]
 model = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-Q2_0.gguf
+chat-template-file = @ROOT@/bonsai-chat-template.jinja
 load-on-startup = false

@@ -82,7 +82,10 @@
     {%- set content = render_content(message.content, true)|trim %}
     {%- if message.role == "system" %}
         {%- if not loop.first %}
-            {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+            {%- set content = render_content(message.content, false, true)|trim %}
+            {%- if content %}
+                {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+            {%- endif %}
         {%- endif %}
     {%- elif message.role == "user" %}
         {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
