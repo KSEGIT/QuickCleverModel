@@ -70,10 +70,12 @@ So when the new code itself fails, `update.sh` writes that commit to
 upstream is still that one. It starts working again on its own as soon as a
 newer commit lands.
 
-Two failures count as proof the commit is bad:
+Three failures count as proof the commit is bad:
 
-- a model cannot answer, or
-- the stack never becomes healthy after a clean build and start.
+- a model cannot answer,
+- the stack never becomes healthy after a clean build and start, or
+- the chat UI stops answering when no new Open WebUI image was pulled — the
+  service is defined in `docker/compose.linux.yaml`, so that is the code.
 
 Other failures do not pin. A build that lost the network, or a start that
 lost a race with the second network address, says nothing about the commit.
@@ -98,7 +100,7 @@ Five settings in `.env` control this. See `.env.example` for each one:
 | `BONSAI_SMOKE_TIMEOUT` | 900s | One model's answer |
 | `BONSAI_SMOKE_SWEEP_MAX` | 4x the above | One whole sweep, retries included |
 | `BONSAI_HEALTH_TIMEOUT` | 900s | Waiting for llama's `/health` after a restart |
-| `BONSAI_WEBUI_TIMEOUT` | 300s | Waiting for the chat UI, which runs database migrations on first start |
+| `BONSAI_WEBUI_TIMEOUT` | 900s | Waiting for the chat UI, which runs database migrations on first start |
 | `BONSAI_SMOKE_RETRY_SLEEP` | 15s | Backoff when the router says it is busy |
 
 If you raise the first two, raise `TimeoutStartSec` in

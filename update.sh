@@ -128,7 +128,7 @@ except Exception:
 if not isinstance(d, dict):
     sys.exit(1)          # a bare scalar would raise AttributeError into the journal
 for m in d.get("data", []):
-    if m.get("id"):
+    if isinstance(m, dict) and m.get("id"):
         print(m["id"])'
 }
 
@@ -152,9 +152,11 @@ except Exception:
 if not isinstance(d, dict) or "error" in d:
     sys.exit(1)
 choices = d.get("choices") or []
-if not choices:
-    sys.exit(1)
-msg = choices[0].get("message") or {}
+if not choices or not isinstance(choices[0], dict):
+    sys.exit(1)          # a non-dict item would raise AttributeError below
+msg = choices[0].get("message")
+if not isinstance(msg, dict):
+    msg = {}
 # Bonsai is a thinking model: a short reply can hit max_tokens while still
 # inside its reasoning block, arriving as content="" with the text in
 # reasoning_content. That is a healthy generation, not a failure — scoring it
@@ -484,6 +486,21 @@ RUN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/bonsai-run.XXXXXX" 2>/dev/null)" || RUN_TM
 
 # .env carries BONSAI_API_KEY and the bind addresses. Exported because compose
 # reads them for interpolation too.
+# Remember any knob given in the environment BEFORE .env is sourced.
+#
+# `set -a; . .env` assigns unconditionally, so .env silently beat an explicit
+# `BONSAI_HEALTH_TIMEOUT=60 ./update.sh` — the opposite of what anyone typing
+# that expects. It also defeated the test harness's short deadlines on any
+# machine with a real .env, turning a 5s suite into one that polls for
+# minutes. .env stays the source of truth for the stack's own settings, which
+# compose reads from it directly; these five are the script's own, and an
+# explicit environment wins.
+_pre_smoke_timeout="${BONSAI_SMOKE_TIMEOUT:-}"
+_pre_sweep_max="${BONSAI_SMOKE_SWEEP_MAX:-}"
+_pre_health_timeout="${BONSAI_HEALTH_TIMEOUT:-}"
+_pre_webui_timeout="${BONSAI_WEBUI_TIMEOUT:-}"
+_pre_retry_sleep="${BONSAI_SMOKE_RETRY_SLEEP:-}"
+
 set -a
 if [[ -f "$ENV_FILE" ]]; then
   # .env is per-machine and never in the repo, so there is nothing to follow.
@@ -491,6 +508,14 @@ if [[ -f "$ENV_FILE" ]]; then
   . "$ENV_FILE"
 fi
 set +a
+
+# Put the explicit environment back on top of whatever .env said.
+[[ -n "$_pre_smoke_timeout" ]]  && BONSAI_SMOKE_TIMEOUT="$_pre_smoke_timeout"
+[[ -n "$_pre_sweep_max" ]]      && BONSAI_SMOKE_SWEEP_MAX="$_pre_sweep_max"
+[[ -n "$_pre_health_timeout" ]] && BONSAI_HEALTH_TIMEOUT="$_pre_health_timeout"
+[[ -n "$_pre_webui_timeout" ]]  && BONSAI_WEBUI_TIMEOUT="$_pre_webui_timeout"
+[[ -n "$_pre_retry_sleep" ]]    && BONSAI_SMOKE_RETRY_SLEEP="$_pre_retry_sleep"
+
 API="http://${LLAMA_BIND:-127.0.0.1}:8080"
 # The other half of the stack. `compose pull open-webui` replaces a moving
 # :main tag and `compose up -d` recreates the container, but every check
@@ -526,12 +551,13 @@ RETRY_SLEEP="${BONSAI_SMOKE_RETRY_SLEEP:-15}"
 # that number was picked on.
 HEALTH_TIMEOUT="${BONSAI_HEALTH_TIMEOUT:-900}"
 
-# Open WebUI gets its own, longer deadline. Its first start after a :main pull
-# runs database migrations, which outlast a llama restart on a slow disk — and
-# blowing this deadline rolls back an otherwise-good update, so quietly
-# borrowing BONSAI_HEALTH_TIMEOUT left the operator with no documented knob
-# pointing at the cause.
-WEBUI_TIMEOUT="${BONSAI_WEBUI_TIMEOUT:-300}"
+# Open WebUI gets its own deadline, as generous as llama's. Its first start
+# after a :main pull runs database migrations, which outlast a llama restart
+# on a slow disk — and blowing this rolls back an otherwise-good update,
+# throwing away a full CUDA rebuild and a smoke sweep. It was 300s against
+# llama's 900s while both comments called it "longer", which is the worst of
+# both: wrong, and reassuring.
+WEBUI_TIMEOUT="${BONSAI_WEBUI_TIMEOUT:-900}"
 
 # Ceiling on one whole smoke sweep. The per-alias retry loop would otherwise
 # multiply the worst case by three, and the systemd unit's time budget is
@@ -1032,9 +1058,18 @@ cmd_update() {
   # crash-looping since a host reboot went unnoticed every Monday. It also
   # made record_rollback_point write verified=1 from a models-only proof,
   # which is half of what --rollback promises.
-  if (( pre_verdict == 0 )) && ! webui_ok; then
+  # Probed unconditionally, not only when pre_verdict is 0. Short-circuiting
+  # meant that when smoke returned 2 ("could not ask") the UI was never looked
+  # at — so a UI dead since last week's reboot was unknown to this run, and
+  # the post-update check below would blame the commit for it.
+  local ui_before=0
+  if webui_ok; then
+    ui_before=1
+  elif (( pre_verdict == 0 )); then
     warn "models answer but the chat UI at $WEBUI_URL does not"
     pre_verdict=1
+  else
+    warn "the chat UI at $WEBUI_URL does not answer either"
   fi
   case "$pre_verdict" in
     0) verified=1;;
@@ -1192,9 +1227,10 @@ touch the running stack"
 
   log "waiting for health"
   # This one DOES pin. Build and compose up both succeeded, so the container
-  # started; llama-server binds /health before it loads any model, so failing
-  # to answer for 180s after a clean start is the code, not a transient bind
-  # race (that would have failed compose up). Without a pin, a commit that
+  # started; llama-server binds /health before it loads any model, so silence
+  # for the whole BONSAI_HEALTH_TIMEOUT window (900s by default, matching
+  # install.sh) after a clean start is the code, not a transient bind race
+  # (that would have failed compose up). Without a pin, a commit that
   # crash-loops the container is re-applied every week, forever.
   wait_for_health || {
     warn "never became healthy within ${HEALTH_TIMEOUT}s — if this box is slow to
@@ -1211,7 +1247,11 @@ recreate containers, raise BONSAI_HEALTH_TIMEOUT in .env before the next run"
     # commit be fetched, rebuilt (~45 min of CUDA) and rolled back every
     # single week, forever — the loop the pin exists to break.
     local ui_pin=""
-    if [[ -n "$webui_before" && "$webui_before" == "$webui_after" ]]; then
+    if (( ! ui_before )); then
+      # It was already down before this run touched anything.
+      warn "the chat UI at $WEBUI_URL did not answer, but it was not answering
+before this update either — not blaming the commit for it"
+    elif [[ -n "$webui_before" && "$webui_before" == "$webui_after" ]]; then
       ui_pin="$pin_arg"
       warn "the chat UI at $WEBUI_URL did not answer, and no new image was
 pulled — so this is the commit, not the registry"

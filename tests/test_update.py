@@ -992,6 +992,135 @@ class AFailedStashStopsTheRewind(unittest.TestCase):
                       "a failed stash must stop the caller rewinding")
 
 
+class AUiAlreadyDownIsNotTheCommitsFault(unittest.TestCase):
+    """webui_ok was probed only when pre_verdict == 0, so a run where smoke
+    returned 2 never looked at the UI — and the post-update check then blamed
+    the commit for a UI that had been dead since last week's reboot.
+
+    Scenario: timer fires at 04:30 while someone is chatting, the router
+    answers "model limit reached" to every alias, smoke returns 2, the UI is
+    never probed. A good commit is merged and built, llama comes up, webui_ok
+    fails for the pre-existing reason, no new image was pulled, and the good
+    commit is blacklisted until a human edits run/update-state.
+    """
+
+    def _run(self, ui_before_ok):
+        first = "0" if ui_before_ok else "1"
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+            'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+            'wait_for_health() { return 0; }; smoke() { return 2; }; '
+            'compose() { return 0; }; stash_local_edits() { :; }; '
+            'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }; '
+            f'W=0; webui_ok() {{ W=$((W+1)); [ "$W" = 1 ] && return {first}; return 1; }}; '
+            'local_image_digest() { echo same; }; remote_image_digest() { echo other; }; '
+            'git() { case "$*" in *"merge-base --is-ancestor"*) return 1;; '
+            '*"rev-parse HEAD"*) echo OLD;; *rev-parse*) echo NEW;; esac; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        return r.stdout + r.stderr
+
+    def test_a_ui_already_down_does_not_pin(self):
+        out = self._run(ui_before_ok=False)
+        self.assertIn("ROLLBACK pin=[]", out,
+                      "blamed the commit for a UI that was already dead")
+        self.assertIn("not answering\nbefore this update either", out)
+
+    def test_a_ui_that_was_up_and_then_died_does_pin(self):
+        out = self._run(ui_before_ok=True)
+        self.assertIn("ROLLBACK pin=[pin]", out,
+                      "the UI worked before this run and does not now")
+
+    def test_the_ui_is_probed_even_when_smoke_cannot_judge(self):
+        out = self._run(ui_before_ok=False)
+        self.assertIn("does not answer either", out,
+                      "the UI must be probed regardless of smoke's verdict")
+
+
+class EnvironmentBeatsDotEnv(unittest.TestCase):
+    """`set -a; . .env` assigns unconditionally, so .env silently beat an
+    explicit `BONSAI_HEALTH_TIMEOUT=60 ./update.sh`. It also defeated this
+    harness's short deadlines on any machine with a real .env — measured:
+    a 5s suite became 30s with one knob set, and would poll for 15 minutes
+    per unstubbed call at the value the docs recommend."""
+
+    def _knobs(self, env_file_values, overrides):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "docker"))
+            copy = os.path.join(d, "bonsai-update.TESTX")
+            shutil.copy(UPDATE_SH, copy)
+            with open(os.path.join(d, ".env"), "w") as fh:
+                fh.write("BONSAI_API_KEY=k\n" + env_file_values)
+            pre = "".join(f'export {k}={v}; ' for k, v in overrides.items())
+            script = (
+                'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+                f'export BONSAI_UPDATE_REEXEC={shlex.quote(copy)}; '
+                f'export BONSAI_UPDATE_ROOT={shlex.quote(d)}; {pre}'
+                f'source {shlex.quote(copy)}; '
+                'echo "H=$HEALTH_TIMEOUT W=$WEBUI_TIMEOUT C=$CHAT_TIMEOUT"'
+            )
+            r = subprocess.run(["bash", "-c", script], capture_output=True,
+                               text=True)
+            return r.stdout.strip(), r.stderr
+
+    def test_dot_env_applies_when_nothing_is_exported(self):
+        out, err = self._knobs("BONSAI_HEALTH_TIMEOUT=25\n", {})
+        self.assertIn("H=25", out, err)
+
+    def test_an_explicit_environment_wins(self):
+        out, err = self._knobs("BONSAI_HEALTH_TIMEOUT=25\nBONSAI_WEBUI_TIMEOUT=26\n",
+                               {"BONSAI_HEALTH_TIMEOUT": "7",
+                                "BONSAI_WEBUI_TIMEOUT": "8"})
+        self.assertIn("H=7", out, err)
+        self.assertIn("W=8", out, err)
+
+    def test_the_harness_pins_every_deadline(self):
+        """A missing stub must fail fast, not poll."""
+        with open(__file__) as fh:
+            harness = fh.read()
+        for knob in ("BONSAI_HEALTH_TIMEOUT=1", "BONSAI_WEBUI_TIMEOUT=1",
+                     "BONSAI_SMOKE_RETRY_SLEEP=0"):
+            self.assertIn(knob, harness)
+        self.assertIn("WEBUI_URL=http://127.0.0.1:9", harness,
+                      "tests must not be able to reach a live box")
+
+
+class MalformedRepliesDoNotBlacklist(unittest.TestCase):
+    """smoke_ok is the one that can pin a commit, so a shape it did not expect
+    must not read as a dead model."""
+
+    def _ok(self, body):
+        r = subprocess.run(
+            ["bash", "-c",
+             f'export BONSAI_UPDATE_LIB=1; source "{UPDATE_SH}"; smoke_ok'],
+            input=body, capture_output=True, text=True)
+        return r.returncode == 0, r.stderr
+
+    def test_a_non_dict_choice_does_not_raise(self):
+        ok, err = self._ok('{"choices": ["not a dict"]}')
+        self.assertFalse(ok)
+        self.assertNotIn("AttributeError", err,
+                         "a traceback in the journal instead of a verdict")
+
+    def test_a_non_dict_message_does_not_raise(self):
+        ok, err = self._ok('{"choices": [{"message": "not a dict"}]}')
+        self.assertFalse(ok)
+        self.assertNotIn("AttributeError", err)
+
+    def test_a_non_dict_model_entry_does_not_raise(self):
+        r = subprocess.run(
+            ["bash", "-c",
+             f'export BONSAI_UPDATE_LIB=1; source "{UPDATE_SH}"; parse_model_ids'],
+            input='{"data": ["bare string", {"id": "real"}]}',
+            capture_output=True, text=True)
+        self.assertNotIn("AttributeError", r.stderr)
+        self.assertIn("real", r.stdout)
+
+    def test_a_good_reply_still_passes(self):
+        ok, _ = self._ok(GOOD_CONTENT)
+        self.assertTrue(ok)
+
+
 class TheWeeklyCheckCoversTheUi(unittest.TestCase):
     """webui_ok was only wired to the POST-update path, so the common case —
     code current, images current — returned 0 having proved only that the
@@ -1815,11 +1944,22 @@ def run_real(setup, call):
     """
     script = (
         # Short deadlines so an UNSTUBBED wait_for_health or webui_ok fails in
-        # a second instead of polling a real port for 180s. A missing stub
-        # should show up as a failure, not as a suite that takes six minutes.
+        # a second instead of polling for minutes. A missing stub should show
+        # up as a failure, not as a suite that takes six minutes.
+        #
+        # BONSAI_WEBUI_TIMEOUT belongs here too: without it an unstubbed
+        # webui_ok polled for its full window, and on a dev box actually
+        # running Open WebUI on 9090 it returned 0 and passed for the wrong
+        # reason. These only bite because .env used to override the process
+        # environment; that is fixed in update.sh, and this belt-and-braces
+        # stays.
         'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
-        'export BONSAI_HEALTH_TIMEOUT=1 BONSAI_SMOKE_RETRY_SLEEP=0; '
+        'export BONSAI_HEALTH_TIMEOUT=1 BONSAI_WEBUI_TIMEOUT=1 '
+        'BONSAI_SMOKE_RETRY_SLEEP=0; '
         f'source "{UPDATE_SH}"; '
+        # Aim at a dead port unless the test says otherwise, so nothing can
+        # reach the operator's live box through LLAMA_BIND/WEBUI_BIND in .env.
+        'API=http://127.0.0.1:9; WEBUI_URL=http://127.0.0.1:9; '
         f'{setup}; {call}; echo "rc=$?"'
     )
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True)

@@ -37,17 +37,17 @@ ExecStart=__ROOT__/update.sh
 # mid-rollback, the one thing this timeout exists to prevent.
 #   wait_for_health (pre)        900s  (matches install.sh's own budget)
 #   smoke before update         4500s
-#   webui_ok (pre)               300s
+#   webui_ok (pre)               900s
 #   compose build llama   up to 2700s  (Dockerfile builds llama.cpp + CUDA)
 #   compose pull open-webui     1800s  (multi-GB, throttled link)
 #   compose up -d                600s
 #   wait_for_health (post)       900s
 #   smoke after update          4500s
-#   webui_ok (post)              300s
+#   webui_ok (post)              900s
 #   rollback: up + health + smoke + webui
-#                               6300s
+#                               6900s
 #                              -------
-#                              22800s
+#                              24600s
 # 27000 leaves headroom without letting a wedged run sit all day. Raising
 # BONSAI_SMOKE_TIMEOUT or BONSAI_SMOKE_SWEEP_MAX means raising this too.
 TimeoutStartSec=27000
