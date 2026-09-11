@@ -34,6 +34,12 @@ TEMPLATE = os.path.join(ROOT, "bonsai-chat-template.jinja")
 MODELS_INI = os.path.join(ROOT, "models.ini.in")
 DOCKERFILE = os.path.join(ROOT, "docker", "Dockerfile")
 
+# The unmodified template, read out of the GGUF metadata key
+# tokenizer.chat_template. Kept so the parity tests below can prove the claim
+# models.ini.in makes: our copy changes multi-system handling and nothing else.
+# Refresh it if the weights ship a new template.
+GGUF_TEMPLATE = os.path.join(ROOT, "tests", "fixtures", "gguf-chat-template.jinja")
+
 # The exact call the GGUF template makes. Its presence anywhere in our copy
 # means the fix has been reverted or a template refresh overwrote it.
 SYSTEM_POSITION_RAISE = "System message must be at the beginning."
@@ -178,6 +184,125 @@ class Rendering(unittest.TestCase):
         )
         for text in ("S", "one", "two", "three"):
             self.assertIn(text, out)
+
+
+@unittest.skipIf(jinja2 is None, "jinja2 not installed")
+class ParityWithTheGgufTemplate(unittest.TestCase):
+    """Our copy must render byte-identically except for multiple system messages.
+
+    Substring assertions would miss a lost newline or a dropped control token in
+    the tool_calls and tool branches, which the fix does not touch but a future
+    edit could. Comparing whole renders against the GGUF original catches that.
+    """
+
+    def setUp(self):
+        self.ours = self.compile(read(TEMPLATE))
+        self.gguf = self.compile(read(GGUF_TEMPLATE))
+
+    @staticmethod
+    def compile(source):
+        env = jinja2.Environment(extensions=["jinja2.ext.do"])
+
+        def raise_exception(message):
+            raise RuntimeError(message)
+
+        env.globals["raise_exception"] = raise_exception
+        return env.from_string(source)
+
+    # Every branch of the template that the fix does not touch.
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "exec_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    SHAPES = {
+        "system and user": [
+            {"role": "system", "content": "S"},
+            {"role": "user", "content": "hi"},
+        ],
+        "no system message": [{"role": "user", "content": "hi"}],
+        "multi turn": [
+            {"role": "system", "content": "S"},
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"},
+        ],
+        "assistant makes a tool call": [
+            {"role": "user", "content": "list files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": {"cmd": "ls -la"},
+                        }
+                    }
+                ],
+            },
+            {"role": "tool", "content": "a.txt\nb.txt"},
+            {"role": "user", "content": "thanks"},
+        ],
+        "two tool responses in a row": [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "working",
+                "tool_calls": [
+                    {"function": {"name": "exec_command", "arguments": {"cmd": "a"}}},
+                    {"function": {"name": "exec_command", "arguments": {"cmd": "b"}}},
+                ],
+            },
+            {"role": "tool", "content": "out a"},
+            {"role": "tool", "content": "out b"},
+            {"role": "user", "content": "done?"},
+        ],
+        "assistant with reasoning content": [
+            {"role": "user", "content": "think"},
+            {
+                "role": "assistant",
+                "content": "answer",
+                "reasoning_content": "some thinking",
+            },
+            {"role": "user", "content": "again"},
+        ],
+    }
+
+    def test_renders_are_byte_identical(self):
+        for name, messages in self.SHAPES.items():
+            for tools in (None, self.TOOLS):
+                with self.subTest(shape=name, tools=bool(tools)):
+                    kwargs = dict(
+                        messages=messages, tools=tools, add_generation_prompt=True
+                    )
+                    self.assertEqual(
+                        self.gguf.render(**kwargs),
+                        self.ours.render(**kwargs),
+                        f"{name} renders differently from the GGUF template",
+                    )
+
+    def test_the_fixture_is_the_unpatched_template(self):
+        """A stale fixture would make the parity test meaningless."""
+        self.assertIn(SYSTEM_POSITION_RAISE, read(GGUF_TEMPLATE))
+
+    def test_only_multi_system_differs(self):
+        """The one shape that must NOT match: the GGUF template raises."""
+        messages = [
+            {"role": "system", "content": "A"},
+            {"role": "system", "content": "B"},
+            {"role": "user", "content": "hi"},
+        ]
+        with self.assertRaises(RuntimeError):
+            self.gguf.render(messages=messages, add_generation_prompt=True)
+        self.ours.render(messages=messages, add_generation_prompt=True)
 
 
 if __name__ == "__main__":
