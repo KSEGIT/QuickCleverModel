@@ -431,7 +431,10 @@ class SmokeHasThreeOutcomes(unittest.TestCase):
         body — the only explanation the operator ever gets — is discarded."""
         with open(UPDATE_SH) as fh:
             body = fh.read()
-        fn = body[body.index("ask() {"):body.index("smoke() {")]
+        # Slice to the NEXT function, not to smoke(): webui_ok sits between
+        # them and uses curl -f on purpose — it is a status-only health poll
+        # with no body worth keeping.
+        fn = body[body.index("ask() {"):body.index("smoke_body() {")]
         # Match the FLAG, not the substring: the function also contains
         # `! -f "$CURL_ERR"`, which is a file test, not curl's --fail.
         self.assertNotIn("curl -f", fn, "curl -f would discard the error body")
@@ -444,7 +447,7 @@ class SmokeHasThreeOutcomes(unittest.TestCase):
         bare "curl failed (exit 7)" with no reason."""
         with open(UPDATE_SH) as fh:
             body = fh.read()
-        fn = body[body.index("ask() {"):body.index("smoke() {")]
+        fn = body[body.index("ask() {"):body.index("smoke_body() {")]
         self.assertIn('2>"$CURL_ERR"', fn)
         self.assertIn("ASK_ERR=", fn)
         self.assertIn("${ASK_ERR:-curl failed}", body,
@@ -713,7 +716,7 @@ class PinsOnlyWhatThisRunMoved(unittest.TestCase):
         'preflight() { :; }; take_lock() { :; }; '
         'docker() { return 0; }; is_pinned_bad() { return 1; }; '
         'record_rollback_point() { :; }; wait_for_health() { return 0; }; '
-        'compose() { return 0; }; '
+        'webui_ok() { return 0; }; compose() { return 0; }; '
         'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }; '
         'N=0; smoke() { N=$((N+1)); [ "$N" = 1 ] && return 0; return 1; }'
     )
@@ -759,7 +762,7 @@ class AlreadyBrokenDoesNotBlameTheCommit(unittest.TestCase):
         setup = (
             'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
             'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
-            'wait_for_health() { return 0; }; compose() { return 0; }; '
+            'wait_for_health() { return 0; }; webui_ok() { return 0; }; compose() { return 0; }; '
             'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }; '
             f'N=0; smoke() {{ N=$((N+1)); [ "$N" = 1 ] && return {pre}; return {post}; }}; '
             f'git() {{ case "$*" in '
@@ -800,6 +803,149 @@ class AlreadyBrokenDoesNotBlameTheCommit(unittest.TestCase):
         out = self._run(pre_ok=False, post_ok=False)
         self.assertIn("is NOT serving before", out)
         self.assertNotIn("could not judge the stack before", out)
+
+
+class MovedAndPinnableAreDifferentQuestions(unittest.TestCase):
+    """`pin_arg` gets cleared when the stack was already broken beforehand.
+    Reusing it as "did this run move code" meant that on an already-broken
+    stack the merge DID move HEAD, pin_arg was empty, and the build-failure
+    handler announced "nothing to undo: this run moved no code" — false —
+    skipped the stash and the reset, and left the checkout on a new, unbuilt
+    commit."""
+
+    def _run(self, pre_verdict, marker):
+        # A marker FILE, not an echo: the real code runs the reset with
+        # >/dev/null 2>&1, so a stub that prints is invisible.
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+            'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+            'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+            'stash_local_edits() { echo "STASHED"; }; '
+            'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }; '
+            f'smoke() {{ return {pre_verdict}; }}; '
+            'local_image_digest() { echo a; }; remote_image_digest() { echo a; }; '
+            'compose() { case "$1" in build) echo "BUILD FAILED"; return 1;; esac; return 0; }; '
+            'git() { case "$*" in '
+            '*"merge-base --is-ancestor"*) return 1;; '          # a real move
+            '*"rev-parse HEAD"*) echo OLDCOMMIT;; '
+            '*rev-parse*) echo NEWCOMMIT;; '
+            f'*"reset --hard"*) touch {shlex.quote(marker)};; '
+            'esac; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        return r.stdout + r.stderr
+
+    def test_a_broken_stack_still_gets_its_merge_undone(self):
+        with tempfile.TemporaryDirectory() as d:
+            marker = os.path.join(d, "reset-ran")
+            out = self._run(pre_verdict=1, marker=marker)   # pin disarmed
+            self.assertIn("undoing the code move", out,
+                          "the merge moved HEAD, so a failed build must undo it")
+            self.assertIn("STASHED", out)
+            self.assertTrue(os.path.exists(marker),
+                            "the checkout was left on a new, unbuilt commit")
+            self.assertNotIn("nothing to undo", out)
+
+    def test_a_healthy_stack_also_gets_its_merge_undone(self):
+        with tempfile.TemporaryDirectory() as d:
+            marker = os.path.join(d, "reset-ran")
+            self._run(pre_verdict=0, marker=marker)
+            self.assertTrue(os.path.exists(marker))
+
+    def test_an_image_only_run_has_nothing_to_undo(self):
+        d = tempfile.mkdtemp()
+        marker = os.path.join(d, "reset-ran")
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+            'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+            'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+            'stash_local_edits() { echo "STASHED"; }; smoke() { return 0; }; '
+            'do_rollback() { echo "ROLLBACK"; return 0; }; '
+            'local_image_digest() { echo old; }; remote_image_digest() { echo new; }; '
+            'compose() { case "$1" in build) return 1;; esac; return 0; }; '
+            'git() { case "$*" in '
+            '*"merge-base --is-ancestor"*) return 0;; '          # no move
+            '*"rev-parse HEAD"*) echo SAME;; *rev-parse*) echo SAME;; '
+            f'*"reset --hard"*) touch {shlex.quote(marker)};; esac; return 0; }}'
+        )
+        out = run_real(setup, 'cmd_update')
+        out = out.stdout + out.stderr
+        self.assertIn("nothing to undo", out)
+        self.assertFalse(os.path.exists(marker),
+                         "an image-only run must not touch the checkout")
+
+
+class CheckFailsLoudWhenItCannotFetch(unittest.TestCase):
+    def test_a_failed_fetch_is_not_up_to_date(self):
+        """rev-list counts against the stale ref and returns 0, so --check
+        printed "code up to date" and exited 0 during a DNS or GHCR outage —
+        while the branches either side of it refuse to report from a
+        comparison that did not happen."""
+        setup = (
+            f'{_TOOLS_PRESENT}; ROOT=/tmp; '
+            'docker() { case "$*" in *version*) return 0;; esac; return 0; }; '
+            'local_image_digest() { echo same; }; remote_image_digest() { echo same; }; '
+            'git() { case "$*" in *fetch*) return 1;; '
+            '*rev-list*) echo 0;; esac; return 0; }'
+        )
+        r = run_real(setup, 'cmd_check')
+        out = r.stdout + r.stderr
+        self.assertNotIn("rc=0", out, "a failed fetch must not report success")
+        self.assertIn("commit drift unknown", out)
+        self.assertNotIn("code up to date", out)
+
+    def test_a_good_fetch_with_no_drift_is_up_to_date(self):
+        setup = (
+            f'{_TOOLS_PRESENT}; ROOT=/tmp; '
+            'docker() { return 0; }; '
+            'local_image_digest() { echo same; }; remote_image_digest() { echo same; }; '
+            'git() { case "$*" in *rev-list*) echo 0;; esac; return 0; }'
+        )
+        r = run_real(setup, 'cmd_check')
+        out = r.stdout + r.stderr
+        self.assertIn("rc=0", out, out)
+        self.assertIn("code up to date", out)
+
+
+class TheChatUiIsHalfTheStack(unittest.TestCase):
+    """compose pull replaces a moving :main tag and compose up recreates the
+    container, but every check aimed at llama alone — so an open-webui image
+    that crash-loops left compose returning 0, every model answering, and the
+    run logging "update complete and verified" while the UI was down."""
+
+    BASE = (
+        'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
+        'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+        'wait_for_health() { return 0; }; smoke() { return 0; }; '
+        'compose() { return 0; }; '
+        'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }; '
+        'local_image_digest() { echo old; }; remote_image_digest() { echo new; }; '
+        'git() { case "$*" in *"merge-base --is-ancestor"*) return 0;; '
+        '*rev-parse*) echo SAME;; esac; return 0; }'
+    )
+
+    def test_a_dead_ui_rolls_back(self):
+        r = run_real(f'{self.BASE}; webui_ok() {{ return 1; }}', 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("ROLLBACK", out, "a dead chat UI must not pass")
+        self.assertNotIn("update complete and verified", out)
+
+    def test_a_dead_ui_does_not_pin_the_commit(self):
+        """The UI image is whatever :main resolved to today, not the code."""
+        r = run_real(f'{self.BASE}; webui_ok() {{ return 1; }}', 'cmd_update')
+        self.assertIn("ROLLBACK pin=[]", r.stdout + r.stderr)
+
+    def test_a_live_ui_and_live_models_pass(self):
+        r = run_real(f'{self.BASE}; webui_ok() {{ return 0; }}', 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("update complete and verified", out, out)
+
+    def test_the_rollback_also_proves_the_ui(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        section = body[body.index("do_rollback() {"):body.index("cmd_check() {")]
+        self.assertIn("webui_ok", section,
+                      "a rollback that restores a broken UI is not verified")
 
 
 class HeadAheadOfUpstreamIsCurrent(unittest.TestCase):
@@ -903,8 +1049,8 @@ class RollbackDoesNotEatLocalEdits(unittest.TestCase):
             fh.write(f"sha={sha}\nwebui=\nllama=\nverified=1\n")
         setup = (
             f'ROOT={shlex.quote(d)}; STATE={shlex.quote(state)}; '
-            'docker() { return 0; }; compose() { return 0; }; '
-            'wait_for_health() { return 0; }; smoke() { return 0; }'
+            'docker() { return 0; }; compose() { return 0; }; webui_ok() { return 0; }; '
+            'wait_for_health() { return 0; }; webui_ok() { return 0; }; smoke() { return 0; }'
         )
         return run_real(setup, 'do_rollback')
 
@@ -1134,12 +1280,19 @@ class BuildFailureUndoesOnlyItsOwnMove(unittest.TestCase):
             body = fh.read()
         section = body[body.index("if ! compose build llama; then"):
                        body.index("log \"pulling open-webui\"")]
-        self.assertIn('if [[ -n "$pin_arg" ]]; then', section,
-                      "the reset must only run when this run actually merged")
+        # `moved`, not `pin_arg`. They answer different questions: pin_arg
+        # also gets cleared when the stack was already broken beforehand, and
+        # reusing it here meant that on an already-broken stack the merge DID
+        # move HEAD while the handler announced "nothing to undo", skipped the
+        # stash and the reset, and left the checkout on a new, unbuilt commit.
+        self.assertIn("if (( moved )); then", section,
+                      "the reset must run whenever this run actually merged")
+        self.assertNotIn('if [[ -n "$pin_arg" ]]; then', section,
+                         "pin_arg is cleared for reasons unrelated to moving")
         self.assertIn("nothing to undo", section,
                       "and must say so plainly when it did not")
         reset_at = section.index("reset --hard")
-        guard_at = section.index('if [[ -n "$pin_arg" ]]')
+        guard_at = section.index("if (( moved ))")
         self.assertLess(guard_at, reset_at, "the guard must precede the reset")
 
 
@@ -1283,7 +1436,7 @@ class NothingToDoIsCheap(unittest.TestCase):
         'docker() { return 0; }; '
         'is_pinned_bad() { return 1; }; '
         'record_rollback_point() { echo "RECORDED verified=$1"; }; '
-        'wait_for_health() { return 0; }; '
+        'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
         'compose() { echo "COMPOSE RAN"; return 0; }'
     )
 
@@ -1422,7 +1575,12 @@ def run_real(setup, call):
     that way. These drive the shipped functions.
     """
     script = (
-        f'set -uo pipefail; export BONSAI_UPDATE_LIB=1; source "{UPDATE_SH}"; '
+        # Short deadlines so an UNSTUBBED wait_for_health or webui_ok fails in
+        # a second instead of polling a real port for 180s. A missing stub
+        # should show up as a failure, not as a suite that takes six minutes.
+        'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+        'export BONSAI_HEALTH_TIMEOUT=1 BONSAI_SMOKE_RETRY_SLEEP=0; '
+        f'source "{UPDATE_SH}"; '
         f'{setup}; {call}; echo "rc=$?"'
     )
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True)

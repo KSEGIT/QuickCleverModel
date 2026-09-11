@@ -268,6 +268,18 @@ transient_reply() {
   return 1
 }
 
+webui_ok() {
+  # Open WebUI serves /health without auth (verified on the box: 200).
+  local deadline=$(( SECONDS + HEALTH_TIMEOUT ))
+  while (( SECONDS < deadline )); do
+    if curl -fsS -m 5 -o /dev/null "$WEBUI_URL/health" 2>/dev/null; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
 # Exit status, and it has three meanings, not two:
 #   0  every model answered
 #   1  a model could not answer            -> a real outage, roll back
@@ -454,6 +466,12 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 set +a
 API="http://${LLAMA_BIND:-127.0.0.1}:8080"
+# The other half of the stack. `compose pull open-webui` replaces a moving
+# :main tag and `compose up -d` recreates the container, but every check
+# below aimed at llama alone — so a published image that crash-loops left
+# compose returning 0, every model answering, and the run logging "update
+# complete and verified" while the chat UI was down.
+WEBUI_URL="http://${WEBUI_BIND:-127.0.0.1}:9090"
 
 # Per-model smoke request. Generous: /health answering says nothing about
 # whether a model is loaded, and in router mode the first request pays the
@@ -856,6 +874,10 @@ do_rollback() {
 
   local verdict=1
   if wait_for_health; then smoke; verdict=$?; fi
+  if (( verdict == 0 )) && ! webui_ok; then
+    warn "models answer but the chat UI at $WEBUI_URL does not"
+    verdict=1
+  fi
 
   if (( ! restored )); then
     # Answering is not the same as being restored: a pruned image or a failed
@@ -877,7 +899,14 @@ do_rollback() {
 cmd_check() {
   preflight check
   local behind rc=0
-  git -C "$ROOT" fetch --quiet 2>/dev/null || warn "could not fetch; drift may be stale"
+  # rc=1, not just a warning: without the fetch, rev-list counts against a
+  # stale ref and happily returns 0, so --check printed "code up to date" and
+  # exited 0 during a DNS or GHCR outage. The unresolvable-upstream and
+  # unreadable-digest branches below already refuse to report from a
+  # comparison that did not happen; this one was the exception.
+  local fetched=1
+  git -C "$ROOT" fetch --quiet 2>/dev/null || {
+    warn "could not fetch; commit drift unknown"; fetched=0; rc=1; }
   # A detached HEAD or a branch with no upstream makes @{u} fail. Folding that
   # into 0 reported "code up to date" on a box arbitrarily far behind — the
   # same mistake the image half of this function refuses to make below.
@@ -887,8 +916,10 @@ cmd_check() {
   elif (( behind > 0 )); then
     log "behind origin by $behind commit(s)"
     rc=1
-  else
+  elif (( fetched )); then
     log "code up to date"
+  else
+    log "code matches the last known upstream, which may be stale"
   fi
 
   local have want
@@ -1012,8 +1043,17 @@ it. See the warnings above."
   # would blacklist B — a commit that was already running and that this update
   # never introduced — and every later run would refuse it. The docs promise
   # only the code gets blamed; this keeps that true.
-  local pin_arg=""
+  # Two separate facts. `moved` says whether the merge below ran, and decides
+  # whether a failed build has anything to undo. `pin_arg` says whether this
+  # run may blame the commit, and gets cleared when the stack was already
+  # broken beforehand. Using pin_arg for both meant that on an already-broken
+  # stack the merge DID move HEAD, pin_arg was empty, and the build-failure
+  # handler then announced "nothing to undo: this run moved no code" — false —
+  # skipped the stash and the reset, and left the checkout sitting on a new,
+  # unbuilt commit.
+  local pin_arg="" moved=0
   if ! code_already_current "$target"; then
+    moved=1
     pin_arg="pin"
     if (( pre_verdict == 1 )); then
       # Only POSITIVE proof that the stack was already broken disarms the pin.
@@ -1049,7 +1089,7 @@ not blame the new commit if it fails"
     # also reset to the recorded sha, which after a "kept the proven point"
     # run can be older than where this run started, rewinding past commits
     # the update never introduced.
-    if [[ -n "$pin_arg" ]]; then
+    if (( moved )); then
       warn "build failed — undoing the code move; the running stack was not touched"
       # do_rollback stashes before its reset for exactly this reason; the
       # merge path had been left out. `git merge --ff-only` refuses only on
@@ -1088,6 +1128,15 @@ touch the running stack"
     warn "never became healthy within ${HEALTH_TIMEOUT}s — if this box is slow to
 recreate containers, raise BONSAI_HEALTH_TIMEOUT in .env before the next run"
     do_rollback "$pin_arg"; exit 1; }
+
+  log "checking the chat UI"
+  if ! webui_ok; then
+    # Not the commit's fault — this is whatever :main resolved to today — so
+    # it rolls back without pinning.
+    warn "the chat UI at $WEBUI_URL did not answer after the update"
+    do_rollback ""
+    exit 1
+  fi
 
   log "smoke testing every model"
   smoke; local verdict=$?

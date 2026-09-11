@@ -18,8 +18,9 @@ Linux and Docker only. On macOS, run `git pull` then `make restart`.
    commit still gets checked every week.
 5. **Updates.** Fetch, move to the commit it checked in step 4 with
    `git merge --ff-only`, rebuild the llama image, pull Open WebUI, restart.
-6. **Proves it works.** It asks every model in `/v1/models` for a short
-   answer.
+6. **Proves it works.** It checks the chat UI answers, then asks every model
+   in `/v1/models` for a short answer. Both halves matter: the Open WebUI
+   image is a moving tag, so it can change even when no model does.
 7. **Undoes the update if that fails.** It puts back the old commit and the
    old images, restarts, and tests again. Then it exits with an error.
 
@@ -124,7 +125,18 @@ commit it checked against the pin. It does not use `git pull`, because `git
 pull` runs its own fetch and can land on a newer commit than the one just
 checked — including the pinned bad one.
 
-If someone changed files on the machine, the merge stops and nothing else
-happens. Fix the checkout by hand.
+If someone changed a file that the new commit also changes, the merge stops
+and nothing else happens. Fix the checkout by hand.
+
+Changes to other files do **not** stop it: `git merge --ff-only` only refuses
+when the paths clash. Those changes survive the merge, and if the script then
+has to undo the move it puts them in a stash first. Get them back with:
+
+```bash
+git -C /path/to/QuickCleverModel stash list
+git -C /path/to/QuickCleverModel stash pop
+```
+
+The script says so in its log when it does this. Nothing is deleted.
 This is on purpose: a machine that quietly throws away local changes is worse
 than one that stops and asks.
