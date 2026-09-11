@@ -164,8 +164,25 @@ curl_conf() {
   # and send the operator chasing a model failure that was really a full disk.
   [[ -n "$CURL_CONF" && -s "$CURL_CONF" ]] && return 0
   CURL_CONF="$(mktemp "${TMPDIR:-/tmp}/bonsai-curlcfg.XXXXXX")" || { CURL_CONF=""; return 1; }
+  # Quoted value, with the key escaped for it.
+  #
+  # curl un-escapes \\ and \" inside a double-quoted config value and ends the
+  # value at the first UNescaped " — so a key containing either character
+  # produced a truncated Authorization header, every request came back 401,
+  # and smoke reported "cannot judge" forever while blaming the credentials
+  # rather than the encoding. Measured against a listener: key ab"cd\ef went
+  # out as `Authorization: Bearer ab`.
+  #
+  # The obvious remedy — dropping the quotes — is WRONG and was briefly
+  # shipped here: with `header = Authorization: Bearer KEY` curl sends no
+  # Authorization header at all. Measured against the live API: unquoted 401,
+  # quoted 200, and a --trace-ascii shows zero authorization lines for the
+  # unquoted form. So keep the quotes and escape the value. Backslashes first,
+  # or the escapes introduced for quotes would be escaped again.
+  local esc="${BONSAI_API_KEY//\\/\\\\}"
+  esc="${esc//\"/\\\"}"
   if ! chmod 600 "$CURL_CONF" \
-     || ! printf 'header = "Authorization: Bearer %s"\n' "$BONSAI_API_KEY" > "$CURL_CONF"; then
+     || ! printf 'header = "Authorization: Bearer %s"\n' "$esc" > "$CURL_CONF"; then
     rm -f -- "$CURL_CONF"
     CURL_CONF=""
     return 1
@@ -213,7 +230,7 @@ transient_reply() {
 # timeout would otherwise look exactly like a dead model, and tear down a
 # stack that was serving perfectly.
 smoke() {
-  local ids id rc failed=0
+  local ids id rc failed=0 unknown=0
 
   ask "$API/v1/models" -m 15 || {
     warn "could not reach $API/v1/models (curl failed)"; return 2; }
@@ -224,11 +241,21 @@ smoke() {
   ids="$(printf '%s' "$ASK_BODY" | parse_model_ids)"
   [[ -n "$ids" ]] || { warn "/v1/models listed no models"; return 2; }
 
-  local attempt busy
+  # A whole-sweep deadline, so the systemd budget can be believed. Without it
+  # the retry loop multiplies the worst case by three per alias, and a unit
+  # budgeted for one attempt each gets SIGTERM mid-rollback.
+  local sweep_deadline=$(( SECONDS + SMOKE_SWEEP_MAX ))
+  local attempt busy this_unknown
   while read -r id; do
     [[ -n "$id" ]] || continue
+    if (( SECONDS > sweep_deadline )); then
+      warn "  smoke: sweep exceeded ${SMOKE_SWEEP_MAX}s; not asking $id"
+      unknown=1
+      continue
+    fi
     log "  smoke: $id"
     busy=0
+    this_unknown=0
     for attempt in 1 2 3; do
       busy=0
       ask "$API/v1/chat/completions" -m "$CHAT_TIMEOUT" \
@@ -244,27 +271,38 @@ smoke() {
         else
           warn "  smoke: $id — curl failed (exit $rc); cannot judge the stack"
         fi
-        return 2
+        this_unknown=1
+        break
       fi
       case "$ASK_CODE" in
         401|403|404)
           # Our credentials or our URL, not the model.
-          warn "  smoke: $id returned HTTP $ASK_CODE — cannot judge the stack"
-          return 2;;
+          warn "  smoke: $id returned HTTP $ASK_CODE — cannot judge it"
+          this_unknown=1
+          break;;
         429|502|503|504) busy=1;;
+        2*) ;;   # a real reply; transient wording inside it means nothing
+        *) transient_reply "$ASK_BODY" && busy=1;;
       esac
-      transient_reply "$ASK_BODY" && busy=1
       (( busy )) || break
       if (( attempt < 3 )); then
         warn "  smoke: $id is busy (HTTP $ASK_CODE) — retrying in $(( attempt * RETRY_SLEEP ))s"
         sleep $(( attempt * RETRY_SLEEP ))
       fi
     done
+    # Per-alias, not sweep-level: one alias we could not ask must not stop
+    # the rest from being judged.
+    if (( this_unknown )); then
+      unknown=1
+      continue
+    fi
     if (( busy )); then
       # Still busy after three tries. Someone is using the box, or a model is
-      # still loading; either way this run cannot judge it, and must not pin.
-      warn "  smoke: $id still busy after 3 tries — cannot judge the stack"
-      return 2
+      # still loading; either way this alias cannot be judged, and must not
+      # be allowed to pin a commit.
+      warn "  smoke: $id still busy after 3 tries — cannot judge it"
+      unknown=1
+      continue
     fi
     if printf '%s' "$ASK_BODY" | smoke_ok; then
       log "  smoke: $id OK"
@@ -273,7 +311,13 @@ smoke() {
       failed=1
     fi
   done <<< "$ids"
-  return "$failed"
+
+  # A model proven dead outranks one that could not be asked. Returning 2
+  # here because a LATER alias hit a rotated key would throw away the
+  # evidence, and cmd_update would leave the outage in production.
+  (( failed )) && return 1
+  (( unknown )) && return 2
+  return 0
 }
 
 # --- run from a copy, never from the file we are about to rewrite -----------
@@ -368,6 +412,11 @@ RETRY_SLEEP="${BONSAI_SMOKE_RETRY_SLEEP:-15}"
 # the commit, so a slow disk plus nvidia-runtime init on a cold recreate must
 # not be able to blacklist good code.
 HEALTH_TIMEOUT="${BONSAI_HEALTH_TIMEOUT:-180}"
+
+# Ceiling on one whole smoke sweep. The per-alias retry loop would otherwise
+# multiply the worst case by three, and the systemd unit's time budget is
+# written against a sweep, not against an attempt.
+SMOKE_SWEEP_MAX="${BONSAI_SMOKE_SWEEP_MAX:-$(( CHAT_TIMEOUT * 3 ))}"
 
 compose() { docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 
@@ -768,14 +817,6 @@ cmd_update() {
   target="$(git -C "$ROOT" rev-parse '@{u}' 2>/dev/null)" \
     || die "no upstream for HEAD (detached, or no tracking branch) — nothing to update to"
   [[ -n "$target" ]] || die "could not resolve the upstream commit"
-  if is_pinned_bad "$target"; then
-    die "upstream is still at ${target:0:12}, which already failed its smoke test
-here and was rolled back. Nothing to do until a newer commit lands.
-
-To try it again anyway:
-  sed -i '/^bad=/d' $STATE"
-  fi
-
   # Prove the stack BEFORE anything else, and before deciding whether there
   # is work to do.
   #
@@ -795,6 +836,18 @@ To try it again anyway:
   fi
   record_rollback_point "$verified"
 
+  # The pin check sits HERE, after the proof above, not before it. Placed
+  # earlier it meant that once a commit was pinned the box was never
+  # smoke-tested again and run/update-state was never refreshed — possibly
+  # for months, until a newer commit happened to land upstream.
+  if is_pinned_bad "$target"; then
+    die "upstream is still at ${target:0:12}, which already failed here and was
+rolled back. Nothing to update until a newer commit lands.
+
+To try it again anyway:
+  sed -i '/^bad=/d' $STATE"
+  fi
+
   # Nothing to do? Stop before the EXPENSIVE part — the rebuild, the restart
   # and the second smoke sweep. The check above has already run, so a dark
   # stack is still reported and the rollback point still exists.
@@ -806,6 +859,15 @@ To try it again anyway:
   if [[ "$target" == "$head_sha" ]]; then
     have="$(local_image_digest "$WEBUI_IMAGE")"
     want="$(remote_image_digest "$WEBUI_IMAGE")"
+    # An unreadable registry digest is NOT a reason to rebuild and restart.
+    # cmd_check refuses to guess in this situation and so must this: the code
+    # is provably current, and guessing "behind" tears the stack down and
+    # evicts the resident model for a rebuild that changes nothing — usually
+    # during the very outage (DNS, GHCR, no network) that hid the digest.
+    if [[ -n "$have" && -z "$want" ]]; then
+      warn "could not read the registry digest; code is current, so assuming nothing to do"
+      want="$have"
+    fi
     if [[ -n "$have" && -n "$want" && "$have" == "$want" ]]; then
       if (( verified )); then
         log "already up to date (code ${head_sha:0:12}, images current) — nothing to do"
@@ -821,9 +883,22 @@ it. See the warnings above."
   # merge, not pull: `git pull` runs its OWN fetch, which can land on a commit
   # newer than the $target the pin was just checked against — including the
   # pinned bad one, which is the single thing the pin exists to prevent.
-  log "moving to ${target:0:12}"
-  if ! git -C "$ROOT" merge --ff-only "$target"; then
-    die "git merge --ff-only $target failed — the checkout has diverged, fix it by hand"
+  # Only a run that actually MOVED the checkout may pin. record_rollback_point
+  # deliberately keeps an older proven commit A when a run could not prove
+  # itself, so HEAD can already be B when this one starts. If the work below
+  # then fails because of a new open-webui image rather than the code, pinning
+  # would blacklist B — a commit that was already running and that this update
+  # never introduced — and every later run would refuse it. The docs promise
+  # only the code gets blamed; this keeps that true.
+  local pin_arg=""
+  if [[ "$target" != "$head_sha" ]]; then
+    pin_arg="pin"
+    log "moving to ${target:0:12}"
+    if ! git -C "$ROOT" merge --ff-only "$target"; then
+      die "git merge --ff-only $target failed — the checkout has diverged, fix it by hand"
+    fi
+  else
+    log "code already at ${head_sha:0:12}; updating images only"
   fi
 
   log "building llama image"
@@ -857,7 +932,7 @@ it. See the warnings above."
   wait_for_health || {
     warn "never became healthy within ${HEALTH_TIMEOUT}s — if this box is slow to
 recreate containers, raise BONSAI_HEALTH_TIMEOUT in .env before the next run"
-    do_rollback pin; exit 1; }
+    do_rollback "$pin_arg"; exit 1; }
 
   log "smoke testing every model"
   smoke; local verdict=$?
@@ -869,7 +944,7 @@ judge it. The update is applied and NOT rolled back — check the warnings
 above, then run ./update.sh --rollback yourself if you want the old version."
   elif (( verdict != 0 )); then
     warn "smoke test failed after update — rolling back"
-    do_rollback pin
+    do_rollback "$pin_arg"
     exit 1
   fi
 

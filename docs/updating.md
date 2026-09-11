@@ -81,6 +81,24 @@ To try the same commit again anyway:
 sed -i '/^bad=/d' run/update-state
 ```
 
+## Tuning the deadlines
+
+`update.sh` rolls the stack back when it decides a model is broken, and
+remembers the commit when the code is to blame. So a deadline that is too
+short on a slow machine blocks good code until a person clears it.
+
+Four settings in `.env` control this. See `.env.example` for each one:
+
+| Setting | Default | What it bounds |
+|---|---|---|
+| `BONSAI_SMOKE_TIMEOUT` | 900s | One model's answer |
+| `BONSAI_SMOKE_SWEEP_MAX` | 3x the above | One whole sweep, retries included |
+| `BONSAI_HEALTH_TIMEOUT` | 180s | Waiting for `/health` after a restart |
+| `BONSAI_SMOKE_RETRY_SLEEP` | 15s | Backoff when the router says it is busy |
+
+If you raise the first two, raise `TimeoutStartSec` in
+`docker/bonsai-update.service` as well. Its comment shows the arithmetic.
+
 ## The weekly timer
 
 `docker/bonsai-update.timer` runs the update once a week.

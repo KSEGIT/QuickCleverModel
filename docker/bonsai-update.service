@@ -24,16 +24,19 @@ ExecStart=__ROOT__/update.sh
 
 # Must cover the WHOLE worst case, including the rollback, or systemd sends
 # SIGTERM in the middle of the one path whose job is to rescue the stack.
-# Budget, with 3 model aliases at BONSAI_SMOKE_TIMEOUT=900 each:
+# Budget. A smoke sweep is bounded by BONSAI_SMOKE_SWEEP_MAX (default 3 x
+# BONSAI_SMOKE_TIMEOUT = 2700s) plus at most one request already in flight
+# when the deadline passes, so 3600s covers a sweep INCLUDING its retries —
+# without that ceiling the per-alias retry loop tripled the worst case and
+# systemd would have sent SIGTERM in the middle of a rollback.
 #   compose build llama   up to 2700s  (Dockerfile builds llama.cpp + CUDA)
-#   smoke before update         2700s
+#   smoke before update         3600s
 #   wait_for_health              180s
-#   smoke after update          2700s
-#   rollback: health + smoke    2880s
+#   smoke after update          3600s
+#   rollback: health + smoke    3780s
 #                              -------
-#                              11160s
-# 14400 leaves headroom for a slow registry without letting a hung run sit
-# there all day. Raising BONSAI_SMOKE_TIMEOUT means raising this too.
+#                              13860s
+# Raising BONSAI_SMOKE_TIMEOUT or BONSAI_SMOKE_SWEEP_MAX means raising this.
 TimeoutStartSec=14400
 
 # Deprioritizes THIS unit: the git work, the smoke sweeps and the compose

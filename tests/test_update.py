@@ -685,6 +685,195 @@ class CheckNeverGuesses(unittest.TestCase):
         self.assertIn("no upstream for HEAD", body)
 
 
+class PinsOnlyWhatThisRunMoved(unittest.TestCase):
+    """record_rollback_point deliberately keeps an older proven commit A when a
+    run could not prove itself, so HEAD can already be B when the next run
+    starts. If that run then fails because of a NEW open-webui image rather
+    than the code, pinning would blacklist B — a commit that was already
+    running and that this update never introduced — and every later run would
+    refuse it. docs/updating.md promises only the code gets blamed."""
+
+    BASE = (
+        'preflight() { :; }; take_lock() { :; }; '
+        'docker() { return 0; }; is_pinned_bad() { return 1; }; '
+        'record_rollback_point() { :; }; wait_for_health() { return 0; }; '
+        'compose() { return 0; }; '
+        'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }; '
+        'N=0; smoke() { N=$((N+1)); [ "$N" = 1 ] && return 0; return 1; }'
+    )
+
+    def _run(self, head, target, have="sha256:old", want="sha256:new"):
+        setup = (
+            f'{self.BASE}; '
+            f'git() {{ case "$*" in *"rev-parse HEAD"*) echo {head};; '
+            f'*rev-parse*) echo {target};; *merge*) return 0;; esac; return 0; }}; '
+            f'local_image_digest() {{ echo {have}; }}; '
+            f'remote_image_digest() {{ echo {want}; }}'
+        )
+        r = run_real(setup, 'cmd_update')
+        return r.stdout + r.stderr
+
+    def test_an_image_only_update_does_not_pin_the_running_commit(self):
+        out = self._run(head="SAMECOMMIT", target="SAMECOMMIT")
+        self.assertIn("ROLLBACK pin=[]", out,
+                      "the code never moved, so the failure is not its fault")
+        self.assertIn("updating images only", out)
+
+    def test_a_real_code_move_does_pin(self):
+        out = self._run(head="OLDCOMMIT", target="NEWCOMMIT")
+        self.assertIn("ROLLBACK pin=[pin]", out,
+                      "this run introduced the commit, so it may be blamed")
+
+
+class DeadOutranksUnknown(unittest.TestCase):
+    """A model proven dead must outrank one that could not be asked. Returning
+    2 because a LATER alias hit a rotated key threw away the evidence, and
+    cmd_update then left the outage in production instead of rolling back."""
+
+    def _smoke(self, replies):
+        cases = "".join(
+            f'{i}) ASK_CODE={c}; ASK_BODY={shlex.quote(b)};; '
+            for i, (c, b) in enumerate(replies, start=1))
+        two = json.dumps({"data": [{"id": "a"}, {"id": "b"}]})
+        stub = (
+            'N=0; ask() { case "$1" in '
+            f'*models) ASK_CODE=200; ASK_BODY={shlex.quote(two)};; '
+            f'*) N=$((N+1)); case "$N" in {cases} esac;; '
+            'esac; return 0; }'
+        )
+        script = (
+            'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+            'export BONSAI_SMOKE_RETRY_SLEEP=0; '
+            f'source "{UPDATE_SH}"; API=http://stub; BONSAI_API_KEY=k; '
+            f'{stub}; smoke; echo "rc=$?"'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        return r.stdout + r.stderr
+
+    def test_a_dead_model_then_a_rotated_key_still_rolls_back(self):
+        out = self._smoke([(500, FAILED_LOAD), (401, '{"error":"nope"}')])
+        self.assertIn("rc=1", out,
+                      "the proven dead model was discarded in favour of "
+                      "'cannot judge', leaving the outage in production")
+
+    def test_only_unknowns_is_still_cannot_judge(self):
+        out = self._smoke([(401, '{"error":"nope"}'), (401, '{"error":"nope"}')])
+        self.assertIn("rc=2", out)
+
+    def test_one_unknown_does_not_stop_the_others_being_judged(self):
+        """The per-alias flag: a 401 on the first must not skip judging the
+        second."""
+        out = self._smoke([(401, '{"error":"nope"}'), (500, FAILED_LOAD)])
+        self.assertIn("rc=1", out)
+
+
+class TransientWordsInAGoodReply(unittest.TestCase):
+    def test_a_200_saying_try_again_later_is_not_busy(self):
+        """transient_reply used to run for every status, so a genuine
+        completion whose TEXT contained "try again later" was retried three
+        times and the whole run returned 'cannot judge'."""
+        body = json.dumps({"choices": [{"message":
+                          {"content": "Sure — try again later if it fails."}}]})
+        one = json.dumps({"data": [{"id": "a"}]})
+        stub = (
+            'ask() { case "$1" in '
+            f'*models) ASK_CODE=200; ASK_BODY={shlex.quote(one)};; '
+            f'*) ASK_CODE=200; ASK_BODY={shlex.quote(body)};; '
+            'esac; return 0; }'
+        )
+        script = (
+            'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+            'export BONSAI_SMOKE_RETRY_SLEEP=0; '
+            f'source "{UPDATE_SH}"; API=http://stub; BONSAI_API_KEY=k; '
+            f'{stub}; smoke; echo "rc=$?"'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        self.assertIn("rc=0", out, out)
+        self.assertNotIn("is busy", out)
+
+
+class KeyEncodingSurvivesOddCharacters(unittest.TestCase):
+    """The API key goes into a curl config file, which has its own escaping.
+
+    Two ways to get this wrong, both measured against the live box:
+      quoted, unescaped -> curl ends the value at the first " and sends
+        `Authorization: Bearer ab` for the key ab"cd\\ef;
+      unquoted          -> curl sends NO Authorization header at all (401
+        against the API, zero authorization lines under --trace-ascii).
+    So: quoted AND escaped. This drives the real curl rather than asserting
+    on the file's text, because the file's text was never the question.
+    """
+
+    ODD_KEY = 'ab"cd\\ef'
+
+    def test_the_key_arrives_intact_through_curl(self):
+        if not shutil.which("curl"):
+            self.skipTest("curl not available")
+        import http.server
+        import threading
+
+        received = {}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                received["auth"] = self.headers.get("Authorization", "")
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.handle_request, daemon=True)
+        t.start()
+        try:
+            d = tempfile.mkdtemp()
+            try:
+                run_real(
+                    f'BONSAI_API_KEY={shlex.quote(self.ODD_KEY)}; '
+                    f'TMPDIR={shlex.quote(d)}',
+                    'curl_conf && curl -sS --config "$CURL_CONF" -o /dev/null '
+                    f'-m 5 http://127.0.0.1:{port}/')
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+        finally:
+            t.join(timeout=5)
+            srv.server_close()
+
+        self.assertEqual(received.get("auth"), f"Bearer {self.ODD_KEY}",
+                         "the key was mangled by the curl config encoding")
+
+    def test_the_value_is_quoted_and_escaped(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn('header = "Authorization: Bearer %s"', body,
+                      "an unquoted value makes curl send no header at all")
+        self.assertIn('esc="${BONSAI_API_KEY//', body, "the key must be escaped")
+
+
+class DocumentedKnobsExist(unittest.TestCase):
+    """The failure messages tell the operator to raise these in .env, so they
+    have to be findable there."""
+
+    def test_every_tunable_is_in_env_example(self):
+        path = os.path.join(ROOT, ".env.example")
+        with open(path) as fh:
+            body = fh.read()
+        for knob in ("BONSAI_SMOKE_TIMEOUT", "BONSAI_HEALTH_TIMEOUT",
+                     "BONSAI_SMOKE_SWEEP_MAX", "BONSAI_SMOKE_RETRY_SLEEP"):
+            self.assertIn(knob, body, f"{knob} is named in a warning but "
+                                      "documented nowhere")
+
+    def test_a_sweep_has_a_ceiling(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn("sweep_deadline", body,
+                      "without a ceiling the retry loop triples the worst "
+                      "case and systemd SIGTERMs a rollback midway")
+
+
 class BusyIsNotBroken(unittest.TestCase):
     """The router holds ONE model at a time (--models-max defaults to 1), so a
     request for a second alias while the first is busy is refused. Observed on
@@ -852,9 +1041,12 @@ class PinningIsNarrow(unittest.TestCase):
         """
         with open(UPDATE_SH) as fh:
             body = fh.read()
-        self.assertEqual(body.count("do_rollback pin"), 2,
+        # Both failure paths pass $pin_arg, which is "pin" only when this
+        # run actually moved the checkout — see PinsOnlyWhatThisRunMoved.
+        self.assertEqual(body.count('do_rollback "$pin_arg"'), 2,
                          "smoke failure and health failure pin; nothing else")
-        self.assertIn("do_rollback pin; exit 1; }", body)
+        self.assertNotIn("do_rollback pin", body,
+                         "pinning must be conditional, never unconditional")
         self.assertIn("never became healthy within", body)
 
     def test_infrastructure_failures_do_not_pin(self):
