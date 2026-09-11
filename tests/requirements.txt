@@ -1,0 +1,6 @@
+# The suite is stdlib-only except for this: tests/test_chat_template.py renders
+# the chat template and compares it against the one baked into the GGUF.
+#
+# Pinned because an unpinned install turns an unrelated PR red the day jinja2
+# ships a breaking release. Bump it deliberately.
+jinja2==3.1.6

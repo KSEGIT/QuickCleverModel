@@ -207,11 +207,17 @@ and writes `run/models.ini`, which is what the router reads. A new model is a ne
 section — the section name becomes the model id in the dropdown, because the
 router force-sets `--alias` to it (`server-models.cpp:154`).
 
-Two traps, both of which cost time here:
+Three traps, all of which cost time here:
 
 - **`mmproj` must be declared per-section.** On the router's own command line it
   is silently discarded (`unset_reserved_args(base_preset, true)`,
   `server-models.cpp:210`), and the model loses image input with no error.
+- **Set `chat-template-file` per section, never in `[*]`.** The Bonsai sections
+  point at `bonsai-chat-template.jinja`, which fixes a multi-system-message bug
+  that made every Codex request fail. `[*]` cascades onto every section and
+  `chat-template-file` overrides whatever template a GGUF carries, so a
+  non-Bonsai model added there would be rendered with Bonsai's ChatML tokens
+  and return silent garbage — no error, no warning.
 - **Do not add the `version = 1` line** that the fork's own README example shows.
   Any key before the first `[section]` header lands in a section named `default`
   (`preset.cpp:254`), which then inherits the `[*]` globals and appears in
