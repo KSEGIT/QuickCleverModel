@@ -2178,6 +2178,49 @@ class RollbackDoesNotEatLocalEdits(unittest.TestCase):
                           f"local edits were discarded, not stashed: {r.stderr}")
 
 
+class RollbackAvoidsNoOpRecreate(unittest.TestCase):
+    """A fully restored state must not evict the resident model just to retag it."""
+
+    def test_matching_checkout_and_image_tags_leave_the_stack_running(self):
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(["git", "init", "-q", d], check=True,
+                           capture_output=True)
+            subprocess.run(["git", "-C", d, "config", "user.email", "t@t"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", d, "config", "user.name", "t"],
+                           check=True, capture_output=True)
+            with open(os.path.join(d, "tracked"), "w") as fh:
+                fh.write("base\n")
+            subprocess.run(["git", "-C", d, "add", "-A"], check=True,
+                           capture_output=True)
+            subprocess.run(["git", "-C", d, "commit", "-qm", "base"],
+                           check=True, capture_output=True)
+            head = subprocess.run(["git", "-C", d, "rev-parse", "HEAD"],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write(f"sha={head}\nwebui=sha256:webui\n"
+                         "llama=sha256:llama\nverified=1\n")
+
+            setup = (
+                f'ROOT={shlex.quote(d)}; STATE={shlex.quote(state)}; '
+                'docker() { case "$1:$3" in '
+                'image:bonsai-llama:rollback) echo sha256:llama;; '
+                'image:bonsai-llama:cuda) echo sha256:llama;; '
+                'image:sha256:webui) return 0;; '
+                'image:ghcr.io/open-webui/open-webui:main) echo sha256:webui;; '
+                'tag:*) echo "TAG RAN";; esac; }; '
+                'compose() { echo "COMPOSE RAN"; }; '
+                'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+                'smoke() { return 0; }'
+            )
+            r = run_real(setup, 'do_rollback')
+
+            self.assertIn("rc=0", r.stdout, r.stderr)
+            self.assertNotIn("TAG RAN", r.stdout + r.stderr)
+            self.assertNotIn("COMPOSE RAN", r.stdout + r.stderr)
+
+
 class SweepDeadlineBoundsRetries(unittest.TestCase):
     def test_the_ceiling_is_checked_per_attempt(self):
         """Checked only between aliases, one alias's retry loop could run

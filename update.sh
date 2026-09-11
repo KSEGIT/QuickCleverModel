@@ -998,7 +998,7 @@ this run introduced, because the recorded point predates it"
     fi
   fi
 
-  local have
+  local have current
   have="$(docker image inspect "$ROLLBACK_IMAGE" --format '{{.Id}}' 2>/dev/null)"
   if [[ -z "$have" ]]; then
     warn "no $ROLLBACK_IMAGE to restore; keeping the current llama image"
@@ -1013,6 +1013,9 @@ this run introduced, because the recorded point predates it"
     # A stale tag would pair this commit's source with another commit's binary.
     warn "$ROLLBACK_IMAGE is ${have:0:19}, not the recorded ${llama:0:19} — not restoring it"
     restored=0
+  elif current="$(docker image inspect "$LLAMA_IMAGE" --format '{{.Id}}' 2>/dev/null)" \
+       && [[ "$current" == "$llama" ]]; then
+    log "$LLAMA_IMAGE already points to the recorded rollback image; leaving it alone"
   else
     if docker tag "$ROLLBACK_IMAGE" "$LLAMA_IMAGE"; then
       changed=1
@@ -1030,6 +1033,9 @@ this run introduced, because the recorded point predates it"
     # `docker system prune -a` on a timer is common and takes the old layers.
     warn "recorded open-webui image ${webui:0:19} is gone (pruned?); leaving the current one"
     restored=0
+  elif current="$(docker image inspect "$WEBUI_IMAGE" --format '{{.Id}}' 2>/dev/null)" \
+       && [[ "$current" == "$webui" ]]; then
+    log "$WEBUI_IMAGE already points to the recorded rollback image; leaving it alone"
   elif ! docker tag "$webui" "$WEBUI_IMAGE"; then
     warn "could not restore $WEBUI_IMAGE"
     restored=0
