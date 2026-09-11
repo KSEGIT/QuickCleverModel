@@ -559,6 +559,20 @@ print(d)
 PY
 }
 
+code_already_current() {
+  # True when HEAD already CONTAINS $1 — equal to it, or ahead of it with
+  # local commits on top.
+  #
+  # Comparing shas said "not current" whenever the checkout carried a local
+  # commit, so the run skipped its nothing-to-do exit, ran `git merge
+  # --ff-only` against an ancestor (git prints "Already up to date", HEAD does
+  # not move), then rebuilt, pulled, force-restarted and swept twice — every
+  # Monday, to change nothing — while logging "moving to <upstream-sha>" and
+  # arming the pin on a run that moved no code.
+  [[ -n "${1:-}" ]] || return 1
+  git -C "$ROOT" merge-base --is-ancestor "$1" HEAD 2>/dev/null
+}
+
 running_working_dir() {
   # Found by IMAGE, not by container name. COMPOSE_PROJECT_NAME in .env
   # overrides the compose file's `name: bonsai` and is passed through by
@@ -878,6 +892,15 @@ cmd_check() {
   fi
 
   local have want
+  if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+    # preflight only checked that the docker BINARY exists. With the daemon
+    # stopped, or the user not in the docker group, local_image_digest returns
+    # empty and the branch below claimed the image was missing — sending the
+    # operator to pull something already on disk. The neighbouring branch
+    # refuses to report from a comparison that did not happen; so does this.
+    warn "cannot reach the docker daemon; image drift unknown"
+    return 1
+  fi
   have="$(local_image_digest "$WEBUI_IMAGE")"
   want="$(remote_image_digest "$WEBUI_IMAGE")"
   if [[ -z "$have" ]]; then
@@ -920,14 +943,19 @@ cmd_update() {
   # upgrade or an OOM could leave every model dead while the timer logged
   # "nothing to do" and exited 0, week after week — and run/update-state was
   # never written, so --rollback had nothing to restore either.
-  local head_sha have want verified=0
+  local head_sha have want verified=0 pre_verdict
   head_sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   log "checking the current stack before changing anything"
-  if wait_for_health && smoke; then
-    verified=1
-  else
-    warn "the stack is not serving BEFORE this update — recording the rollback point as unverified"
-  fi
+  if wait_for_health; then smoke; pre_verdict=$?; else pre_verdict=1; fi
+  case "$pre_verdict" in
+    0) verified=1;;
+    2) # Could not ASK — a busy router, a rotated key. Not proof of anything,
+       # and in particular NOT proof the stack was broken.
+       warn "could not judge the stack before this update — recording the
+rollback point as unverified";;
+    *) warn "the stack is NOT serving before this update — recording the
+rollback point as unverified";;
+  esac
   record_rollback_point "$verified"
 
   # The pin check sits HERE, after the proof above, not before it. Placed
@@ -950,7 +978,7 @@ To try it again anyway:
   # stale ref and the merge is a no-op, but without this the run would still
   # rebuild, restart and sweep again. With --models-max 1 and three aliases
   # that is six cold 27B loads, every Monday, to prove nothing changed.
-  if [[ "$target" == "$head_sha" ]]; then
+  if code_already_current "$target"; then
     have="$(local_image_digest "$WEBUI_IMAGE")"
     want="$(remote_image_digest "$WEBUI_IMAGE")"
     # An unreadable registry digest is NOT a reason to rebuild and restart.
@@ -964,7 +992,7 @@ To try it again anyway:
     fi
     if [[ -n "$have" && -n "$want" && "$have" == "$want" ]]; then
       if (( verified )); then
-        log "already up to date (code ${head_sha:0:12}, images current) — nothing to do"
+        log "already up to date (code ${head_sha:0:12} contains ${target:0:12}, images current) — nothing to do"
         return 0
       fi
       warn "already up to date (code ${head_sha:0:12}, images current), but the
@@ -985,15 +1013,20 @@ it. See the warnings above."
   # never introduced — and every later run would refuse it. The docs promise
   # only the code gets blamed; this keeps that true.
   local pin_arg=""
-  if [[ "$target" != "$head_sha" ]]; then
+  if ! code_already_current "$target"; then
     pin_arg="pin"
-    if (( ! verified )); then
-      # The stack failed its check BEFORE this update touched anything, so a
-      # failure afterwards proves nothing about the new commit. A driver
-      # upgrade, an OOM, or weights that moved — every cause named above —
-      # would otherwise blacklist an innocent commit, and is_pinned_bad would
-      # then refuse every later run until something newer landed, while the
-      # real outage went untouched.
+    if (( pre_verdict == 1 )); then
+      # Only POSITIVE proof that the stack was already broken disarms the pin.
+      # A driver upgrade, an OOM, or weights that moved would otherwise
+      # blacklist an innocent commit, and is_pinned_bad would refuse every
+      # later run while the real outage went untouched.
+      #
+      # "Could not judge" (2) must NOT land here. Folding it in meant the
+      # timer firing at 04:00 while someone was chatting — the router answers
+      # "model limit reached" to every alias with --models-max 1 — disarmed
+      # the pin, so a genuinely crash-looping commit was rolled back unpinned
+      # and the box walked onto it again the next week, and the next. That is
+      # the exact loop the pin exists to break.
       warn "the stack was already failing before this update, so this run will
 not blame the new commit if it fails"
       pin_arg=""
@@ -1018,6 +1051,11 @@ not blame the new commit if it fails"
     # the update never introduced.
     if [[ -n "$pin_arg" ]]; then
       warn "build failed — undoing the code move; the running stack was not touched"
+      # do_rollback stashes before its reset for exactly this reason; the
+      # merge path had been left out. `git merge --ff-only` refuses only on
+      # COLLIDING paths, so an uncommitted edit to a file the commit does not
+      # touch reaches here alive and would be erased without a word.
+      stash_local_edits
       # Guarded by pin_arg, which is set only when the merge above actually
       # ran. Unconditional, this reset fired on image-only runs too — where
       # it reset to the commit already checked out and silently deleted any

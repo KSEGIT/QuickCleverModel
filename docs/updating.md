@@ -95,7 +95,7 @@ Four settings in `.env` control this. See `.env.example` for each one:
 | Setting | Default | What it bounds |
 |---|---|---|
 | `BONSAI_SMOKE_TIMEOUT` | 900s | One model's answer |
-| `BONSAI_SMOKE_SWEEP_MAX` | 3x the above | One whole sweep, retries included |
+| `BONSAI_SMOKE_SWEEP_MAX` | 4x the above | One whole sweep, retries included |
 | `BONSAI_HEALTH_TIMEOUT` | 180s | Waiting for `/health` after a restart |
 | `BONSAI_SMOKE_RETRY_SLEEP` | 15s | Backoff when the router says it is busy |
 

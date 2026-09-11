@@ -721,7 +721,12 @@ class PinsOnlyWhatThisRunMoved(unittest.TestCase):
     def _run(self, head, target, have="sha256:old", want="sha256:new"):
         setup = (
             f'{self.BASE}; '
-            f'git() {{ case "$*" in *"rev-parse HEAD"*) echo {head};; '
+            # merge-base --is-ancestor is what decides "did the code
+            # move", so the stub has to answer it: ancestor (0) when HEAD
+            # already carries target, not-an-ancestor (1) on a real move.
+            f'git() {{ case "$*" in '
+            f'*"merge-base --is-ancestor"*) [ "{head}" = "{target}" ]; return $?;; '
+            f'*"rev-parse HEAD"*) echo {head};; '
             f'*rev-parse*) echo {target};; *merge*) return 0;; esac; return 0; }}; '
             f'local_image_digest() {{ echo {have}; }}; '
             f'remote_image_digest() {{ echo {want}; }}'
@@ -749,15 +754,17 @@ class AlreadyBrokenDoesNotBlameTheCommit(unittest.TestCase):
     something newer landed, while the real outage went untouched."""
 
     def _run(self, pre_ok, post_ok, head="OLD", target="NEW"):
-        pre = "0" if pre_ok else "1"
-        post = "0" if post_ok else "1"
+        pre = pre_ok if isinstance(pre_ok, str) else ("0" if pre_ok else "1")
+        post = post_ok if isinstance(post_ok, str) else ("0" if post_ok else "1")
         setup = (
             'preflight() { :; }; take_lock() { :; }; docker() { return 0; }; '
             'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
             'wait_for_health() { return 0; }; compose() { return 0; }; '
             'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }; '
             f'N=0; smoke() {{ N=$((N+1)); [ "$N" = 1 ] && return {pre}; return {post}; }}; '
-            f'git() {{ case "$*" in *"rev-parse HEAD"*) echo {head};; '
+            f'git() {{ case "$*" in '
+            f'*"merge-base --is-ancestor"*) [ "{head}" = "{target}" ]; return $?;; '
+            f'*"rev-parse HEAD"*) echo {head};; '
             f'*rev-parse*) echo {target};; esac; return 0; }}; '
             'local_image_digest() { echo a; }; remote_image_digest() { echo b; }'
         )
@@ -775,6 +782,99 @@ class AlreadyBrokenDoesNotBlameTheCommit(unittest.TestCase):
         out = self._run(pre_ok=True, post_ok=False)
         self.assertIn("ROLLBACK pin=[pin]", out,
                       "the update genuinely broke a working stack")
+
+    def test_could_not_judge_beforehand_still_pins(self):
+        """rc=2 is "could not ask", not "proven broken", and folding it in
+        recreated the weekly-outage loop: the timer fires at 04:00 while
+        someone is chatting, the router answers "model limit reached" to every
+        alias with --models-max 1, smoke returns 2 — and a genuinely
+        crash-looping commit was then rolled back UNPINNED, so the box walked
+        onto it again the next week, and the next."""
+        out = self._run(pre_ok="2", post_ok=False)
+        self.assertIn("ROLLBACK pin=[pin]", out,
+                      "an unjudgeable pre-check must not disarm the pin")
+        self.assertIn("could not judge the stack before", out,
+                      "and must not claim the stack was not serving")
+
+    def test_the_message_matches_what_was_actually_observed(self):
+        out = self._run(pre_ok=False, post_ok=False)
+        self.assertIn("is NOT serving before", out)
+        self.assertNotIn("could not judge the stack before", out)
+
+
+class HeadAheadOfUpstreamIsCurrent(unittest.TestCase):
+    """Comparing shas said "not current" whenever the checkout carried a local
+    commit on top of @{u}. The run then merged an ANCESTOR (git prints
+    "Already up to date", HEAD does not move), rebuilt, pulled, force-restarted
+    and swept twice — every Monday, to change nothing — while logging "moving
+    to <upstream-sha>" and arming the pin on a run that moved no code."""
+
+    def _current(self, ancestor_rc):
+        setup = (
+            f'ROOT=/tmp; git() {{ case "$*" in '
+            f'*"merge-base --is-ancestor"*) return {ancestor_rc};; '
+            'esac; return 0; }'
+        )
+        r = run_real(setup, 'code_already_current abc123')
+        return "rc=0" in r.stdout
+
+    def test_head_containing_the_target_counts_as_current(self):
+        self.assertTrue(self._current(0))
+
+    def test_a_target_not_in_head_is_a_real_move(self):
+        self.assertFalse(self._current(1))
+
+    def test_it_uses_ancestry_not_sha_equality(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn("merge-base --is-ancestor", body)
+        self.assertIn("code_already_current", body)
+        self.assertNotIn('[[ "$target" == "$head_sha" ]]', body)
+        self.assertNotIn('[[ "$target" != "$head_sha" ]]', body)
+
+
+class BuildFailureStashesToo(unittest.TestCase):
+    def test_the_merge_path_stashes_before_resetting(self):
+        """do_rollback stashes before its reset for exactly this reason; the
+        merge path had been left out. `git merge --ff-only` refuses only on
+        COLLIDING paths, so an uncommitted edit to an untouched file reaches
+        the build failure alive and would be erased without a word."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        section = body[body.index("if ! compose build llama; then"):
+                       body.index('log "pulling open-webui"')]
+        self.assertIn("stash_local_edits", section)
+        self.assertLess(section.index("stash_local_edits"),
+                        section.index("reset --hard"),
+                        "the stash must happen before the reset")
+
+
+class CheckDoesNotGuessAboutTheDaemon(unittest.TestCase):
+    def test_an_unreachable_daemon_is_reported_as_unknown(self):
+        """preflight only checks the docker BINARY. With the daemon stopped,
+        or the user not in the docker group, local_image_digest returns empty
+        and --check claimed the image was missing — sending the operator to
+        pull something already on disk."""
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        section = body[body.index("cmd_check() {"):body.index("cmd_update() {")]
+        self.assertIn("cannot reach the docker daemon", section)
+        self.assertLess(section.index("cannot reach the docker daemon"),
+                        section.index("not present locally"),
+                        "the daemon check must come first")
+
+
+class DocsQuoteTheRealDefaults(unittest.TestCase):
+    def test_the_sweep_default_matches_the_code(self):
+        """An operator sizing TimeoutStartSec from the table under-budgeted by
+        900s per sweep, and that unit exists to avoid SIGTERM mid-rollback."""
+        with open(os.path.join(ROOT, "docs", "updating.md")) as fh:
+            docs = fh.read()
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        multiplier = "4" if "CHAT_TIMEOUT * 4" in body else "3"
+        self.assertIn(f"| `BONSAI_SMOKE_SWEEP_MAX` | {multiplier}x the above |",
+                      docs, "the docs table disagrees with the code default")
 
 
 class RollbackDoesNotEatLocalEdits(unittest.TestCase):
@@ -1176,7 +1276,9 @@ class NothingToDoIsCheap(unittest.TestCase):
 
     STUBS = (
         'preflight() { :; }; take_lock() { :; }; '
-        'git() { case "$*" in *"rev-parse HEAD"*) echo SAMECOMMIT;; '
+        'git() { case "$*" in '
+        '*"merge-base --is-ancestor"*) return 0;; '
+        '*"rev-parse HEAD"*) echo SAMECOMMIT;; '
         '*rev-parse*) echo SAMECOMMIT;; esac; return 0; }; '
         'docker() { return 0; }; '
         'is_pinned_bad() { return 1; }; '
