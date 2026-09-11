@@ -7,13 +7,16 @@ Linux and Docker only. On macOS, run `git pull` then `make restart`.
 1. **Checks first.** It stops if a tool it needs is missing, if the weights
    are missing, if `.env` is missing, or if a stack is already running from a
    different folder.
-2. **Refuses a commit that already failed.** See "The bad commit pin" below.
-3. **Tests the stack before changing it.** This proves the state it is about
-   to save really works.
-4. **Saves a way back.** It writes the commit to `run/update-state` with
-   `verified=1` if step 3 passed, and gives the current image a second name,
+2. **Tests the stack before changing it.** This proves the state it is about
+   to save really works. It happens before every other decision on purpose:
+   it is the only weekly check a machine that never changes ever gets.
+3. **Saves a way back.** It writes the commit to `run/update-state` with
+   `verified=1` if step 2 passed, and gives the current image a second name,
    `bonsai-llama:rollback`.
-5. **Updates.** Fetch, move to the commit it checked in step 2 with
+4. **Refuses a commit that already failed.** See "The bad commit pin" below.
+   This comes after the test above, not before it, so a machine with a pinned
+   commit still gets checked every week.
+5. **Updates.** Fetch, move to the commit it checked in step 4 with
    `git merge --ff-only`, rebuild the llama image, pull Open WebUI, restart.
 6. **Proves it works.** It asks every model in `/v1/models` for a short
    answer.

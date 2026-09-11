@@ -853,6 +853,78 @@ class KeyEncodingSurvivesOddCharacters(unittest.TestCase):
         self.assertIn('esc="${BONSAI_API_KEY//', body, "the key must be escaped")
 
 
+class AwkwardAliasesDoNotFakeAnOutage(unittest.TestCase):
+    """Aliases come from /v1/models and, per models.ini.in, are ini section
+    names — free-form operator-editable text. Interpolated straight into a
+    JSON string, one containing a quote or a backslash produced malformed
+    JSON, the server answered 400, and smoke_ok scored that as a dead model:
+    roll back AND pin the commit."""
+
+    def _body(self, alias):
+        # ':' not '': run_real joins setup and call with ';', and an empty
+        # setup would leave a leading ';' — a bash syntax error.
+        r = run_real(':', f'smoke_body {shlex.quote(alias)}')
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        # run_real appends an "rc=" line; the JSON is everything before it.
+        return r.stdout.rsplit("rc=", 1)[0].strip()
+
+    def test_a_quote_in_an_alias_still_yields_valid_json(self):
+        alias = 'we"ird'
+        parsed = json.loads(self._body(alias))
+        self.assertEqual(parsed["model"], alias)
+
+    def test_a_backslash_in_an_alias_still_yields_valid_json(self):
+        alias = "back\\slash"
+        parsed = json.loads(self._body(alias))
+        self.assertEqual(parsed["model"], alias)
+
+    def test_an_ordinary_alias_is_unchanged(self):
+        parsed = json.loads(self._body("bonsai-27b-ternary"))
+        self.assertEqual(parsed["model"], "bonsai-27b-ternary")
+        self.assertEqual(parsed["max_tokens"], 8)
+
+    def test_the_body_is_not_hand_interpolated(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        self.assertIn('-d "$(smoke_body "$id")"', body)
+        self.assertNotIn('\\"model\\":\\"$id\\"', body)
+
+
+class BuildFailureUndoesOnlyItsOwnMove(unittest.TestCase):
+    """`git merge --ff-only` refuses only when local edits collide with the
+    merged files, so uncommitted edits to untouched files survive the merge.
+    An unconditional `git reset --hard` after a failed build then destroyed
+    them — on image-only runs it reset to the commit already checked out, so
+    it could only ever delete work, never undo anything."""
+
+    def test_the_reset_is_guarded_by_an_actual_move(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        section = body[body.index("if ! compose build llama; then"):
+                       body.index("log \"pulling open-webui\"")]
+        self.assertIn('if [[ -n "$pin_arg" ]]; then', section,
+                      "the reset must only run when this run actually merged")
+        self.assertIn("nothing to undo", section,
+                      "and must say so plainly when it did not")
+        reset_at = section.index("reset --hard")
+        guard_at = section.index('if [[ -n "$pin_arg" ]]')
+        self.assertLess(guard_at, reset_at, "the guard must precede the reset")
+
+
+class DocsMatchTheCode(unittest.TestCase):
+    def test_the_pin_check_is_documented_after_the_stack_test(self):
+        """The doc used to list the pin refusal before the pre-update check.
+        An operator reading it would conclude a pinned box gets no weekly
+        check — the exact thing the code was changed to avoid."""
+        with open(os.path.join(ROOT, "docs", "updating.md")) as fh:
+            body = fh.read()
+        tests_at = body.index("**Tests the stack before changing it.**")
+        pin_at = body.index("**Refuses a commit that already failed.**")
+        self.assertLess(tests_at, pin_at,
+                        "docs list the pin check before the stack test, but "
+                        "cmd_update runs it after")
+
+
 class DocumentedKnobsExist(unittest.TestCase):
     """The failure messages tell the operator to raise these in .env, so they
     have to be findable there."""

@@ -200,6 +200,19 @@ ask() {
   return "$rc"
 }
 
+smoke_body() {
+  # Aliases come from /v1/models, and per models.ini.in they are ini section
+  # names — free-form operator-editable text. Interpolating one straight into
+  # a JSON string meant an alias containing " or \ produced malformed JSON,
+  # the server answered 400, and smoke_ok scored that as a dead model: roll
+  # back AND pin the commit. Exactly the fake outage the 401/403 and
+  # transient_reply arms exist to prevent.
+  python3 -c 'import json, sys
+print(json.dumps({"model": sys.argv[1],
+                  "messages": [{"role": "user", "content": "say OK"}],
+                  "max_tokens": 8}))' "$1"
+}
+
 transient_reply() {
   # Momentary router answers that say nothing about the commit.
   #
@@ -259,8 +272,7 @@ smoke() {
     for attempt in 1 2 3; do
       busy=0
       ask "$API/v1/chat/completions" -m "$CHAT_TIMEOUT" \
-        -H "Content-Type: application/json" \
-        -d "{\"model\":\"$id\",\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}],\"max_tokens\":8}"; rc=$?
+        -H "Content-Type: application/json" -d "$(smoke_body "$id")"; rc=$?
       if (( rc != 0 )); then
         # /health answering does not mean a model is loaded: in router mode
         # the first request carries the whole cold load. A timeout is
@@ -911,9 +923,21 @@ it. See the warnings above."
     # also reset to the recorded sha, which after a "kept the proven point"
     # run can be older than where this run started, rewinding past commits
     # the update never introduced.
-    warn "build failed — undoing the code move; the running stack was not touched"
-    git -C "$ROOT" reset --hard "$head_sha" >/dev/null 2>&1 \
-      || warn "could not undo the merge; the checkout is left on ${target:0:12}"
+    if [[ -n "$pin_arg" ]]; then
+      warn "build failed — undoing the code move; the running stack was not touched"
+      # Guarded by pin_arg, which is set only when the merge above actually
+      # ran. Unconditional, this reset fired on image-only runs too — where
+      # it reset to the commit already checked out and silently deleted any
+      # uncommitted work in the tree. `git merge --ff-only` refuses only when
+      # local edits collide with the merged files, so edits to untouched
+      # files survive the merge and were then destroyed here. That is the
+      # opposite of what docs/updating.md promises.
+      git -C "$ROOT" reset --hard "$head_sha" >/dev/null 2>&1 \
+        || warn "could not undo the merge; the checkout is left on ${target:0:12}"
+    else
+      warn "build failed — nothing to undo: this run moved no code and did not
+touch the running stack"
+    fi
     exit 1
   fi
 

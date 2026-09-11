@@ -27,17 +27,27 @@ ExecStart=__ROOT__/update.sh
 # Budget. A smoke sweep is bounded by BONSAI_SMOKE_SWEEP_MAX (default 3 x
 # BONSAI_SMOKE_TIMEOUT = 2700s) plus at most one request already in flight
 # when the deadline passes, so 3600s covers a sweep INCLUDING its retries —
-# without that ceiling the per-alias retry loop tripled the worst case and
-# systemd would have sent SIGTERM in the middle of a rollback.
-#   compose build llama   up to 2700s  (Dockerfile builds llama.cpp + CUDA)
+# without that ceiling the per-alias retry loop tripled the worst case.
+#
+# Every term the run actually executes, in order. An earlier version of this
+# comment omitted the pre-update health wait, the registry pull and the
+# restart, and left only ~540s of slack for a multi-GB GHCR pull — so a
+# throttled link on a run that also had to roll back would have taken SIGTERM
+# mid-rollback, the one thing this timeout exists to prevent.
+#   wait_for_health (pre)        180s
 #   smoke before update         3600s
-#   wait_for_health              180s
+#   compose build llama   up to 2700s  (Dockerfile builds llama.cpp + CUDA)
+#   compose pull open-webui     1800s  (multi-GB, throttled link)
+#   compose up -d                600s
+#   wait_for_health (post)       180s
 #   smoke after update          3600s
-#   rollback: health + smoke    3780s
+#   rollback: up + health + smoke
+#                               4380s
 #                              -------
-#                              13860s
-# Raising BONSAI_SMOKE_TIMEOUT or BONSAI_SMOKE_SWEEP_MAX means raising this.
-TimeoutStartSec=14400
+#                              17040s
+# 21600 leaves headroom without letting a wedged run sit all day. Raising
+# BONSAI_SMOKE_TIMEOUT or BONSAI_SMOKE_SWEEP_MAX means raising this too.
+TimeoutStartSec=21600
 
 # Deprioritizes THIS unit: the git work, the smoke sweeps and the compose
 # client. It does NOT reach the image build — `docker compose build` only
