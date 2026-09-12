@@ -39,6 +39,10 @@ fi
 HOST="${BONSAI_HOST:-0.0.0.0}"
 PORT="${BONSAI_PORT:-8080}"
 CTX="${BONSAI_CTX:-32768}"   # model trains to 262144; that KV cache will not fit in 24 GB
+# The text-only preset can usually afford more context than the vision ones:
+# no mmproj, and it is the preset coding agents use, where long conversations
+# are the norm. Defaults to CTX, so this changes nothing unless you set it.
+CTX_TEXT="${BONSAI_CTX_TEXT:-$CTX}"
 
 # Keep ONE model resident and swap on selection. Switching in the UI unloads
 # the current child and loads the other from disk, measured at +4-5s because the
@@ -60,6 +64,7 @@ PRESET="$ROOT/run/models.ini"
 mkdir -p "$ROOT/run"
 sed -e "s|@ROOT@|$ROOT|g" \
     -e "s|@CTX@|$CTX|g" \
+    -e "s|@CTX_TEXT@|$CTX_TEXT|g" \
     -e "s|@NKVO@|${BONSAI_NO_KV_OFFLOAD:-false}|g" \
     -e "s|@PARALLEL@|${BONSAI_PARALLEL:-1}|g" \
     -e "s|@SPEC@|${BONSAI_SPEC:-ngram-simple}|g" \
@@ -76,7 +81,7 @@ sed -e "s|@ROOT@|$ROOT|g" \
 
 echo "server : $SERVER (router)"
 echo "preset : $PRESET"
-echo "listen : http://$HOST:$PORT  (ctx=$CTX, models-max=$MODELS_MAX)"
+echo "listen : http://$HOST:$PORT  (ctx=$CTX, text-ctx=$CTX_TEXT, models-max=$MODELS_MAX)"
 
 # No -m: that is what selects router mode. No --mmproj either — it would be
 # discarded here and must live in the preset sections.
