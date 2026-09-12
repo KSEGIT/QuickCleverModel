@@ -265,6 +265,7 @@ docs/architecture.md                system architecture (both platforms, request
 docs/decisions.md                   design decisions and why
 docs/tuning.md                      measured performance tuning
 docs/macos.md                       this file — macOS operations
+docs/codex.md                       Codex CLI against this server
 docker/compose.yaml                 containerised UI, parked pending Docker fix
 docker/Dockerfile                   CUDA llama-server build (Linux + NVIDIA)
 docker/compose.linux.yaml           full Linux/NVIDIA stack (llama + webui)
