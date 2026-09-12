@@ -93,4 +93,12 @@ load-on-startup = false
 [bonsai-27b-ternary-text]
 model = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-Q2_0.gguf
 chat-template-file = @ROOT@/bonsai-chat-template.jinja
+; Its own context, set by BONSAI_CTX_TEXT and defaulting to BONSAI_CTX.
+; Measured on a 3070 Ti (8 GB), weights on the GPU, KV in system RAM:
+; 131072 loads here with ~230 MiB of VRAM to spare, because the compute
+; buffer grows with context. The vision presets need ~600 MiB more on top
+; of that and cudaMalloc fails, which is why this is per-section and not
+; in [*]. KV itself is host-side: ~136 KiB/token, so 128k costs ~17 GiB
+; of RAM. Raise [*] c instead if your card has room for all three.
+c = @CTX_TEXT@
 load-on-startup = false

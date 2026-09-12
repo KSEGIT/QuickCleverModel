@@ -156,6 +156,28 @@ class Wiring(unittest.TestCase):
             "overriding that model's own template with Bonsai's ChatML",
         )
 
+    def test_text_preset_has_its_own_context_knob(self):
+        """128k fits without mmproj; the vision presets OOM on an 8 GB card."""
+        sections = parse_models_ini(read(MODELS_INI))
+        self.assertEqual(
+            "@CTX_TEXT@",
+            sections["bonsai-27b-ternary-text"].get("c"),
+            "the text preset must take its context from BONSAI_CTX_TEXT",
+        )
+        for vision in ("bonsai-27b-ternary", "bonsai-27b-1bit"):
+            self.assertNotIn(
+                "c",
+                sections[vision],
+                f"[{vision}] must inherit [*] c -- it cannot afford the text "
+                "preset's context",
+            )
+
+    def test_start_server_substitutes_the_text_context(self):
+        """A placeholder with no sed rule would reach llama-server verbatim."""
+        script = read(os.path.join(ROOT, "start-server.sh"))
+        self.assertIn("@CTX_TEXT@|$CTX_TEXT", script)
+        self.assertIn('CTX_TEXT="${BONSAI_CTX_TEXT:-$CTX}"', script)
+
     def test_the_raise_is_gone(self):
         # assertNotIn would dump all 7 KB of template into the failure report.
         self.assertFalse(
