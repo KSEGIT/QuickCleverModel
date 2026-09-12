@@ -31,6 +31,18 @@
 #
 # MCP servers (e.g. Playwright) are a separate concern — add them to the
 # config yourself, see https://opencode.ai/docs/mcp-servers/
+#
+# Your `mcp` block survives re-runs. It did not always: this script rendered the
+# whole document from its own template, so every run deleted the servers this
+# header tells you to add, and --check then called them drift. Keys outside the
+# `provider`/`model` pair it owns are now carried across (PRESERVED_KEYS).
+#
+# Worth knowing if you came here from Codex: opencode is the way to drive MCP
+# servers against this stack. Codex sends each MCP server as one tool of
+# `type: "namespace"` with the real tools nested inside, which llama.cpp does
+# not implement, so the model cannot call them — measured, same tool flat gets
+# called and namespaced does not. opencode sends them flat
+# (playwright_browser_navigate and friends) and they work.
 set -euo pipefail
 
 MODE="write"
@@ -244,6 +256,31 @@ except Exception:
   fi
 fi
 
+# The text-only preset can carry a bigger context than the vision ones (see
+# models.ini.in), so one number for all three would either reject long requests
+# against the text model or compact it away early. Ask about that model
+# specifically; fall back to the shared CTX when it cannot be reached.
+TEXT_MODEL="bonsai-27b-ternary-text"
+if [[ -n "${BONSAI_CTX_TEXT:-}" ]]; then
+  CTX_TEXT="$BONSAI_CTX_TEXT"
+  CTX_TEXT_SOURCE="BONSAI_CTX_TEXT in .env"
+else
+  CTX_TEXT="$(curl -s -m 5 -H "Authorization: Bearer $API_KEY" \
+           "${BASE_URL%/v1}/props?model=$TEXT_MODEL" 2>/dev/null \
+         | python3 -c 'import sys,json
+try:
+    n = json.load(sys.stdin).get("default_generation_settings", {}).get("n_ctx")
+    print(n if isinstance(n, int) and n > 0 else "")
+except Exception:
+    print("")' 2>/dev/null || true)"
+  if [[ -n "$CTX_TEXT" ]]; then
+    CTX_TEXT_SOURCE="the server ($BASE_URL)"
+  else
+    CTX_TEXT="$CTX"
+    CTX_TEXT_SOURCE="same as the shared context"
+  fi
+fi
+
 # Render and compare in Python: a shell heredoc cannot escape these values, so
 # a context of "32k" or a key containing a quote silently produced invalid JSON
 # while the script reported success. json.dump cannot.
@@ -254,7 +291,7 @@ trap 'rm -f "$PYHELPER"' EXIT
 cat > "$PYHELPER" <<'PYEOF'
 import hashlib, json, os, sys
 
-mode, cfg_path, base_url, ctx_raw, ctx_source = sys.argv[1:6]
+mode, cfg_path, base_url, ctx_raw, ctx_source, ctx_text_raw = sys.argv[1:7]
 api_key = sys.stdin.read()
 
 try:
@@ -264,7 +301,19 @@ try:
 except ValueError:
     sys.exit(f"err  context must be a positive integer, got {ctx_raw!r} (from {ctx_source})")
 
+try:
+    ctx_text = int(ctx_text_raw)
+    if ctx_text <= 0:
+        raise ValueError
+except ValueError:
+    sys.exit(f"err  text context must be a positive integer, got {ctx_text_raw!r}")
+
 MODELS = ("bonsai-27b-1bit", "bonsai-27b-ternary", "bonsai-27b-ternary-text")
+TEXT_MODEL = "bonsai-27b-ternary-text"
+# Top-level keys this script does not own. opencode keeps MCP servers here,
+# and rewriting the file from `expected` alone silently deleted them.
+PRESERVED_KEYS = ("mcp", "agent", "instructions", "permission", "keybinds",
+                  "formatter", "lsp", "theme", "share", "autoupdate", "plugin")
 expected = {
     "$schema": "https://opencode.ai/config.json",
     "provider": {
@@ -272,7 +321,11 @@ expected = {
             "npm": "@ai-sdk/openai-compatible",
             "name": "Bonsai local",
             "options": {"baseURL": base_url, "apiKey": api_key},
-            "models": {m: {"name": m, "limit": {"context": ctx, "output": 4096}}
+            # The text preset gets its own context: it is the agent/coding
+            # preset and models.ini.in lets it run larger than the vision ones.
+            "models": {m: {"name": m,
+                           "limit": {"context": ctx_text if m == TEXT_MODEL else ctx,
+                                     "output": 4096}}
                        for m in MODELS},
         }
     },
@@ -302,6 +355,10 @@ if mode == "check":
         clone = json.loads(json.dumps(doc))
         for m in clone.get("provider", {}).get("bonsai", {}).get("models", {}).values():
             m.get("limit", {}).pop("context", None)
+        # Keys this script does not own are not drift. Without this, adding the
+        # `mcp` block the header tells you to add reported the config as broken.
+        for key in PRESERVED_KEYS:
+            clone.pop(key, None)
         return clone
 
     drift, notes = [], []
@@ -316,8 +373,9 @@ if mode == "check":
         drift.append(f"models: config has {sorted(a_models)}, expected {sorted(MODELS)}")
     for name in sorted(set(a_models) & set(MODELS)):
         got = a_models[name].get("limit", {}).get("context")
-        if got != ctx:
-            msg = f"{name}: context {got}, {ctx_source} says {ctx}"
+        want = ctx_text if name == TEXT_MODEL else ctx
+        if got != want:
+            msg = f"{name}: context {got}, {ctx_source} says {want}"
             (drift if ctx_explicit else notes).append(msg)
 
     if strip_ctx(actual) != strip_ctx(expected):
@@ -349,10 +407,27 @@ if mode == "check":
 # Write mode. umask before creating: chmod after the fact leaves a window in
 # which a file containing the API key is world-readable.
 os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+
+# Carry over the keys this script does not own. Writing `expected` alone wiped
+# out any `mcp` block -- the very thing the header tells you to add by hand --
+# on every run, with no warning.
+document = dict(expected)
+try:
+    with open(cfg_path) as fh:
+        previous = json.load(fh)
+    if isinstance(previous, dict):
+        kept = [k for k in PRESERVED_KEYS if k in previous]
+        for k in kept:
+            document[k] = previous[k]
+        if kept:
+            print(f"note  kept your {', '.join(kept)} from the existing config")
+except (OSError, ValueError):
+    pass  # no readable config yet: nothing to preserve
+
 old = os.umask(0o077)
 try:
     with open(cfg_path, "w") as fh:
-        json.dump(expected, fh, indent=2)
+        json.dump(document, fh, indent=2)
         fh.write("\n")
 finally:
     os.umask(old)
@@ -366,7 +441,7 @@ else
   info "writing $CONFIG ($BASE_URL, context $CTX from $CTX_SOURCE)"
 fi
 
-printf '%s' "$API_KEY" | python3 "$PYHELPER" "$MODE" "$CONFIG" "$BASE_URL" "$CTX" "$CTX_SOURCE"
+printf '%s' "$API_KEY" | python3 "$PYHELPER" "$MODE" "$CONFIG" "$BASE_URL" "$CTX" "$CTX_SOURCE" "$CTX_TEXT"
 RC=$?
 [[ "$MODE" == check ]] && exit $RC
 
