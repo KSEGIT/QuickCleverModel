@@ -21,18 +21,33 @@ Three things must be true.
 Check all three at once:
 
 ```bash
+# Missing key: 401
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"bonsai-27b-ternary-text","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+  http://100.x.y.z:8080/v1/responses
+
+# Invalid key: 401
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H 'Authorization: Bearer not-the-bonsai-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"bonsai-27b-ternary-text","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+  http://100.x.y.z:8080/v1/responses
+
+# Valid key: 200
 curl -sS -o /dev/null -w '%{http_code}\n' \
   -H "Authorization: Bearer $BONSAI_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"bonsai-27b-ternary-text","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
-  http://100.x.y.z:8080/v1/chat/completions
+  http://100.x.y.z:8080/v1/responses
 ```
 
-`200` and you are ready. `401` means the key is wrong.
+The three calls should return `401`, `401`, and `200`, respectively. `200` and
+you are ready.
 
 **Do not test with `/v1/models`.** That route answers without a key, so it
 returns `200` even when your key is wrong, and it will tell you the setup works
-when it does not. Only `/v1/chat/completions` checks the key.
+when it does not. Use `/v1/responses` to check the key for this Codex setup.
 
 ## Configure it
 
@@ -69,10 +84,12 @@ Two traps here:
 
 ## Run it
 
-Codex reads the key from the environment, so export it first:
+Codex reads the key from the environment. On the client, keep only this key in
+a client-side environment file, then export it:
 
 ```bash
-set -a && . ./.env && set +a       # from the repo root
+BONSAI_ENV_FILE="$HOME/.config/bonsai.env" # contains only BONSAI_API_KEY=...
+set -a && . "$BONSAI_ENV_FILE" && set +a
 codex -p bonsai                    # interactive
 codex exec -p bonsai 'your prompt' # one-shot
 ```
@@ -82,7 +99,9 @@ avoid exporting it every session, put `export BONSAI_API_KEY=...` in your
 `~/.zshrc`, or wrap it:
 
 ```bash
-bonsai() { (cd ~/Source/models && set -a && . ./.env && set +a && codex -p bonsai "$@"); }
+BONSAI_REPO=/path/to/QuickCleverModel
+BONSAI_ENV_FILE="$HOME/.config/bonsai.env"
+bonsai() { (cd "$BONSAI_REPO" && set -a && . "$BONSAI_ENV_FILE" && set +a && codex -p bonsai "$@"); }
 ```
 
 ## Which model
