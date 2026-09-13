@@ -32,7 +32,10 @@ set +a
 # SERVER binds, never a connect target, and 0.0.0.0 is a wildcard nobody dials.
 if [[ -n "${BONSAI_SERVER_URL:-}" ]]; then
   # Claude Code appends /v1 itself; a base ending in /v1 yields /v1/v1/messages.
-  BASE_URL="${BONSAI_SERVER_URL%/v1}"
+  # Strip any trailing slashes first, or a URL written .../v1/ keeps its /v1.
+  BASE_URL="${BONSAI_SERVER_URL%"${BONSAI_SERVER_URL##*[!/]}"}"
+  BASE_URL="${BASE_URL%/v1}"
+  BASE_URL="${BASE_URL%"${BASE_URL##*[!/]}"}"
 else
   CONNECT_HOST="${BONSAI_HOST:-127.0.0.1}"
   [[ "$CONNECT_HOST" == "0.0.0.0" ]] && CONNECT_HOST=127.0.0.1

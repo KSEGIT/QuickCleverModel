@@ -24,21 +24,21 @@ Check all three at once:
 # Missing key: 401
 curl -sS -o /dev/null -w '%{http_code}\n' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"bonsai-27b-ternary-text","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+  -d '{"model":"bonsai-27b-ternary-text","input":"hi","max_output_tokens":1}' \
   http://100.x.y.z:8080/v1/responses
 
 # Invalid key: 401
 curl -sS -o /dev/null -w '%{http_code}\n' \
   -H 'Authorization: Bearer not-the-bonsai-key' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"bonsai-27b-ternary-text","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+  -d '{"model":"bonsai-27b-ternary-text","input":"hi","max_output_tokens":1}' \
   http://100.x.y.z:8080/v1/responses
 
 # Valid key: 200
 curl -sS -o /dev/null -w '%{http_code}\n' \
   -H "Authorization: Bearer $BONSAI_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"bonsai-27b-ternary-text","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+  -d '{"model":"bonsai-27b-ternary-text","input":"hi","max_output_tokens":1}' \
   http://100.x.y.z:8080/v1/responses
 ```
 

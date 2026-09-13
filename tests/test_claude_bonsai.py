@@ -84,6 +84,14 @@ class BaseUrlTest(Harness):
                        BONSAI_SERVER_URL="http://10.1.2.3:8080/v1")
         self.assertEqual("http://10.1.2.3:8080", self.handed()["BASE"])
 
+    def test_a_trailing_slash_does_not_survive(self):
+        """.../v1/ kept its /v1 and produced /v1/v1/messages."""
+        for written in ("http://10.1.2.3:8080/v1/", "http://10.1.2.3:8080/v1//",
+                        "http://10.1.2.3:8080/"):
+            with self.subTest(url=written):
+                self.write_env(BONSAI_API_KEY=KEY, BONSAI_SERVER_URL=written)
+                self.assertEqual("http://10.1.2.3:8080", self.handed()["BASE"])
+
     def test_defaults_to_localhost(self):
         self.write_env(BONSAI_API_KEY=KEY)
         self.assertEqual("http://127.0.0.1:8080", self.handed()["BASE"])
