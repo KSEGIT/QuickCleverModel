@@ -69,6 +69,9 @@ Never use `0.0.0.0` unless you mean to share with the whole office LAN.
 From another machine, the API is now at `http://100.x.y.z:8080/v1` — point any
 OpenAI-compatible tool there (OpenCode, Aider, scripts) with your
 `BONSAI_API_KEY`. More detail: [docs/architecture.md](docs/architecture.md#ports--security).
+For Codex CLI specifically, see [docs/codex.md](docs/codex.md); for Claude
+Code, [docs/claude-code.md](docs/claude-code.md) — it is the one that can also
+use MCP servers such as Playwright.
 
 ## Using it
 
@@ -142,6 +145,8 @@ On macOS, update by hand: `git pull` then `make restart`.
 - [docs/tuning.md](docs/tuning.md) — speed numbers measured on this machine.
 - [docs/macos.md](docs/macos.md) — setup and day-to-day use on a Mac.
 - [docs/updating.md](docs/updating.md) — how updates and the weekly timer work.
+- [docs/codex.md](docs/codex.md) — using Codex CLI with this server as the model.
+- [docs/claude-code.md](docs/claude-code.md) — same for Claude Code, which also gets MCP.
 
 ## License
 
