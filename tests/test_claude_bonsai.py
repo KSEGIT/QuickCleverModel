@@ -49,6 +49,11 @@ class Harness(unittest.TestCase):
                 'echo "MODEL=$ANTHROPIC_MODEL"\n'
                 'echo "HAIKU=$ANTHROPIC_DEFAULT_HAIKU_MODEL"\n'
                 'echo "CTX=$CLAUDE_CODE_MAX_CONTEXT_TOKENS"\n'
+                'echo "SUBAGENT=$CLAUDE_CODE_SUBAGENT_MODEL"\n'
+                'echo "SONNET=$ANTHROPIC_DEFAULT_SONNET_MODEL"\n'
+                'echo "OPUS=$ANTHROPIC_DEFAULT_OPUS_MODEL"\n'
+                'echo "FABLE=$ANTHROPIC_DEFAULT_FABLE_MODEL"\n'
+                'echo "NOFALLBACK=$CLAUDE_CODE_NO_MODEL_FALLBACK"\n'
                 'echo "ARGS=$*"\n'
             )
         os.chmod(stub, 0o755)
@@ -154,6 +159,39 @@ class ModelAndContextTest(Harness):
     def test_model_is_overridable(self):
         self.write_env(BONSAI_API_KEY=KEY, BONSAI_CLAUDE_MODEL="bonsai-27b-1bit")
         self.assertEqual("bonsai-27b-1bit", self.handed()["MODEL"])
+
+
+class AgentTest(Harness):
+    """Subagents and /model switching each resolve a model by name.
+
+    Any name left pointing at a hosted Anthropic model is a request that leaves
+    the machine and then 401s, because the token is a Bonsai key.
+    """
+
+    def test_subagents_run_on_this_server(self):
+        self.write_env(BONSAI_API_KEY=KEY)
+        handed = self.handed()
+        self.assertEqual(handed["MODEL"], handed["SUBAGENT"])
+
+    def test_agents_can_use_a_different_preset(self):
+        self.write_env(BONSAI_API_KEY=KEY,
+                       BONSAI_CLAUDE_AGENT_MODEL="bonsai-27b-ternary")
+        handed = self.handed()
+        self.assertEqual("bonsai-27b-ternary", handed["SUBAGENT"])
+        self.assertEqual("bonsai-27b-ternary-text", handed["MODEL"])
+
+    def test_every_model_alias_points_here(self):
+        """/model opus must not reach for a hosted model."""
+        self.write_env(BONSAI_API_KEY=KEY)
+        handed = self.handed()
+        for alias in ("SONNET", "OPUS", "FABLE", "HAIKU"):
+            with self.subTest(alias=alias):
+                self.assertEqual(handed["MODEL"], handed[alias])
+
+    def test_fallback_to_a_hosted_model_is_off(self):
+        """A silent retry elsewhere hides this server's actual error."""
+        self.write_env(BONSAI_API_KEY=KEY)
+        self.assertEqual("1", self.handed()["NOFALLBACK"])
 
 
 class PassthroughTest(Harness):

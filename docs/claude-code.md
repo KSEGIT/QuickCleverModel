@@ -6,17 +6,39 @@ answers `/v1/messages`, the Anthropic Messages API, alongside the OpenAI routes.
 Written against Claude Code 2.1. Unlike Codex, MCP servers work here, so this is
 the client to use when you want Playwright.
 
-## Run it
+## Quick start
 
-`claude-bonsai.sh` in the repo root sets the environment and launches Claude Code:
+Everything you need, in order.
 
 ```bash
+# 1. The server must be up. On the Linux box:
+docker compose --env-file .env -f docker/compose.linux.yaml up -d
+
+# 2. Check the key works. 200 means ready; 401 means the key is wrong.
+#    Do NOT test with /v1/models -- that route answers without a key.
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "x-api-key: $BONSAI_API_KEY" -H 'anthropic-version: 2023-06-01' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"bonsai-27b-ternary-text","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
+  http://100.x.y.z:8080/v1/messages
+
+# 3. Run it. Arguments pass straight through to claude.
 ./claude-bonsai.sh                 # interactive
 ./claude-bonsai.sh -p 'your task'  # one-shot
+
+# 4. Browser automation, or any other MCP server.
+echo '{"mcpServers":{"playwright":{"command":"npx","args":["-y","@playwright/mcp@latest"]}}}' > mcp.json
+./claude-bonsai.sh --mcp-config mcp.json -p 'Open https://example.com, give me the title.'
+
+# 5. Agents. Subagents run on this server too -- nothing extra to set.
+./claude-bonsai.sh -p 'Use the Task tool to check X, then summarise.'
 ```
 
-Every argument is passed straight through. It reads `.env` for the key and
-`BONSAI_SERVER_URL`, so it follows the same settings as everything else here.
+The launcher reads `.env` for the key and `BONSAI_SERVER_URL`, so it follows the
+same settings as everything else here.
+
+If you want this without the script, it is only environment — see
+[what it sets](#what-it-sets-and-why) and export those yourself.
 
 ## Why a launcher and not settings.json
 
@@ -60,6 +82,35 @@ Measured: the model calls `mcp__playwright__browser_navigate`, then
 
 This is the difference from Codex, which wraps each MCP server in one tool of
 `type: "namespace"` that llama.cpp cannot read — see [codex.md](codex.md).
+
+## Agents
+
+Subagents work with no extra setup. The launcher points every model name Claude
+Code can resolve at this server — `ANTHROPIC_MODEL`, the `sonnet`/`opus`/`haiku`
+/`fable` aliases behind `/model`, the background classifier, and
+`CLAUDE_CODE_SUBAGENT_MODEL`. Anything left unmapped would be a request leaving
+the machine, which then 401s, because the token is a Bonsai key. It also sets
+`CLAUDE_CODE_NO_MODEL_FALLBACK=1`, so a failure shows you this server's error
+instead of silently retrying somewhere else.
+
+Measured: a one-shot that spawns a general-purpose subagent to run a command and
+report back completes in two turns, with `bonsai-27b-ternary-text` as the only
+model used.
+
+To run agents on a different preset:
+
+```bash
+BONSAI_CLAUDE_AGENT_MODEL=bonsai-27b-ternary ./claude-bonsai.sh
+```
+
+Think before you do. The server keeps **one** model resident (`--models-max 1`),
+so every hand-off between the main model and the agent unloads one set of
+weights and loads the other. On a 27B model that is seconds to a minute per
+switch, each way. Same preset for both is almost always faster, and the vision
+preset also disables the prompt cache for every turn.
+
+Agents are also where the speed below hurts most: each one carries its own
+prompt, and they run one after another on a single GPU, not in parallel.
 
 ## What to expect
 

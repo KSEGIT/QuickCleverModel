@@ -55,6 +55,15 @@ MODEL="${BONSAI_CLAUDE_MODEL:-bonsai-27b-ternary-text}"
 # 131072 the text preset ships with.
 CONTEXT="${BONSAI_CTX_TEXT:-${BONSAI_CTX:-131072}}"
 
+# Subagents (the Task tool) and /model switching each pick a model by name. Any
+# name left pointing at a hosted Anthropic model is a request that leaves this
+# machine -- and fails, since the token is a Bonsai key. Map every one of them.
+#
+# Override to run agents on a different preset, but read the note in
+# docs/claude-code.md first: only one model is resident at a time, so a
+# main/agent split makes every hand-off reload weights.
+AGENT_MODEL="${BONSAI_CLAUDE_AGENT_MODEL:-$MODEL}"
+
 export ANTHROPIC_BASE_URL="$BASE_URL"
 export ANTHROPIC_AUTH_TOKEN="$API_KEY"
 export ANTHROPIC_MODEL="$MODEL"
@@ -62,7 +71,18 @@ export ANTHROPIC_MODEL="$MODEL"
 # Claude Code asks this server for a model it has never heard of.
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL"
 export ANTHROPIC_SMALL_FAST_MODEL="$MODEL"
+# So /model sonnet, /model opus and friends stay on this server.
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_FABLE_MODEL="$MODEL"
+# Agents.
+export CLAUDE_CODE_SUBAGENT_MODEL="$AGENT_MODEL"
+export CLAUDE_CODE_BG_CLASSIFIER_MODEL="$MODEL"
+export CLAUDE_CODE_AUTO_MODE_MODEL="$MODEL"
+# Never quietly retry against a hosted model: with a Bonsai key that is a 401,
+# and the useful error is the one from this server.
+export CLAUDE_CODE_NO_MODEL_FALLBACK=1
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CONTEXT"
 
-echo "==>  $MODEL at $BASE_URL (context $CONTEXT)" >&2
+echo "==>  $MODEL at $BASE_URL (context $CONTEXT, agents $AGENT_MODEL)" >&2
 exec claude "$@"
