@@ -175,3 +175,97 @@ class DriftCheckTest(Harness):
         proc = self.render_then(BONSAI_CTX="99999")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("context", proc.stderr)
+
+
+class PreservedKeysTest(Harness):
+    """The script must not delete config it does not own.
+
+    The header points you at opencode's MCP docs and says to add servers
+    yourself. Write mode rendered the whole document from its own template, so
+    every run silently deleted the `mcp` block -- and check mode then called the
+    hand-added block drift. Playwright against this server lives in that block.
+    """
+
+    MCP = {
+        "playwright": {
+            "type": "local",
+            "command": ["npx", "-y", "@playwright/mcp@latest"],
+            "enabled": True,
+        }
+    }
+
+    def seed_with_mcp(self):
+        self.write_env(BONSAI_API_KEY=LOCAL_KEY)
+        self.assertEqual(self.run_script().returncode, 0)
+        with open(self.cfg) as fh:
+            doc = json.load(fh)
+        doc["mcp"] = self.MCP
+        with open(self.cfg, "w") as fh:
+            json.dump(doc, fh, indent=2)
+
+    def test_write_keeps_the_mcp_block(self):
+        self.seed_with_mcp()
+        self.assertEqual(self.run_script().returncode, 0)
+        with open(self.cfg) as fh:
+            doc = json.load(fh)
+        self.assertEqual(self.MCP, doc.get("mcp"), "the mcp block was wiped")
+        # and the managed half is still correct
+        self.assertEqual(
+            "http://127.0.0.1:8080/v1",
+            doc["provider"]["bonsai"]["options"]["baseURL"],
+        )
+
+    def test_check_does_not_call_an_mcp_block_drift(self):
+        self.seed_with_mcp()
+        result = self.run_script("--check")
+        self.assertEqual(
+            0, result.returncode, f"--check rejected an mcp block: {result.stderr}"
+        )
+
+    def test_the_user_is_told_what_was_kept(self):
+        self.seed_with_mcp()
+        result = self.run_script()
+        self.assertIn("mcp", result.stdout)
+
+
+class TextModelContextTest(Harness):
+    """The text preset runs a larger context than the vision ones.
+
+    One number for all three either rejects long requests against the text
+    model or compacts it away early -- see models.ini.in.
+    """
+
+    def limits(self):
+        with open(self.cfg) as fh:
+            models = json.load(fh)["provider"]["bonsai"]["models"]
+        return {name: m["limit"]["context"] for name, m in models.items()}
+
+    def test_text_model_takes_its_own_context(self):
+        self.write_env(BONSAI_API_KEY=LOCAL_KEY, BONSAI_CTX="65536",
+                       BONSAI_CTX_TEXT="131072")
+        self.assertEqual(self.run_script().returncode, 0)
+        limits = self.limits()
+        self.assertEqual(131072, limits["bonsai-27b-ternary-text"])
+        self.assertEqual(65536, limits["bonsai-27b-ternary"])
+        self.assertEqual(65536, limits["bonsai-27b-1bit"])
+
+    def test_it_falls_back_to_the_shared_context(self):
+        """Unset must behave exactly as before this knob existed."""
+        self.write_env(BONSAI_API_KEY=LOCAL_KEY, BONSAI_CTX="32768")
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertEqual({32768}, set(self.limits().values()))
+
+    def test_check_compares_the_text_model_against_its_own_value(self):
+        self.write_env(BONSAI_API_KEY=LOCAL_KEY, BONSAI_CTX="65536",
+                       BONSAI_CTX_TEXT="131072")
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertEqual(self.run_script("--check").returncode, 0)
+        # Now break just the text model's limit; --check must notice.
+        with open(self.cfg) as fh:
+            doc = json.load(fh)
+        doc["provider"]["bonsai"]["models"]["bonsai-27b-ternary-text"]["limit"]["context"] = 65536
+        with open(self.cfg, "w") as fh:
+            json.dump(doc, fh, indent=2)
+        result = self.run_script("--check")
+        self.assertEqual(1, result.returncode)
+        self.assertIn("bonsai-27b-ternary-text", result.stderr)
