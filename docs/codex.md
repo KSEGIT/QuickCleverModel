@@ -162,7 +162,25 @@ Anything that speaks the OpenAI API works the same way — point it at
 `http://100.x.y.z:8080/v1` with your key. `setup-opencode.sh` does this for
 OpenCode, including a drift check against `.env`.
 
-Claude Code is the exception. It speaks the Anthropic Messages API, not the
-OpenAI one, and `ANTHROPIC_BASE_URL` only changes where those Anthropic-shaped
-requests go — it does not translate them. Using it against this server needs a
-translating proxy in between.
+Claude Code speaks the Anthropic Messages API rather than the OpenAI one, and
+needs no proxy: this server answers `/v1/messages` as well. See
+[claude-code.md](claude-code.md).
+
+## MCP does not work here
+
+Codex sends each MCP server as a single tool of `type: "namespace"`, with the
+real tools nested inside it. llama.cpp does not implement that type, so the
+model never sees them. Measured against this server with one identical tool
+sent both ways:
+
+| tool shape | model calls it |
+|---|---|
+| namespace-wrapped, as Codex sends MCP | no |
+| the same tool, flat | yes |
+
+So Playwright, context7 and the rest are unreachable from Codex here, however
+you prompt. The model is not at fault and a bigger model would not help.
+
+Use Claude Code ([claude-code.md](claude-code.md)) or OpenCode for MCP work:
+both send tool definitions flat, and both drive Playwright against this server.
+Codex remains fine for everything that does not need MCP.

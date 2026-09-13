@@ -257,6 +257,7 @@ models.ini.in                       model preset template -> run/models.ini
 bonsai-chat-template.jinja          chat template served to the models (see architecture.md)
 fetch-models.sh                     weight downloader (make models)
 start-webui.sh                      native Open WebUI launcher (:9090)
+claude-bonsai.sh                    launch Claude Code against this server
 cache-viz.py                        live prompt-cache dashboard (:8090)
 menubar/                            native SwiftUI menu bar app (make menubar / menubar-install)
 tests/                              stdlib unittest suite: cache-viz.py, stack.sh, and the menu bar app
@@ -266,6 +267,7 @@ docs/decisions.md                   design decisions and why
 docs/tuning.md                      measured performance tuning
 docs/macos.md                       this file — macOS operations
 docs/codex.md                       Codex CLI against this server
+docs/claude-code.md                 Claude Code against this server (MCP works here)
 docker/compose.yaml                 containerised UI, parked pending Docker fix
 docker/Dockerfile                   CUDA llama-server build (Linux + NVIDIA)
 docker/compose.linux.yaml           full Linux/NVIDIA stack (llama + webui)
