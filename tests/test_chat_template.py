@@ -137,7 +137,7 @@ class Wiring(unittest.TestCase):
     def test_every_bonsai_section_sets_the_template(self):
         """Not [*]: that would cascade Bonsai's ChatML onto a future model."""
         sections = parse_models_ini(read(MODELS_INI))
-        models = {name: keys for name, keys in sections.items() if name != "*"}
+        models = {name: keys for name, keys in sections.items() if name.startswith("bonsai-")}
         self.assertEqual(
             3, len(models), f"expected three model sections, found {sorted(models)}"
         )
@@ -157,7 +157,7 @@ class Wiring(unittest.TestCase):
         )
 
     def test_text_preset_has_its_own_context_knob(self):
-        """128k fits without mmproj; the vision presets OOM on an 8 GB card."""
+        """The text alias keeps a separate context knob after the runtime upgrade."""
         sections = parse_models_ini(read(MODELS_INI))
         self.assertEqual(
             "@CTX_TEXT@",
@@ -524,11 +524,13 @@ def gguf_chat_template(path):
 # Only runs where the weights are: a dev box or the inference host, not CI.
 # models/ is gitignored, so a git worktree does not have it -- point
 # BONSAI_MODELS_DIR at the main checkout's models/ to run this from one.
-WEIGHTS = os.path.join(
+TERNARY_MODELS_DIR = os.path.join(
     os.environ.get("BONSAI_MODELS_DIR") or os.path.join(ROOT, "models"),
     "Ternary-Bonsai-27B-gguf",
-    "Ternary-Bonsai-27B-Q2_0.gguf",
 )
+PQ2_WEIGHTS = os.path.join(TERNARY_MODELS_DIR, "Ternary-Bonsai-27B-PQ2_0.gguf")
+LEGACY_WEIGHTS = os.path.join(TERNARY_MODELS_DIR, "Ternary-Bonsai-27B-Q2_0.gguf")
+WEIGHTS = PQ2_WEIGHTS if os.path.isfile(PQ2_WEIGHTS) else LEGACY_WEIGHTS
 
 
 @unittest.skipUnless(os.path.isfile(WEIGHTS), "weights not present")

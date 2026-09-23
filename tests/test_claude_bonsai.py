@@ -134,6 +134,16 @@ class ModelAndContextTest(Harness):
                        BONSAI_CTX_TEXT="131072")
         self.assertEqual("131072", self.handed()["CTX"])
 
+    def test_qwen_uses_agent_context_not_bonsai_context(self):
+        self.write_env(BONSAI_API_KEY=KEY, BONSAI_CTX_TEXT="131072",
+                       BONSAI_CLAUDE_MODEL="qwen3.5-9b-q4_k_m", QCM_QWEN9_CTX="12288")
+        self.assertEqual("12288", self.handed()["CTX"])
+
+    def test_granite_defaults_to_8k(self):
+        self.write_env(BONSAI_API_KEY=KEY, BONSAI_CTX_TEXT="131072",
+                       BONSAI_CLAUDE_MODEL="granite-4.1-8b-q4_k_m")
+        self.assertEqual("8192", self.handed()["CTX"])
+
     def test_context_falls_back_to_the_shared_value(self):
         self.write_env(BONSAI_API_KEY=KEY, BONSAI_CTX="65536")
         self.assertEqual("65536", self.handed()["CTX"])
@@ -141,7 +151,7 @@ class ModelAndContextTest(Harness):
     def test_context_has_a_default(self):
         """Unset must not mean 'let Claude Code assume 200k'."""
         self.write_env(BONSAI_API_KEY=KEY)
-        self.assertEqual("131072", self.handed()["CTX"])
+        self.assertEqual("8192", self.handed()["CTX"])
 
     def test_model_is_overridable(self):
         self.write_env(BONSAI_API_KEY=KEY, BONSAI_CLAUDE_MODEL="bonsai-27b-1bit")

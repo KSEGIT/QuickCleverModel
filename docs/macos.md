@@ -13,14 +13,14 @@ and node/npx (for the Playwright MCP, optional).
 
 ```bash
 # 1. Build the prism fork's llama-server (Metal is enabled by default on macOS).
-#    brew's llama.cpp cannot load the ternary Q2_0 layout — see docs/decisions.md.
+#    Use Prism for PQ2_0; fetch the current-format artifact without deleting Q2_0.
 git clone https://github.com/PrismML-Eng/llama.cpp src/llama.cpp-prism
-git -C src/llama.cpp-prism checkout 4dd165625bb6c020285eec8b342af25cf60233dd
-cmake -S src/llama.cpp-prism -B src/llama.cpp-prism/build -DCMAKE_BUILD_TYPE=Release
+git -C src/llama.cpp-prism checkout 922be44aa6ac81b46f092716351cddff1c1733a7
+cmake -S src/llama.cpp-prism -B src/llama.cpp-prism/build -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
 cmake --build src/llama.cpp-prism/build --target llama-server -j
 
 # 2. Python env for Open WebUI
-python3.11 -m venv .venv && .venv/bin/pip install open-webui
+python3.11 -m venv .venv && .venv/bin/pip install open-webui==0.11.3
 
 # 3. API key (enforced by the router — the server binds 0.0.0.0)
 printf 'BONSAI_API_KEY=bonsai-%s\n' "$(openssl rand -hex 20)" > .env && chmod 600 .env
@@ -82,7 +82,7 @@ docker compose --env-file .env -f docker/compose.yaml up -d
 
 It points at `host.docker.internal:8080`.
 
-Tunables (env): `BONSAI_CTX` (default 32768), `BONSAI_PORT`, `BONSAI_HOST`,
+Tunables (env): `BONSAI_CTX` (default 8192), `BONSAI_PORT`, `BONSAI_HOST`,
 `BONSAI_MODELS_MAX` (default 1 — see
 [architecture.md](architecture.md#model-selection)). The model trains to
 262144 context; that KV cache will not fit in 24 GB, hence the lower default.

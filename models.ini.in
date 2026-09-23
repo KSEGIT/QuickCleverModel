@@ -15,9 +15,10 @@
 ; globals cascade onto it, and a phantom model with no weights appears in
 ; /v1/models and in the Open WebUI dropdown.
 
-; Shared by both children. Every value here is measured — see docs/tuning.md.
+; Shared settings. Bonsai-specific historical measurements are in docs/tuning.md;
+; new agent overrides start conservatively and still need RTX 3070 validation.
 [*]
-ngl = 99
+ngl = @NGL@
 ; KV cache on the GPU by default. Set true on a box with little VRAM but plenty
 ; of RAM (e.g. RTX 3070 Ti 8 GB + 64 GB DDR4): weights stay on the GPU, the KV
 ; cache lives in system RAM, and ctx can grow past what VRAM would allow.
@@ -25,7 +26,7 @@ ngl = 99
 no-kv-offload = @NKVO@
 c = @CTX@
 parallel = @PARALLEL@
-fa = on
+fa = @FA@
 ; q4_0 KV, not q8_0: measured on THIS fork's Metal kernels (llama-bench, stack
 ; down, r=3): Q1_0 tg128 16.14 (q4_0) vs 14.06 (q8_0) vs 13.85 (f16) -- +15%.
 ; Upstream advice says quantized KV is unoptimized on Metal (llama.cpp#23011);
@@ -75,7 +76,7 @@ min-p = 0
 
 ; 6.7 GB, 94.6% of FP16 per the model card. The default.
 [bonsai-27b-ternary]
-model = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-Q2_0.gguf
+model = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-PQ2_0.gguf
 mmproj = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-mmproj-Q8_0.gguf
 chat-template-file = @ROOT@/bonsai-chat-template.jinja
 load-on-startup = true
@@ -87,18 +88,63 @@ mmproj = @ROOT@/models/Bonsai-27B-gguf/Bonsai-27B-mmproj-Q8_0.gguf
 chat-template-file = @ROOT@/bonsai-chat-template.jinja
 load-on-startup = false
 
-; Text-only: no mmproj. Vision loaded disables prompt cache / cache-reuse for
-; ALL turns (upstream issue #21133, fixed in PR #25076 which this fork predates).
-; Without mmproj, multi-turn caching works again -- this is the agent/coding preset.
+; New agent presets use the GGUF's native template. They are text-only here.
+; The 8K/f16 defaults are conservative starting points, not an RTX benchmark.
+; Each overrides Bonsai's reasoning, speculation and cache configuration.
+[qwen3.5-9b-q4_k_m]
+model = @ROOT@/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf
+c = @QWEN9_CTX@
+ngl = @QWEN9_NGL@
+fa = @QWEN_FA@
+ctk = @QWEN_CTK@
+ctv = @QWEN_CTV@
+no-kv-offload = false
+parallel = 1
+ubatch-size = @AGENT_UBATCH@
+spec-type = none
+cache-ram = @AGENT_CACHE_RAM@
+reasoning = @QWEN_REASONING@
+reasoning-budget = @QWEN_REASONING_BUDGET@
+load-on-startup = false
+
+[granite-4.1-8b-q4_k_m]
+model = @ROOT@/models/granite-4.1-8b-GGUF/granite-4.1-8b-Q4_K_M.gguf
+c = @GRANITE_CTX@
+ngl = @GRANITE_NGL@
+fa = @GRANITE_FA@
+ctk = @GRANITE_CTK@
+ctv = @GRANITE_CTV@
+no-kv-offload = false
+parallel = 1
+ubatch-size = @AGENT_UBATCH@
+spec-type = none
+cache-ram = @AGENT_CACHE_RAM@
+reasoning = auto
+reasoning-budget = -1
+load-on-startup = false
+
+[qwen3.5-4b-q4_k_m]
+model = @ROOT@/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf
+c = @QWEN4_CTX@
+ngl = @QWEN4_NGL@
+fa = @QWEN_FA@
+ctk = @QWEN_CTK@
+ctv = @QWEN_CTV@
+no-kv-offload = false
+parallel = 1
+ubatch-size = @AGENT_UBATCH@
+spec-type = none
+cache-ram = @AGENT_CACHE_RAM@
+reasoning = @QWEN_REASONING@
+reasoning-budget = @QWEN_REASONING_BUDGET@
+load-on-startup = false
+
+; Text-only Bonsai: no mmproj. Retained as the coding-focused Bonsai alias.
 [bonsai-27b-ternary-text]
-model = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-Q2_0.gguf
+model = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-PQ2_0.gguf
 chat-template-file = @ROOT@/bonsai-chat-template.jinja
 ; Its own context, set by BONSAI_CTX_TEXT and defaulting to BONSAI_CTX.
-; Measured on a 3070 Ti (8 GB), weights on the GPU, KV in system RAM:
-; 131072 loads here with ~230 MiB of VRAM to spare, because the compute
-; buffer grows with context. The vision presets need ~600 MiB more on top
-; of that and cudaMalloc fails, which is why this is per-section and not
-; in [*]. KV itself is host-side: ~136 KiB/token, so 128k costs ~17 GiB
-; of RAM. Raise [*] c instead if your card has room for all three.
+; Previous runtime measurements with host-side KV at 131072 tokens are
+; historical; repeat fit and reliability tests after this Prism upgrade.
 c = @CTX_TEXT@
 load-on-startup = false

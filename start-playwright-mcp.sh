@@ -59,7 +59,7 @@ OUTPUT_MAX_SIZE="${PW_MCP_OUTPUT_MAX_SIZE:-536870912}"
 MAX_SIZE_ARGS=(--output-max-size "$OUTPUT_MAX_SIZE")
 [[ "$OUTPUT_MAX_SIZE" == "0" ]] && MAX_SIZE_ARGS=()
 
-exec npx -y @playwright/mcp@latest \
+exec npx -y @playwright/mcp@0.0.82 \
   --port "$PORT" \
   --host 127.0.0.1 \
   --browser "$BROWSER" \
