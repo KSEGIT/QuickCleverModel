@@ -180,7 +180,8 @@ class DriftCheckTest(Harness):
 
     def test_new_models_have_separate_agent_contexts(self):
         self.write_env(BONSAI_API_KEY=LOCAL_KEY, BONSAI_CTX="65536",
-                       BONSAI_CTX_TEXT="131072", QCM_QWEN9_CTX="12288")
+                       BONSAI_CTX_TEXT="131072", QCM_QWEN9_CTX="12288",
+                       QCM_QWEN36_CTX="16384", QCM_GEMMA4_CTX="12288")
         proc = self.run_script()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         with open(self.cfg) as config:
@@ -188,6 +189,8 @@ class DriftCheckTest(Harness):
         self.assertEqual(models["qwen3.5-9b-q4_k_m"]["limit"]["context"], 12288)
         self.assertEqual(models["qwen3.5-4b-q4_k_m"]["limit"]["context"], 8192)
         self.assertEqual(models["granite-4.1-8b-q4_k_m"]["limit"]["context"], 8192)
+        self.assertEqual(models["qwen3.6-35b-a3b"]["limit"]["context"], 16384)
+        self.assertEqual(models["gemma4-e4b"]["limit"]["context"], 12288)
 
     def test_agent_context_drift_is_an_error_when_explicit(self):
         proc = self.render_then(QCM_AGENT_CTX="12288")

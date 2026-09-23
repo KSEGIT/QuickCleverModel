@@ -165,10 +165,10 @@ class Wiring(unittest.TestCase):
             "the text preset must take its context from BONSAI_CTX_TEXT",
         )
         for vision in ("bonsai-27b-ternary", "bonsai-27b-1bit"):
-            self.assertNotIn(
-                "c",
-                sections[vision],
-                f"[{vision}] must inherit [*] c -- it cannot afford the text "
+            self.assertEqual(
+                "@CTX@",
+                sections[vision].get("c"),
+                f"[{vision}] must retain BONSAI_CTX without inheriting the text "
                 "preset's context",
             )
 

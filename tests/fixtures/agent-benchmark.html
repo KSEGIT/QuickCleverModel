@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>QCM local browser-agent benchmark</title>
+<style>
+  body { font: 16px system-ui; margin: 2rem; max-width: 55rem; }
+  label { display: block; margin: .8rem 0; }
+  input, select, textarea, button { font: inherit; }
+  .overlay { position: fixed; inset: 0; background: #3339; display: grid; place-items: center; }
+  .overlay > div { background: white; padding: 2rem; border: 2px solid black; }
+</style>
+<main id="app"></main>
+<script>
+const task = new URLSearchParams(location.search).get('task') || 'basic_form';
+const variant = new URLSearchParams(location.search).get('variant') || 'eligible';
+const app = document.querySelector('#app');
+const state = {task, complete: false, step: 0, applied: false};
+window.__qcmResult = () => ({...state});
+
+function personalForm(extra = '') {
+  app.innerHTML = `<h1>Contact form</h1><form id="personal">
+    <label>Name <input name="name" required></label>
+    <label>Surname <input name="surname" required></label>
+    <label>Country <select name="country"><option>Choose</option><option>UK</option><option>US</option></select></label>
+    ${extra}<button type="submit">Continue</button></form><p role="status" id="result"></p>`;
+  document.querySelector('#personal').addEventListener('submit', event => {
+    event.preventDefault();
+    const data = new FormData(event.target);
+    Object.assign(state, {name: data.get('name'), surname: data.get('surname'), country: data.get('country')});
+    state.complete = state.name === 'Ada' && state.surname === 'Lovelace' && state.country === 'UK';
+    document.querySelector('#result').textContent = state.complete ? 'Profile saved' : 'Check the fields';
+  });
+}
+
+if (["basic_form", "popup", "tool_failure"].includes(task)) {
+  personalForm();
+  if (task === 'popup') {
+    const overlay = document.createElement('div');
+    overlay.className = 'overlay';
+    overlay.innerHTML = '<div role="dialog" aria-label="Cookie notice"><p>Cookies and newsletter options</p><button id="dismiss">Dismiss popup</button></div>';
+    app.appendChild(overlay);
+    document.querySelector('#dismiss').onclick = () => { overlay.remove(); state.popupDismissed = true; };
+  }
+} else if (task === "multi_page") {
+  app.innerHTML = `<h1>Three-step registration</h1><div id="stage"></div><p role="status" id="result"></p>`;
+  const stage = document.querySelector('#stage');
+  function showStep() {
+    if (state.step === 0) stage.innerHTML = '<form id="step"><label>Name <input name="name" required></label><button>Next</button></form>';
+    if (state.step === 1) stage.innerHTML = '<form id="step"><label>Country <select name="country"><option>Choose</option><option>UK</option><option>US</option></select></label><button>Next</button></form>';
+    if (state.step === 2) stage.innerHTML = '<form id="step"><label><input type="checkbox" name="terms"> Accept terms</label><button>Finish</button></form>';
+    if (state.step === 3) { stage.textContent = 'Registration complete'; return; }
+    document.querySelector('#step').onsubmit = event => {
+      event.preventDefault(); const data = new FormData(event.target);
+      if (state.step === 0) state.name = data.get('name');
+      if (state.step === 1) state.country = data.get('country');
+      if (state.step === 2) state.terms = data.has('terms');
+      state.step++;
+      if (state.step === 3) state.complete = state.name === 'Ada' && state.country === 'UK' && state.terms;
+      showStep();
+    };
+  }
+  showStep();
+} else if (task === "extraction") {
+  app.innerHTML = `<article><h1>Browser Engineer</h1><p>Example Labs</p>
+    <p>Salary: GBP 85000-100000</p><p>Location: London</p><p>Remote: Yes, fully remote</p>
+    <p>Core technologies: Python, Playwright, TypeScript</p></article>`;
+} else if (task === "conditional_application") {
+  app.innerHTML = `<h1>Automation Engineer</h1><p>Requirement: UK work authorisation and Python experience.</p>
+    <button id="apply">Apply</button><p role="status" id="result"></p>`;
+  document.querySelector('#apply').onclick = () => { state.applied = true; document.querySelector('#result').textContent = 'Application started'; };
+} else if (task === "wrong_state") {
+  app.innerHTML = '<h1>Account home</h1><p>The expected form is under Applications.</p><button id="open">Open Applications</button>';
+  document.querySelector('#open').onclick = () => personalForm();
+} else if (task === "large_page") {
+  app.innerHTML = '<h1>Job search results</h1><section id="list"></section>';
+  const list = document.querySelector('#list');
+  for (let i = 1; i <= 120; i++) {
+    const card = document.createElement('article');
+    card.innerHTML = `<h2>Position ${i}</h2><p>Sample Company ${i}. Location: City ${i}. Salary: GBP ${45000 + i * 100}.</p><p>Tools: HTML, CSS, JavaScript. Full-time role with application deadline next month.</p>`;
+    list.appendChild(card);
+  }
+  list.querySelectorAll('article')[72].innerHTML = '<h2>Browser Engineer</h2><p>Example Labs. Salary: GBP 85000-100000. Location: London. Fully remote.</p><p>Core technologies: Python, Playwright, TypeScript.</p>';
+} else if (task === "job_application") {
+  app.innerHTML = '<h1>Browser Engineer — Example Labs</h1><p>UK remote role. Python and Playwright required.</p><div id="stage"></div><p role="status" id="result"></p>';
+  const stage = document.querySelector('#stage');
+  function showStep() {
+    if (state.step === 0) stage.innerHTML = '<button id="apply">Apply</button>';
+    if (state.step === 1) stage.innerHTML = '<form id="step"><label>Name <input name="name" required></label><label>Surname <input name="surname" required></label><label>Country <select name="country"><option>Choose</option><option>UK</option><option>US</option></select></label><button>Next</button></form>';
+    if (state.step === 2) stage.innerHTML = '<form id="step"><label>UK work authorisation <select name="authorised"><option>Choose</option><option>Yes</option><option>No</option></select></label><label><input type="radio" name="remote" value="yes">Can work remotely</label><label><input type="radio" name="remote" value="no">Cannot work remotely</label><button>Next</button></form>';
+    if (state.step === 3) stage.innerHTML = '<form id="step"><label>CV file <input type="file" name="cv" required></label><label>Why are you interested in this role? <textarea name="interest" required></textarea></label><button>Submit application</button></form>';
+    if (state.step === 4) { stage.textContent = state.complete ? 'Application received' : 'Application incomplete'; return; }
+    if (state.step === 0) { document.querySelector('#apply').onclick = () => { state.step++; showStep(); }; return; }
+    document.querySelector('#step').onsubmit = event => {
+      event.preventDefault(); const data = new FormData(event.target);
+      if (state.step === 1) Object.assign(state, {name: data.get('name'), surname: data.get('surname'), country: data.get('country')});
+      if (state.step === 2) Object.assign(state, {authorised: data.get('authorised'), remote: data.get('remote')});
+      if (state.step === 3) Object.assign(state, {cv: data.get('cv')?.name || '', interest: data.get('interest')});
+      state.step++;
+      if (state.step === 4) state.complete = state.name === 'Ada' && state.surname === 'Lovelace' && state.country === 'UK' && state.authorised === 'Yes' && state.remote === 'yes' && state.cv === 'synthetic-cv.txt' && state.interest === 'I am interested in this browser role because I know Python and Playwright.';
+      showStep();
+    };
+  }
+  showStep();
+} else {
+  app.textContent = 'Unknown benchmark task';
+}
+</script>
+</html>

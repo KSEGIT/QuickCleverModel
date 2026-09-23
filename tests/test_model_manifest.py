@@ -21,8 +21,11 @@ class ModelDownloads(unittest.TestCase):
         self.revision = "a" * 40
         self.manifest = self.root / "models.lock.tsv"
         self.manifest.write_text(
-            "# group\trepo\trevision\tfilename\tbytes\tsha256\n"
-            + self.row("bonsai", "old.gguf") + self.row("agents", "new.gguf")
+            "# group\tmodel_id\tquant\tdefault\trepo\trevision\tfilename\tbytes\tsha256\n"
+            + self.row("bonsai", "old", "Q1_0", "yes", "old.gguf")
+            + self.row("agents", "new", "Q4_K_M", "yes", "new.gguf")
+            + self.row("browser", "large", "Q4_K_XL", "yes", "large-xl.gguf")
+            + self.row("browser", "large", "IQ4_XS", "no", "large-xs.gguf")
         )
         self.bin = self.root / "bin"
         self.bin.mkdir()
@@ -39,8 +42,9 @@ class ModelDownloads(unittest.TestCase):
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
                         CALLS=str(self.root / "calls"))
 
-    def row(self, group, name):
-        return f"{group}\towner/repo\t{self.revision}\t{name}\t{len(self.payload)}\t{self.sha}\n"
+    def row(self, group, model_id, quant, default, name):
+        return (f"{group}\t{model_id}\t{quant}\t{default}\towner/repo\t{self.revision}"
+                f"\t{name}\t{len(self.payload)}\t{self.sha}\n")
 
     def run_fetch(self, *args):
         return subprocess.run(["bash", str(self.root / "fetch-models.sh"), *args],
@@ -57,6 +61,33 @@ class ModelDownloads(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.root / "models/repo/new.gguf").exists())
         self.assertFalse((self.root / "models/repo/old.gguf").exists())
+
+    def test_model_selector_downloads_only_default_quant(self):
+        result = self.run_fetch("--model", "large")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "models/repo/large-xl.gguf").exists())
+        self.assertFalse((self.root / "models/repo/large-xs.gguf").exists())
+        self.assertFalse((self.root / "models/repo/old.gguf").exists())
+
+    def test_model_selector_can_choose_alternative_quant(self):
+        result = self.run_fetch("--model", "large", "--quant", "IQ4_XS")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "models/repo/large-xs.gguf").exists())
+        self.assertFalse((self.root / "models/repo/large-xl.gguf").exists())
+
+    def test_all_flag_retains_all_artifact_behavior(self):
+        result = self.run_fetch("--all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("old.gguf", "new.gguf", "large-xl.gguf", "large-xs.gguf"):
+            self.assertTrue((self.root / "models/repo" / name).exists())
+
+    def test_missing_model_or_quant_fails_before_download(self):
+        for args in (("--model", "missing"), ("--model", "large", "--quant", "Q3_K_M"),
+                     ("--quant", "IQ4_XS")):
+            with self.subTest(args=args):
+                result = self.run_fetch(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / "calls").exists())
 
     def test_valid_existing_file_is_not_downloaded(self):
         dest = self.root / "models/repo/old.gguf"
@@ -89,22 +120,26 @@ class ModelDownloads(unittest.TestCase):
         self.assertFalse((self.root / "calls").exists())
 
     def test_unpinned_revision_fails_before_download(self):
-        self.manifest.write_text(self.row("bonsai", "old.gguf").replace(self.revision, "main"))
+        self.manifest.write_text(self.row("bonsai", "old", "Q1_0", "yes", "old.gguf").replace(self.revision, "main"))
         result = self.run_fetch()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("revision", result.stderr)
         self.assertFalse((self.root / "calls").exists())
 
-    def test_repository_manifest_has_seven_pinned_artifacts(self):
+    def test_repository_manifest_has_pinned_browser_variants(self):
         rows = [line.split("\t") for line in (ROOT / "models.lock.tsv").read_text().splitlines()
                 if line and not line.startswith("#")]
-        self.assertEqual(len(rows), 7)
+        self.assertEqual(len(rows), 12)
         self.assertEqual(sum(row[0] == "agents" for row in rows), 3)
+        self.assertEqual(sum(row[0] == "browser" for row in rows), 5)
+        defaults = {row[1]: row[2] for row in rows if row[3] == "yes"}
+        self.assertEqual(defaults["qwen3.6-35b-a3b"], "Q4_K_XL")
+        self.assertEqual(defaults["gemma4-e4b"], "QAT_Q4_0")
         for row in rows:
-            self.assertEqual(len(row), 6)
-            self.assertRegex(row[2], r"^[a-f0-9]{40}$")
-            self.assertRegex(row[5], r"^[a-f0-9]{64}$")
-            self.assertGreater(int(row[4]), 0)
+            self.assertEqual(len(row), 9)
+            self.assertRegex(row[5], r"^[a-f0-9]{40}$")
+            self.assertRegex(row[8], r"^[a-f0-9]{64}$")
+            self.assertGreater(int(row[7]), 0)
 
 
 class OfflineVersions(unittest.TestCase):
@@ -113,7 +148,7 @@ class OfflineVersions(unittest.TestCase):
             root = Path(tmp)
             shutil.copy(ROOT / "version.sh", root)
             (root / "runtime-versions.env").write_text("PRISM_SHA=" + "a" * 40 + "\nCUDA_VERSION=12.8.1\n")
-            (root / "models.lock.tsv").write_text("agents\towner/model\t" + "b" * 40 + "\tmodel.gguf\t12\t" + "c" * 64 + "\n")
+            (root / "models.lock.tsv").write_text("agents\tfixture\tQ4_K_M\tyes\towner/model\t" + "b" * 40 + "\tmodel.gguf\t12\t" + "c" * 64 + "\n")
             (root / "build-revision").write_text("fixture-qcm-sha\n")
             binary = root / "llama-server"
             binary.write_text("#!/bin/sh\nprintf 'fixture-installed-build\\n'\n")
@@ -126,6 +161,7 @@ class OfflineVersions(unittest.TestCase):
             self.assertIn("Installed llama-server", result.stdout)
             self.assertIn("fixture-installed-build", result.stdout)
             self.assertIn("owner/model", result.stdout)
+            self.assertIn("fixture Q4_K_M", result.stdout)
             self.assertNotIn("must-not-print", result.stdout)
 
 

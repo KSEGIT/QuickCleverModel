@@ -1,15 +1,37 @@
 #!/usr/bin/env bash
 # Download revision-pinned GGUFs and verify their full SHA256 before installation.
-# Default remains the existing Bonsai set; use agents or all explicitly.
+# Default remains Bonsai. A model selector downloads its default quant only.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+usage() { echo "Usage: $0 [bonsai|agents|browser|all|--all|--model ID [--quant QUANT]]" >&2; exit 2; }
 selection="${1:-bonsai}"
-[[ $# -le 1 ]] || { echo "Usage: $0 [bonsai|agents|all]" >&2; exit 2; }
+model_id=""
+quant=""
 case "$selection" in
-  bonsai|agents|all) ;;
-  *) echo "Usage: $0 [bonsai|agents|all]" >&2; exit 2 ;;
+  bonsai|agents|browser|all|--all) [[ $# -eq 0 || $# -eq 1 ]] || usage ;;
+  --model)
+    [[ $# -ge 2 && $# -le 4 ]] || usage
+    model_id="$2"
+    if [[ $# -gt 2 ]]; then
+      [[ $# -eq 4 && "$3" == --quant ]] || usage
+      quant="$4"
+    fi
+    [[ "$model_id" =~ ^[a-z0-9][a-z0-9._-]*$ && ( -z "$quant" || "$quant" =~ ^[A-Z0-9_]+$ ) ]] || usage
+    ;;
+  *) usage ;;
 esac
+[[ "$selection" != --all ]] || selection=all
+
+selected() {
+  local group="$1" id="$2" variant="$3" primary="$4"
+  if [[ "$selection" == --model ]]; then
+    [[ "$id" == "$model_id" ]] || return 1
+    if [[ -n "$quant" ]]; then [[ "$variant" == "$quant" ]]; else [[ "$primary" == yes ]]; fi
+  else
+    [[ "$selection" == all || "$selection" == "$group" ]]
+  fi
+}
 
 size_of() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null; }
 sha256_of() {
@@ -29,15 +51,15 @@ verify() {
   }
 }
 
-# Staging is on the destination filesystem so successful installation is atomic.
-# Existing files are never removed or replaced, including mismatched old weights.
-stage=""
-# Keep failed downloads for hf's range/partial-download resume support.
-trap '[[ -z "$stage" ]] || printf "Partial download retained for retry: %s\n" "$stage" >&2' EXIT
-
-while IFS=$'\t' read -r group repo revision file bytes sha extra; do
+# Validate the entire catalogue and selector before downloading any large file.
+selected_count=0
+selected_bytes=0
+while IFS=$'\t' read -r group id variant primary repo revision file bytes sha extra; do
   [[ -z "$group" || "$group" == \#* ]] && continue
-  [[ "$selection" == all || "$selection" == "$group" ]] || continue
+  [[ "$group" =~ ^(bonsai|agents|browser)$ && "$id" =~ ^[a-z0-9][a-z0-9._-]*$ \
+     && "$variant" =~ ^[A-Z0-9_]+$ && "$primary" =~ ^(yes|no)$ ]] || {
+    echo "ERROR: invalid catalogue identity for $id" >&2; exit 1;
+  }
   [[ "$revision" =~ ^[a-f0-9]{40}$ ]] || { echo "ERROR: unpinned revision for $repo" >&2; exit 1; }
   [[ "$sha" =~ ^[a-f0-9]{64}$ && "$bytes" =~ ^[1-9][0-9]*$ && -z "$extra" ]] || {
     echo "ERROR: invalid hash/size in models.lock.tsv for $repo" >&2; exit 1;
@@ -45,6 +67,24 @@ while IFS=$'\t' read -r group repo revision file bytes sha extra; do
   [[ "$repo" =~ ^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$ && "$file" =~ ^[A-Za-z0-9_-][A-Za-z0-9_.-]*\.gguf$ ]] || {
     echo "ERROR: invalid artifact path in models.lock.tsv" >&2; exit 1;
   }
+  if selected "$group" "$id" "$variant" "$primary"; then
+    selected_count=$((selected_count + 1))
+    selected_bytes=$((selected_bytes + bytes))
+  fi
+done < "$ROOT/models.lock.tsv"
+[[ "$selected_count" -gt 0 ]] || { echo "ERROR: no catalogue entry for model/quant selection" >&2; exit 1; }
+printf 'Selected %d artifact(s), %.2f GiB total before existing-file checks.\n' \
+  "$selected_count" "$(awk -v bytes="$selected_bytes" 'BEGIN { print bytes / 1073741824 }')"
+
+# Staging is on the destination filesystem so successful installation is atomic.
+# Existing files are never removed or replaced, including mismatched old weights.
+stage=""
+# Keep failed downloads for hf's range/partial-download resume support.
+trap '[[ -z "$stage" ]] || printf "Partial download retained for retry: %s\n" "$stage" >&2' EXIT
+
+while IFS=$'\t' read -r group id variant primary repo revision file bytes sha extra; do
+  [[ -z "$group" || "$group" == \#* ]] && continue
+  selected "$group" "$id" "$variant" "$primary" || continue
   dest_dir="$ROOT/models/${repo#*/}"
   dest="$dest_dir/$file"
   if [[ -e "$dest" || -L "$dest" ]]; then

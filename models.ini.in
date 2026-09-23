@@ -15,51 +15,11 @@
 ; globals cascade onto it, and a phantom model with no weights appears in
 ; /v1/models and in the Open WebUI dropdown.
 
-; Shared settings. Bonsai-specific historical measurements are in docs/tuning.md;
-; new agent overrides start conservatively and still need RTX 3070 validation.
+; Only universal settings belong here. Keep offload, cache, reasoning and
+; sampling inside each model section.
 [*]
-ngl = @NGL@
-; KV cache on the GPU by default. Set true on a box with little VRAM but plenty
-; of RAM (e.g. RTX 3070 Ti 8 GB + 64 GB DDR4): weights stay on the GPU, the KV
-; cache lives in system RAM, and ctx can grow past what VRAM would allow.
-; Slower decode (KV is read over PCIe every token) — measure before keeping.
-no-kv-offload = @NKVO@
-c = @CTX@
-parallel = @PARALLEL@
-fa = @FA@
-; q4_0 KV, not q8_0: measured on THIS fork's Metal kernels (llama-bench, stack
-; down, r=3): Q1_0 tg128 16.14 (q4_0) vs 14.06 (q8_0) vs 13.85 (f16) -- +15%.
-; Upstream advice says quantized KV is unoptimized on Metal (llama.cpp#23011);
-; the prism fork evidently fixed that. Measurement beats citation.
-; Linux + host-side KV may prefer q8_0 -- the CPU KV fast path is gated on
-; non-q4 KV types.
-ctk = @CTK@
-ctv = @CTV@
-; Sizes the peak compute buffer. 256 fixes cudaMalloc OOM on 8 GB cards at a
-; cost of ~25% prefill speed; 512 is the llama.cpp default.
-ubatch-size = @UBATCH@
-; Caps thinking tokens; the fork soft-closes the think block when the budget
-; runs out. -1 = unlimited, 0 = end thinking at once (arg.cpp:3193).
-reasoning-budget = @REASONING_BUDGET@
-spec-type = @SPEC@
-; ngram-mod tuning, used only when spec-type includes ngram-mod. Defaults
-; match the fork: lookup length 24, draft window 48-64 tokens.
-spec-ngram-mod-n-match = @NGRAM_MOD_N_MATCH@
-spec-ngram-mod-n-min = @NGRAM_MOD_N_MIN@
-spec-ngram-mod-n-max = @NGRAM_MOD_N_MAX@
-cache-reuse = @CACHE_REUSE@
-; llama-server defaults --cache-ram to 8192 MiB. On a 24 GB box already holding
-; 6.7 GB of weights wired by Metal, letting the prompt cache grow to 8 GB is
-; what pushes the weights out to swap -- measured at 13.5 GB of page-ins during
-; a single benchmark run. Capping it keeps multi-turn reuse (a few checkpoints
-; of ~150 MiB each) without competing with the weights for RAM.
-cache-ram = @CACHE_RAM@
 metrics = true
 jinja = true
-temp = 0.5
-top-p = 0.85
-top-k = 20
-min-p = 0
 
 ; Every Bonsai section sets chat-template-file. It is NOT in [*]: that block
 ; cascades onto every section, so a future non-Bonsai model would be rendered
@@ -77,6 +37,25 @@ min-p = 0
 ; 6.7 GB, 94.6% of FP16 per the model card. The default.
 [bonsai-27b-ternary]
 model = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-PQ2_0.gguf
+ngl = @NGL@
+c = @CTX@
+no-kv-offload = @NKVO@
+parallel = @PARALLEL@
+fa = @FA@
+ctk = @CTK@
+ctv = @CTV@
+ubatch-size = @UBATCH@
+reasoning-budget = @REASONING_BUDGET@
+spec-type = @SPEC@
+spec-ngram-mod-n-match = @NGRAM_MOD_N_MATCH@
+spec-ngram-mod-n-min = @NGRAM_MOD_N_MIN@
+spec-ngram-mod-n-max = @NGRAM_MOD_N_MAX@
+cache-reuse = @CACHE_REUSE@
+cache-ram = @CACHE_RAM@
+temp = 0.5
+top-p = 0.85
+top-k = 20
+min-p = 0
 mmproj = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-mmproj-Q8_0.gguf
 chat-template-file = @ROOT@/bonsai-chat-template.jinja
 load-on-startup = true
@@ -84,6 +63,25 @@ load-on-startup = true
 ; 3.8 GB, 89.5% of FP16 per the model card. Loads on first request.
 [bonsai-27b-1bit]
 model = @ROOT@/models/Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf
+ngl = @NGL@
+c = @CTX@
+no-kv-offload = @NKVO@
+parallel = @PARALLEL@
+fa = @FA@
+ctk = @CTK@
+ctv = @CTV@
+ubatch-size = @UBATCH@
+reasoning-budget = @REASONING_BUDGET@
+spec-type = @SPEC@
+spec-ngram-mod-n-match = @NGRAM_MOD_N_MATCH@
+spec-ngram-mod-n-min = @NGRAM_MOD_N_MIN@
+spec-ngram-mod-n-max = @NGRAM_MOD_N_MAX@
+cache-reuse = @CACHE_REUSE@
+cache-ram = @CACHE_RAM@
+temp = 0.5
+top-p = 0.85
+top-k = 20
+min-p = 0
 mmproj = @ROOT@/models/Bonsai-27B-gguf/Bonsai-27B-mmproj-Q8_0.gguf
 chat-template-file = @ROOT@/bonsai-chat-template.jinja
 load-on-startup = false
@@ -93,6 +91,10 @@ load-on-startup = false
 ; Each overrides Bonsai's reasoning, speculation and cache configuration.
 [qwen3.5-9b-q4_k_m]
 model = @ROOT@/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf
+temp = 0.5
+top-p = 0.85
+top-k = 20
+min-p = 0
 c = @QWEN9_CTX@
 ngl = @QWEN9_NGL@
 fa = @QWEN_FA@
@@ -102,6 +104,7 @@ no-kv-offload = false
 parallel = 1
 ubatch-size = @AGENT_UBATCH@
 spec-type = none
+cache-reuse = @AGENT_CACHE_REUSE@
 cache-ram = @AGENT_CACHE_RAM@
 reasoning = @QWEN_REASONING@
 reasoning-budget = @QWEN_REASONING_BUDGET@
@@ -109,6 +112,10 @@ load-on-startup = false
 
 [granite-4.1-8b-q4_k_m]
 model = @ROOT@/models/granite-4.1-8b-GGUF/granite-4.1-8b-Q4_K_M.gguf
+temp = 0.5
+top-p = 0.85
+top-k = 20
+min-p = 0
 c = @GRANITE_CTX@
 ngl = @GRANITE_NGL@
 fa = @GRANITE_FA@
@@ -118,6 +125,7 @@ no-kv-offload = false
 parallel = 1
 ubatch-size = @AGENT_UBATCH@
 spec-type = none
+cache-reuse = @AGENT_CACHE_REUSE@
 cache-ram = @AGENT_CACHE_RAM@
 reasoning = auto
 reasoning-budget = -1
@@ -125,6 +133,10 @@ load-on-startup = false
 
 [qwen3.5-4b-q4_k_m]
 model = @ROOT@/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf
+temp = 0.5
+top-p = 0.85
+top-k = 20
+min-p = 0
 c = @QWEN4_CTX@
 ngl = @QWEN4_NGL@
 fa = @QWEN_FA@
@@ -134,14 +146,71 @@ no-kv-offload = false
 parallel = 1
 ubatch-size = @AGENT_UBATCH@
 spec-type = none
+cache-reuse = @AGENT_CACHE_REUSE@
 cache-ram = @AGENT_CACHE_RAM@
 reasoning = @QWEN_REASONING@
 reasoning-budget = @QWEN_REASONING_BUDGET@
 load-on-startup = false
 
+; Qwen3.6 MoE hybrid escalation model. With ngl unset, Prism's --fit algorithm
+; chooses attention/other GPU tensors and leaves excess experts in system RAM.
+; fit-target reserves GPU headroom; do not claim this is tuned for 8 GB yet.
+[qwen3.6-35b-a3b]
+model = @QWEN36_MODEL@
+c = @QWEN36_CTX@
+ngl = @QWEN36_NGL@
+fit = on
+fit-target = @QWEN36_FIT_TARGET@
+fa = @QWEN36_FA@
+ctk = @QWEN36_CTK@
+ctv = @QWEN36_CTV@
+no-kv-offload = false
+parallel = 1
+ubatch-size = @AGENT_UBATCH@
+spec-type = none
+cache-ram = @AGENT_CACHE_RAM@
+reasoning = @QWEN36_REASONING@
+reasoning-budget = @QWEN36_REASONING_BUDGET@
+load-on-startup = false
+
+; Official QAT text/tool preset; Q5_K_M alternative is selected separately.
+[gemma4-e4b]
+model = @GEMMA4_MODEL@
+c = @GEMMA4_CTX@
+ngl = @GEMMA4_NGL@
+fa = @GEMMA4_FA@
+ctk = @GEMMA4_CTK@
+ctv = @GEMMA4_CTV@
+no-kv-offload = false
+parallel = 1
+ubatch-size = @AGENT_UBATCH@
+spec-type = none
+cache-ram = @AGENT_CACHE_RAM@
+reasoning = auto
+reasoning-budget = -1
+load-on-startup = false
+
 ; Text-only Bonsai: no mmproj. Retained as the coding-focused Bonsai alias.
 [bonsai-27b-ternary-text]
 model = @ROOT@/models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-PQ2_0.gguf
+ngl = @NGL@
+no-kv-offload = @NKVO@
+parallel = @PARALLEL@
+fa = @FA@
+ctk = @CTK@
+ctv = @CTV@
+ubatch-size = @UBATCH@
+reasoning-budget = @REASONING_BUDGET@
+spec-type = @SPEC@
+spec-ngram-mod-n-match = @NGRAM_MOD_N_MATCH@
+spec-ngram-mod-n-min = @NGRAM_MOD_N_MIN@
+spec-ngram-mod-n-max = @NGRAM_MOD_N_MAX@
+cache-reuse = @CACHE_REUSE@
+cache-ram = @CACHE_RAM@
+temp = 0.5
+top-p = 0.85
+top-k = 20
+min-p = 0
 chat-template-file = @ROOT@/bonsai-chat-template.jinja
 ; Its own context, set by BONSAI_CTX_TEXT and defaulting to BONSAI_CTX.
 ; Previous runtime measurements with host-side KV at 131072 tokens are
