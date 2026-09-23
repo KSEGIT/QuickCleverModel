@@ -132,6 +132,20 @@ offload and KV controls. No 12K/16K, q8_0 K/V, flash attention off/on or
 reasoning on/bounded comparison has yet passed on the target GPU. Keep these
 controls as test settings until correctness and memory measurements exist.
 
+A focused **native Metal** Qwen 4B comparison used one declared tool, a short
+prompt, and both `auto` and `required` choice. Each case included a tool result
+and a second tool call. All six off/on/bounded-128 cases passed. The two-case
+wall time was 7.54 seconds with reasoning off, 15.68 seconds on, and 15.88
+seconds with a 128-token budget. Each first call generated 26 tokens with
+reasoning off and 74 with on or bounded-128. The on and bounded-128 responses
+contained the same reasoning text, so 128 did not constrain this short case.
+A separate `auto` case with a 32-token budget passed in 6.58 seconds; its first
+call generated 59 tokens and cut the reasoning text mid-sentence. This proves
+the per-request budget is applied, but does not prove it is useful for longer
+agent tasks. One deterministic trial per setting cannot establish reliability.
+These results support keeping Qwen reasoning off as the initial repetitive-tool
+preset, pending task-level tests on the RTX target.
+
 ## Current release decision
 
 Keep the existing Bonsai preset as the default local agent until the official
