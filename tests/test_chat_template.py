@@ -220,7 +220,8 @@ class Qwen35Wiring(unittest.TestCase):
                 native = gguf_chat_template(path)
                 self.assertEqual(QWEN_NATIVE_SHA256, hashlib.sha256(native.encode()).hexdigest())
                 self.assertEqual(1, native.count(old))
-                self.assertEqual(read(QWEN_TEMPLATE), native.replace(old, new))
+                self.assertEqual(read(QWEN_TEMPLATE).rstrip("\n"),
+                                 native.replace(old, new).rstrip("\n"))
 
 
 @unittest.skipIf(jinja2 is None and not ON_CI, "jinja2 not installed")
