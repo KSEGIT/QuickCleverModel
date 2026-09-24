@@ -18,12 +18,16 @@ class AgentPresets(unittest.TestCase):
             "*", "bonsai-27b-ternary", "bonsai-27b-1bit", "bonsai-27b-ternary-text", *AGENTS,
         })
 
-    def test_agent_presets_have_native_templates_and_separate_controls(self):
+    def test_agent_presets_have_family_templates_and_separate_controls(self):
         for model in AGENTS:
             with self.subTest(model=model):
                 effective = dict(self.presets["*"])
                 effective.update(self.presets[model])
-                self.assertNotIn("chat-template-file", effective)
+                if model.startswith("qwen3.5-"):
+                    self.assertEqual("@ROOT@/qwen3.5-chat-template.jinja",
+                                     effective.get("chat-template-file"))
+                else:
+                    self.assertNotIn("chat-template-file", effective)
                 self.assertNotIn("mmproj", effective)
                 self.assertNotEqual("@CTX@", effective["c"])
                 self.assertNotEqual("@CTK@", effective["ctk"])

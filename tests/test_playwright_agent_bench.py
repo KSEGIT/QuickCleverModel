@@ -15,6 +15,14 @@ SPEC.loader.exec_module(bench)
 
 
 class BenchmarkContractTests(unittest.TestCase):
+    def test_agent_prompt_explains_playwright_refs_and_json(self):
+        prompt = bench.BROWSER_SYSTEM_PROMPT
+        self.assertIn('target "e6"', prompt)
+        self.assertIn('not "ref=e6"', prompt)
+        self.assertIn('not "[ref=e6]"', prompt)
+        self.assertIn('no Markdown fence', prompt)
+        self.assertIn('Do not repeat an action that returned an error', prompt)
+
     def test_eight_tasks_plus_synthetic_job_application(self):
         self.assertEqual(set(bench.TASKS), {
             "basic_form", "multi_page", "extraction", "conditional_application",

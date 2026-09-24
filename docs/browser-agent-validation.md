@@ -57,6 +57,79 @@ regression. Both builds logged that `cache-reuse` is disabled when mmproj is
 attached. The new-model RTX comparison is pending live tests; the GGUF weights
 have now downloaded and passed the catalogue's size and SHA-256 checks.
 
+Gemma 4 E4B official QAT Q4 loaded on the RTX with an 8,192-token context,
+f16 K/V cache, automatic flash attention, and 99 requested GPU layers. Its
+startup log reached `model loaded` after about 181 seconds while the worker
+showed sustained disk I/O pressure; do not treat that as a steady-state load
+benchmark. One live basic-form task **failed** in 29.6 seconds. Gemma navigated
+and found the Name textbox, then repeatedly passed invalid `browser_type`
+targets (`ref=e6` and `Name`) despite Playwright's errors. It made six
+malformed browser actions before a 512-token response cap ended the task.
+Observed VRAM during the task was 3,135 MiB (a single sample, not a peak).
+The RTX API probe passed 17/20 checks: Chat and Responses tool round trips,
+streaming, and two distinct tools passed; three Messages tool-continuation
+checks failed. This reproduces the earlier Apple Metal pattern and is not a
+successful Playwright run.
+
+Qwen3.5 9B Q4_K_M loaded on the RTX at 8K with f16 K/V, automatic flash
+attention, reasoning off, and 99 GPU layers. Its startup log reached `model
+loaded` after 32.8 seconds under the same disk pressure; sampled peak VRAM was
+5,427 MiB. One run of ten browser cases passed seven in 81.5 seconds total;
+the median of successful cases was 7.1 seconds. It passed basic form,
+three-step form, popup, injected tool failure, synthetic job application,
+eligible application decision, and wrong-state recovery. It failed extraction
+by repeating `browser_find` until the 30-turn cap, returned a correct no-apply
+decision in prose plus a fenced JSON block instead of strict JSON for the
+ineligible case, and hit HTTP 400 on the large-page case at 8K context. The
+last two failures need separate prompt/context investigation; no success rate
+beyond these single runs is claimed. Aggregate server-reported rates over the
+ten cases were about 987 prompt and 88 generation tokens/s; the prompt figure
+includes cached turns and is not a cold-prefill rate. Real Playwright MCP
+selection with 20 tools passed `auto` and `required`.
+
+Qwen3.5 9B's native GGUF template rejects a second system message after the
+first. Four Responses API regression cases returned HTTP 500 in the RTX API
+probe, including tool continuation and streaming. Chat and Messages tool
+round trips passed. This is a Codex compatibility blocker until the template
+is corrected and retested; ordinary browser tasks use Chat Completions and
+are unaffected by this specific failure.
+
+The first Qwen3.6 Q4_K_XL browser pass (six tasks, original prompt) passed
+four and failed two in 260.6 seconds. Its 66.9-second basic form involved 12
+tool errors from using `[ref=e6]`-style targets where Playwright expects the
+bare `e6` ID. A shared prompt change now states that exact syntax, prohibits
+identical error retries, and asks for unfenced JSON. With the revised prompt,
+Q4_K_XL completed the basic form in 17.2 seconds with zero tool errors, but
+still fenced the extraction JSON and retried an injected failed click before
+inspecting, so those two oracles failed. Its RTX API probe passed all 20 cases,
+and 20-tool Playwright selection passed `auto` and `required`. Sampled peak
+VRAM was 6,241 MiB; the container used about 14.7 GiB RAM during a task.
+
+Qwen3.6 IQ4_XS, with the same 8K hybrid fit settings and revised prompt,
+passed basic form (21.8 seconds cold, 15.1 seconds in a warm repeat),
+three-step form (24.9 seconds), and synthetic job application (48.6 seconds),
+all with zero tool errors. Sampled peak VRAM was 6,281 MiB. Its 5.4K-token
+prefix probe took 19.66 seconds with prompt caching disabled, versus 0.54 and
+0.53 seconds on two shared-prefix follow-ups. The first probe call already had
+1,710 cached tokens, so it is not a pure cold-load number. These are too few
+trials to choose between Q4_K_XL and IQ4_XS by quant speed; the browser task
+and cache state must match.
+
+Qwen3.5 4B, with the revised prompt, passed five of six selected workflows in
+42.9 seconds total (successful-case median 5.85 seconds). Basic form took 4.55
+seconds, injected-error recovery 5.85 seconds, and the synthetic application
+17.7 seconds. The extraction facts were right, but a Markdown fence failed
+strict JSON. In four additional cases, wrong-state recovery passed; eligible
+and ineligible application decisions and large-page extraction had correct
+facts/actions but failed strict JSON formatting. Its sampled peak VRAM was
+3,157 MiB and startup log reached `model loaded` at 6.44 seconds. Selection
+with 20 real Playwright tools passed `auto` and `required`.
+
+The Qwen3.5 GGUF templates for 9B and 4B have identical SHA-256 and the same
+late-system guard. A model-specific copy with only that guard changed is now
+in the PR, leaving the native Qwen tool and thinking grammar intact. It still
+needs a live Responses/Codex retest before claiming the blocker fixed.
+
 The sections below describe the earlier Apple Metal checks. Their prior
 statement that the RTX host was unavailable applies to **2026-09-23 only**.
 

@@ -86,11 +86,14 @@ mmproj = @ROOT@/models/Bonsai-27B-gguf/Bonsai-27B-mmproj-Q8_0.gguf
 chat-template-file = @ROOT@/bonsai-chat-template.jinja
 load-on-startup = false
 
-; New agent presets use the GGUF's native template. They are text-only here.
+; New agent presets are text-only. Qwen3.5 uses a copy of its native GGUF
+; template with only the late-system-message guard changed: Codex Responses
+; sends multiple instruction messages. Other families keep native templates.
 ; The 8K/f16 defaults are conservative starting points, not an RTX benchmark.
 ; Each overrides Bonsai's reasoning, speculation and cache configuration.
 [qwen3.5-9b-q4_k_m]
 model = @ROOT@/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf
+chat-template-file = @ROOT@/qwen3.5-chat-template.jinja
 temp = 0.5
 top-p = 0.85
 top-k = 20
@@ -133,6 +136,7 @@ load-on-startup = false
 
 [qwen3.5-4b-q4_k_m]
 model = @ROOT@/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf
+chat-template-file = @ROOT@/qwen3.5-chat-template.jinja
 temp = 0.5
 top-p = 0.85
 top-k = 20

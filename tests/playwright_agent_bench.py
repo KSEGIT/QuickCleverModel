@@ -61,6 +61,16 @@ INVENTORY_ORDER = ("browser_navigate", "browser_snapshot", "browser_find", "brow
                    "browser_fill_form", "browser_select_option", "browser_type", "browser_file_upload")
 CACHE_PROBE_PLAN = (("first_call", True), ("warm_prefix_2", True),
                     ("warm_prefix_3", True), ("no_cache_control", False))
+BROWSER_SYSTEM_PROMPT = (
+    "You are a local browser agent. Use the supplied browser tools on the local fixture only. "
+    "Inspect the current page before choosing element refs. Playwright snapshot refs are bare IDs: "
+    'use target "e6", not "ref=e6" and not "[ref=e6]". '
+    "Request browser_find or browser_snapshot only when needed; ordinary operations do not "
+    "include automatic snapshots. Handle tool errors by inspecting state and changing the target. "
+    "Do not repeat an action that returned an error with the same arguments. "
+    "Do not invent candidate facts. When asked for strict JSON, output only the JSON object with "
+    "no Markdown fence or explanation. Otherwise answer briefly when done. Do not access other sites."
+)
 
 
 def cache_probe_messages(index):
@@ -432,12 +442,8 @@ class Agent:
                        f" can work remotely, knows Python and Playwright. CV: {self.args.cv_path}."
                        f" For the interest answer, enter exactly: {ALLOWED_INTEREST}"
                        " Do not claim years of experience or other unsupported facts.")
-        system = ("You are a local browser agent. Use the supplied browser tools on the local fixture only. "
-                  "Inspect the current page before choosing element refs. Request browser_find or browser_snapshot "
-                  "only when needed; ordinary operations do not include automatic snapshots. "
-                  "Handle tool errors by inspecting state and retrying safely. Do not invent candidate facts. "
-                  "When done, answer briefly, or use exact JSON when requested. Do not access other sites.")
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+        messages = [{"role": "system", "content": BROWSER_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}]
         result = {"task": task, "variant": variant, "status": "FAIL", "model": self.args.model,
                   "turns": [], "navigated": False, "page_read": False, "tool_calls": 0,
                   "tool_errors": 0, "mcp_tool_errors": 0, "wrong_arguments": 0,
