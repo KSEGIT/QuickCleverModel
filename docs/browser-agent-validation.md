@@ -40,13 +40,22 @@ adds tunnel latency, but it was the same route in both trials.
 | Startup log to model loaded | about 12.24 s | about 4.36 s |
 
 This is a single run, not a success-rate or performance guarantee. The new
+run evaluated 2,917 uncached prompt tokens versus 3,707 in the old run; the
+reported prompt rates therefore do not isolate a kernel-speed change. Peak
+VRAM came from worker `nvidia-smi` telemetry sampled every 500 ms, and load
+times came from the corresponding Docker startup logs, not the browser JSON
+reports (which leave those fields empty). The raw telemetry and logs are in
+the ignored worker `run/rtx/` directory.
+
+The new
 image loaded the GGUF and mmproj and served `/v1/chat/completions`,
 `/v1/responses`, and `/v1/messages` tool round trips. In a short 128-token API
 probe, both builds failed the same plain-text cases because reasoning consumed
 the cap. One two-tool Responses case passed on the old build and failed on the
 new build; repeat it with a larger token limit before assigning a parser
 regression. Both builds logged that `cache-reuse` is disabled when mmproj is
-attached. The new-model RTX comparison is still pending full verified weights.
+attached. The new-model RTX comparison is pending live tests; the GGUF weights
+have now downloaded and passed the catalogue's size and SHA-256 checks.
 
 The sections below describe the earlier Apple Metal checks. Their prior
 statement that the RTX host was unavailable applies to **2026-09-23 only**.
