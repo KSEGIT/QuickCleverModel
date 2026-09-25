@@ -54,8 +54,9 @@ probe, both builds failed the same plain-text cases because reasoning consumed
 the cap. One two-tool Responses case passed on the old build and failed on the
 new build; repeat it with a larger token limit before assigning a parser
 regression. Both builds logged that `cache-reuse` is disabled when mmproj is
-attached. The new-model RTX comparison is pending live tests; the GGUF weights
-have now downloaded and passed the catalogue's size and SHA-256 checks.
+attached. The downloaded GGUF weights passed the catalogue's size and SHA-256
+checks. The new-model RTX tests below are single runs unless a repeat count is
+stated.
 
 Gemma 4 E4B official QAT Q4 loaded on the RTX with an 8,192-token context,
 f16 K/V cache, automatic flash attention, and 99 requested GPU layers. Its
@@ -70,6 +71,17 @@ The RTX API probe passed 17/20 checks: Chat and Responses tool round trips,
 streaming, and two distinct tools passed; three Messages tool-continuation
 checks failed. This reproduces the earlier Apple Metal pattern and is not a
 successful Playwright run.
+
+With the shared prompt's bare-ref syntax explained, Gemma improved from the
+first browser failure to five passes in ten single-run cases. Basic form took
+14.0 seconds and popup 19.5 seconds. It passed both application decisions and
+wrong-state recovery, but failed the three-step form, strict JSON extraction,
+injected-error recovery, synthetic job application, and large-page extraction.
+The job fixture ended in `Application incomplete` despite the model claiming it
+had submitted. Six-case total wall time was 120.7 seconds, with two passes;
+sampled peak VRAM was 3,135 MiB and a later warm model load logged 11.4
+seconds. These outcomes do not support Gemma as the everyday browser default
+on this stack, despite fast token generation.
 
 Qwen3.5 9B Q4_K_M loaded on the RTX at 8K with f16 K/V, automatic flash
 attention, reasoning off, and 99 GPU layers. Its startup log reached `model
@@ -125,10 +137,92 @@ facts/actions but failed strict JSON formatting. Its sampled peak VRAM was
 3,157 MiB and startup log reached `model loaded` at 6.44 seconds. Selection
 with 20 real Playwright tools passed `auto` and `required`.
 
+In a later repeat of the four core workflows (basic form, three-step form,
+injected tool failure, synthetic job application), Qwen3.5 4B passed all 12
+cases across three repetitions with the patched template. Total wall time was
+127.4 seconds; the successful-case median was 8.53 seconds and p95 was 18.43
+seconds. Nine browser-action errors occurred, but the agent recovered in every
+case. Sampled peak VRAM was 3,157 MiB. Mixed cached-turn server timings were
+about 1,372 prompt and 135 generation tokens/s; neither is a cold-prefill
+measurement. This core-workflow result does **not** erase its strict-JSON
+failures in the broader ten-case set.
+
 The Qwen3.5 GGUF templates for 9B and 4B have identical SHA-256 and the same
 late-system guard. A model-specific copy with only that guard changed is now
-in the PR, leaving the native Qwen tool and thinking grammar intact. It still
-needs a live Responses/Codex retest before claiming the blocker fixed.
+in the PR, leaving the native Qwen tool and thinking grammar intact. Mounted
+into the RTX test server, it passed all 20 API probe cases, including the four
+Responses cases that previously returned HTTP 500. The real Codex CLI test
+still failed before its first request: the macOS filesystem confinement blocked
+in-process app-server initialisation. That is an environment failure, not a
+model pass; the actual CLI round trip remains unverified.
+
+A later real Claude Code CLI test passed the isolated file read/edit round trip
+with Qwen3.5 9B after the harness bounded output to 2,048 tokens and disabled
+compaction for an explicit 8K context. The first run copied a line-number
+prefix from the Read tool; a clearer fixture instruction fixed that on repeat.
+Real OpenCode read the fixture and wrote a file, but copied its Read-tool line
+number despite the instruction, so its exact-output oracle failed. Claude Code
+plus the full Playwright MCP inventory did not complete at 8K, 12K, or 16K:
+it progressed farther at 16K (navigate, snapshot, tabs, close) but then
+reported `Prompt is too long`. This is a real-client limit, not a synthetic
+Messages API pass. The harness still keeps Playwright snapshots explicit and
+image responses omitted.
+
+Qwen3.5 9B with the revised prompt and patched template passed eight of ten
+single-run browser cases in 66.7 seconds total; successful-case median was
+6.9 seconds. It did not click Apply for the ineligible candidate, but its
+answer contained prose and fenced JSON rather than strict JSON. The large-page
+request needed 13,878 tokens: 8K and 12K returned HTTP 400. At 16K it read
+the page and extracted correct facts in 11.1 seconds, but again fenced the
+JSON, so the strict oracle still failed. Observed VRAM was 5,555 MiB at 12K
+and 5,687 MiB at 16K (single samples, not peaks). A 5.4K-token prefix probe
+on the 8K server took 2.16 seconds with caching disabled and 0.19/0.23
+seconds on shared-prefix calls. The first probe call already had 1,710 cached
+tokens; it was not a pure cold call.
+
+Granite 4.1 8B Q4_K_M loaded at 8K with native template, f16 K/V, automatic
+flash attention, and 99 GPU layers. Disk pressure stretched the startup-log
+load to about 178 seconds; sampled peak VRAM was 6,417 MiB. With the revised
+prompt it passed six of ten single-run browser cases: basic form, three-step
+form, strict JSON extraction, eligible application decision, wrong-state
+recovery, and large-page extraction. It failed popup, injected-error recovery,
+synthetic job application, and ineligible decision; some final answers claimed
+success that the fixture did not confirm. Its RTX API probe passed 19/20; the
+two-distinct-tool Responses continuation missed one tool result. Playwright
+selection with 20 tools passed `auto` and `required`. This makes Granite useful
+as a structured-output comparison, but not yet a faster reliable browser
+default.
+
+## Matched core-workflow repeat, 2026-09-25
+
+Both Qwen3.5 Q4_K_M models used the pinned Prism image, patched Qwen
+template, 8K context, f16 K/V, automatic flash attention, reasoning off,
+99 GPU layers, the same local Playwright MCP fixture, and `tool_choice=auto`.
+Each completed basic form, three-step form, injected-error recovery, and the
+synthetic job application three times. The RTX inference server was accessed
+over the same SSH tunnel. These are 12 workflow trials per model, not an
+estimate of production-wide reliability.
+
+| Core-workflow result | Qwen3.5 4B | Qwen3.5 9B |
+| --- | ---: | ---: |
+| Successful / total | 12 / 12 | 12 / 12 |
+| Total wall time | 127.37 s | 152.71 s |
+| Median / p95 successful task | 8.53 / 18.43 s | 10.78 / 22.16 s |
+| Model inference / browser execution | 100.4 / 27.0 s | 128.3 / 24.3 s |
+| LLM turns | 144 | 129 |
+| Tool errors / wrong arguments | 9 / 3 | 6 / 0 |
+| Mixed cached-turn prompt / generation speed | 1,372 / 135 t/s | 1,155 / 88 t/s |
+
+Qwen3.5 4B finished this narrow set about 17% faster overall. Qwen3.5 9B
+used fewer turns and made no wrong-argument calls. The broader ten-case runs
+still favour 9B for strict extraction and decisions: both models have JSON
+formatting failures, but 4B failed more of those cases. Keep 9B as the
+**provisional everyday agent** and use 4B for simple, deterministic workflows;
+do not switch between them after every browser action. More repeated strict
+JSON and long-page trials are needed before calling either the final winner.
+The 9B server logged about 13.3 seconds from startup to model loaded in this
+warm repeat. Its GPU/RAM sampler was not active, so use the earlier VRAM
+samples rather than treating this run as a peak-memory measurement.
 
 The sections below describe the earlier Apple Metal checks. Their prior
 statement that the RTX host was unavailable applies to **2026-09-23 only**.
