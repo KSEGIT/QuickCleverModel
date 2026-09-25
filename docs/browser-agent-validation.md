@@ -246,6 +246,46 @@ but it was only one task. These checks reduce the upgrade risk; they do not
 yet justify replacing the worker's production image. The old production
 container was restored and its authenticated `/health` checked after testing.
 
+## Context and concurrency follow-up, 2026-09-25
+
+The worker lacks Node and the Playwright/Chrome setup required by this
+benchmark. These checks therefore ran the isolated Playwright MCP fixture on
+the Mac through the loopback SSH tunnel, as in the earlier RTX runs. Inference
+and VRAM measurement were on the RTX worker. The figures do **not** include a
+browser running on the worker's GPU. The old production inference container was
+restored afterward; its authenticated `/health` returned HTTP 200.
+
+Qwen3.5 9B Q4_K_M loaded with f16 GPU K/V, `--parallel 1`, and
+`--ctx-size 32768`; the server logged one 32,768-token slot. Idle VRAM was
+6,257 MiB and a sample during browser work was 6,269 / 8,192 MiB. The
+synthetic job application passed in 15.7 seconds. The large-page task reached
+a 15,568-token prompt and finished in 11.1 seconds without context or OOM
+errors, but failed the strict-output oracle by adding prose and a fenced JSON
+block. This proves 32K load and request acceptance, not strict extraction
+reliability or peak memory under a worker-side browser.
+
+The same model loaded with `--parallel 2 --ctx-size 49152`; the server logged
+two 24,576-token slots. Idle VRAM was 6,811 MiB and a sample during
+simultaneous work was 6,823 / 8,192 MiB. Two pairs of synthetic application
+agents ran concurrently: **2/4 passed**. In each pair the failed agent filled
+the Name field with `Ada Lovelace` rather than `Ada`, reached the
+`Application incomplete` state, then exhausted the 30-turn cap while trying
+to recover. This was a task error, not a context or GPU error. The failures
+cannot be attributed solely to concurrency without a matched serial run on
+the two-slot server.
+The passing concurrent applications took 24.6 and 24.9 seconds, slower than
+the 15.7-second single-slot trial. In a separate simultaneous pair with the
+full safe Playwright tool inventory, both large-page requests reached a
+16,243-token prompt in separate slots without context or OOM errors. Both
+extracted correct facts but failed strict JSON because they fenced the answer.
+
+For now, use **one 32K Qwen3.5 9B agent** for long job-application work and
+queue additional jobs. Two 24K agents are a memory-feasible experiment, not
+a reliable production setting. The current preset still defaults to 8K; set
+`QCM_QWEN9_CTX=32768` explicitly for a dedicated long-context test server.
+Do not infer 32K support for other model presets or claim worker-side browser
+VRAM headroom from these numbers.
+
 The sections below describe the earlier Apple Metal checks. Their prior
 statement that the RTX host was unavailable applies to **2026-09-23 only**.
 
