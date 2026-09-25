@@ -270,11 +270,21 @@ simultaneous work was 6,823 / 8,192 MiB. Two pairs of synthetic application
 agents ran concurrently: **2/4 passed**. In each pair the failed agent filled
 the Name field with `Ada Lovelace` rather than `Ada`, reached the
 `Application incomplete` state, then exhausted the 30-turn cap while trying
-to recover. This was a task error, not a context or GPU error. The failures
-cannot be attributed solely to concurrency without a matched serial run on
-the two-slot server.
+to recover. This was a task error, not a context or GPU error.
 The passing concurrent applications took 24.6 and 24.9 seconds, slower than
-the 15.7-second single-slot trial. In a separate simultaneous pair with the
+the 15.7-second single-slot trial.
+
+A matched serial control ran on 2026-09-25 on the same two-slot server
+(same image, flags, and benchmark arguments), with one agent at a time:
+**3/4 passed**, in 17.7, 14.9 and 15.0 seconds (18 turns each, peak prompt
+about 4,870 tokens). The one failure had the same cause: it filled Name with
+`Ada Lovelace` and hit the 30-turn cap after 25.3 seconds. So this error also
+happens without concurrency; two agents at once did not cause it. Four trials
+each are too few to show whether concurrency makes it more frequent (2/4 vs
+1/4 failures). Concurrency did add about 9 seconds per passing run. Raw
+reports: `run/rtx-qwen9-2x24k-serial-{a,b,c,d}.json`.
+
+In a separate simultaneous pair with the
 full safe Playwright tool inventory, both large-page requests reached a
 16,243-token prompt in separate slots without context or OOM errors. Both
 extracted correct facts but failed strict JSON because they fenced the answer.
