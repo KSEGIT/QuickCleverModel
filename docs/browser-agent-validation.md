@@ -224,6 +224,28 @@ The 9B server logged about 13.3 seconds from startup to model loaded in this
 warm repeat. Its GPU/RAM sampler was not active, so use the earlier VRAM
 samples rather than treating this run as a peak-memory measurement.
 
+## Bonsai compatibility follow-up, 2026-09-25
+
+The upgraded Prism image loaded the existing `bonsai-27b-ternary` PQ2_0 GGUF,
+its Q8_0 mmproj, and the custom Bonsai template at the worker's configured
+65,536-token host-KV setting (`q8_0` K/V, 256 ubatch, 99 requested GPU
+layers). Its isolated API probe passed **20/20** checks, covering health,
+model metadata, Chat Completions, Responses, Messages, streaming, multi-tool
+continuation, and `auto`/`required` one-tool choice. A live VRAM sample was
+7,793 / 8,192 MiB. The server nevertheless logged one failed 248 MiB CUDA
+buffer allocation during mmproj load before reporting `model loaded` and
+passing the probe. Treat that as a memory-headroom warning, not a clean
+GPU-fit result; the test did not run a long browser session or image input.
+
+The `bonsai-27b-ternary-text` preset loaded the same PQ2_0 GGUF and Bonsai
+template without mmproj at its configured 131,072-token host-KV context. Its
+short API probe passed **9/9** health, metadata, Chat, Responses, Messages,
+and streaming checks. Tool continuation was not exercised for this text-only
+run. The earlier matched Bonsai 1-bit browser trial passed on the new image,
+but it was only one task. These checks reduce the upgrade risk; they do not
+yet justify replacing the worker's production image. The old production
+container was restored and its authenticated `/health` checked after testing.
+
 The sections below describe the earlier Apple Metal checks. Their prior
 statement that the RTX host was unavailable applies to **2026-09-23 only**.
 
