@@ -20,8 +20,12 @@ file is `.github/workflows/benchmark.yml`.
 This repository is public. A workflow that runs on `push` or on a pull
 request would also run for a pull request from a fork, with no review. That
 must never reach the worker over SSH. So the workflow only has a
-`workflow_dispatch` (manual) trigger. Only a person with write access to the
-repository can start a run.
+`workflow_dispatch` (manual) trigger.
+
+GitHub itself lets anyone with write access to the repository start a
+`workflow_dispatch` run. In practice, only the repository owner should start
+one, because a run stops the live model for everyone (see "Stopping
+production, on purpose" below).
 
 ## One-time setup
 
@@ -74,16 +78,24 @@ public docs where they'd be specific to your worker):
 | `WORKER_HOST` | The worker's tailnet name or address | none — must be set |
 | `WORKER_SSH_USER` | The SSH account the job connects as | none — must be set |
 | `LIVE_CONTAINER` | The production container the job pauses and restores | `bonsai-llama-1` |
-| `LIVE_HEALTH_URL` | Health-check URL for the live container, checked on the worker | — |
-| `LIVE_ENV_FILE` | Worker path to the live container's env file, if it needs one | — |
+| `LIVE_HEALTH_URL` | Health-check URL for the live container, checked on the worker | `http://127.0.0.1:8080/health` |
+| `LIVE_ENV_FILE` | Worker path to the live container's env file, if it needs one | none — no key is sent if unset |
 | `TEST_IMAGE` | The pinned test image the benchmark runs | `qcm-rtx-validation:922be44` |
-| `MODELS_DIR` | Worker path to the model files | — |
-| `TEMPLATE_FILE` | Worker path to the chat template for the test server | — |
+| `MODELS_DIR` | Worker path to the model files | none — must be set |
+| `TEMPLATE_FILE` | Worker path to the chat template for the test server | none — must be set |
 
 A `workflow_dispatch` run also takes `worker_host` and `ssh_user` inputs that
 can override these variables. Leave them blank when you start a run — the
 job then uses the variables above. If you type a value instead, it shows on
 the run's page, and this repository is public.
+
+**`LIVE_ENV_FILE` must be readable by the SSH user, without `sudo`.** The
+restore step reads the live server's API key from this file, on the worker,
+to check that the live container answers after it restarts. If the SSH user
+cannot read the file, the check sends no key. The live server can then
+answer 401, and the job reports the live container as unhealthy — even
+though the container itself is running. Set file permissions so the
+dedicated SSH account (from step 2) can read this file directly.
 
 ### 4. Turn on GitHub Pages
 
@@ -91,6 +103,13 @@ the run's page, and this repository is public.
 2. Under **Build and deployment**, set **Source** to **GitHub Actions**.
 3. Save. This step needs repository admin rights, so only the owner can do
    it, and it is a one-time setup step, not something each run repeats.
+4. Go to **Settings → Environments → github-pages** (GitHub creates this
+   environment the first time a Pages deployment runs, or you can create it
+   yourself). Check its **Deployment branches and tags** rule. If it only
+   allows a specific branch (often the default branch), and you dispatch a
+   benchmark run from a different branch, the publish job stalls or is
+   blocked — the environment rule never matches. Add every branch you might
+   dispatch a run from, or set the rule to allow all branches.
 
 ## Starting a run
 
@@ -103,14 +122,14 @@ the run's page, and this repository is public.
 | --- | --- | --- |
 | `worker_host` | Overrides `WORKER_HOST` for this run only | (environment variable) |
 | `ssh_user` | Overrides `WORKER_SSH_USER` for this run only | (environment variable) |
-| `model_preset` | Which model to benchmark: `qwen3.5-9b` or `qwen3.5-4b` | — |
+| `model_preset` | Which model to benchmark: `qwen3.5-9b` or `qwen3.5-4b` | `qwen3.5-9b` |
 | `ctx` | Context size, in tokens | `32768` |
 | `suites` | Space-separated list of suites to run: `fixture`, `long_context`, `live_web`, `concurrency` | `fixture long_context live_web` |
 | `repetitions` | How many times to repeat each suite's tasks | `1` |
 | `restore_production` | Restart the live container when the run ends | `true` |
 
-3. Only a repository owner should start a run — see "Why a manual trigger
-   only" above.
+3. Anyone with write access to the repository can start a run, but only the
+   repository owner should — see "Why a manual trigger only" above.
 4. Click **Run workflow** and wait. A run can take a while, because it
    downloads nothing new but does run real browser tasks against a live
    model, one suite at a time.
@@ -147,10 +166,17 @@ hand right after the run.
    starts the live container again (unless you set `restore_production` to
    `false`). It checks the live container's health endpoint. If that check
    does not return HTTP 200, the job fails — that tells you production is
-   not back up cleanly, instead of hiding the problem.
-6. On success, it writes a run summary to the `gh-pages` branch
+   not back up cleanly, instead of hiding the problem. This step retries on
+   its own: starting the live container is tried up to 5 times, and if the
+   whole step still fails, the workflow waits 20 seconds and runs it a
+   second time. This covers a short network drop between the runner and the
+   worker.
+6. On success, a separate publish job downloads the run summary that this
+   job uploaded as an artifact, then writes it to the `gh-pages` branch
    (`data/runs/<run_id>.json`), rebuilds the run index (`data/index.json`),
-   and updates the Pages site from `bench-site/`.
+   and updates the Pages site from `bench-site/`. If the benchmark job never
+   reaches its "Upload summary" step, there is nothing for the publish job
+   to download, and publishing does not happen.
 
 Only one run can happen at a time. If you start a second run while one is
 already going, it waits its turn instead of running alongside the first.
