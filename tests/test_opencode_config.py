@@ -63,12 +63,14 @@ class Harness(unittest.TestCase):
                 fh.write(f"{k}={v}\n")
 
     def run_script(self, *args):
-        # Strip every BONSAI_* from the inherited environment. The script
-        # sources .env with `set -a`, but a var already exported in the
+        # Strip every BONSAI_* and QCM_* from the inherited environment. The
+        # script sources .env with `set -a`, but a var already exported in the
         # developer's shell survives and silently overrides the fixture —
         # in a repo whose whole premise is exporting BONSAI_*, that is a
-        # near-certain flake rather than a theoretical one.
-        env = {k: v for k, v in os.environ.items() if not k.startswith("BONSAI_")}
+        # near-certain flake rather than a theoretical one. QCM_*_CTX
+        # (agent context sizes) would change the rendered model limits.
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("BONSAI_", "QCM_"))}
         env["BONSAI_ENV_FILE"] = self.env_file
         env["XDG_CONFIG_HOME"] = self.cfg_home
         env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
