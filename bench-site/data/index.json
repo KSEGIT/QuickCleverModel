@@ -43,7 +43,7 @@
           "total": 4,
           "pass_rate": 75.0,
           "median_seconds": 16.3,
-          "peak_vram_mib": 6400,
+          "peak_vram_mib": 6823,
           "peak_prompt_tokens": 6801
         },
         "concurrency_parallel": {

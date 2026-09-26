@@ -70,7 +70,7 @@ class SummarizeRun2x24kTest(unittest.TestCase):
         self.assertEqual((s["passed"], s["total"]), (3, 4))
         self.assertEqual(s["pass_rate"], 75.0)
         self.assertEqual(s["median_seconds"], 16.3)
-        self.assertEqual(s["peak_vram_mib"], 6400)
+        self.assertEqual(s["peak_vram_mib"], 6823)
 
     def test_concurrency_parallel_two_of_four(self):
         s = self.summary["suites"]["concurrency_parallel"]
@@ -78,6 +78,17 @@ class SummarizeRun2x24kTest(unittest.TestCase):
         self.assertEqual(s["pass_rate"], 50.0)
         self.assertEqual(s["median_seconds"], 29.7)
         self.assertEqual(s["peak_vram_mib"], 6823)
+
+    def test_concurrency_phases_share_one_vram_sample(self):
+        """run_suites.py samples VRAM once for the whole concurrency suite
+        (both phases run back to back under one VramSampler) and writes a
+        single vram-concurrency.json — never a per-phase file. Both summary
+        entries must read that same peak, not two independent ones."""
+        serial = self.summary["suites"]["concurrency_serial"]
+        parallel = self.summary["suites"]["concurrency_parallel"]
+        self.assertEqual(serial["peak_vram_mib"], 6823)
+        self.assertEqual(parallel["peak_vram_mib"], 6823)
+        self.assertEqual(serial["peak_vram_mib"], parallel["peak_vram_mib"])
 
     def test_run_level_peak_is_max_across_suites(self):
         peaks = [s["peak_vram_mib"] for s in self.summary["suites"].values()]

@@ -199,10 +199,15 @@ def summarize(dir_path):
             passed, total, seconds, peak_tokens, peak_vram,
             error=error_for("live_web", "live_web"))
 
-    # concurrency: serial and parallel phases, each its own suite key
-    for phase, pattern, vram_name in (
-        ("concurrency_serial", "concurrency-serial-*.json", "vram-concurrency_serial.json"),
-        ("concurrency_parallel", "concurrency-parallel-*.json", "vram-concurrency_parallel.json"),
+    # concurrency: serial and parallel phases, each its own suite key.
+    # run_suites.py samples VRAM once for the whole concurrency suite (both
+    # phases run back to back under one VramSampler) and writes a single
+    # vram-concurrency.json, not a per-phase file — so both phases share
+    # that one peak.
+    concurrency_peak_vram = _vram_peak(dir_path, "vram-concurrency.json")
+    for phase, pattern in (
+        ("concurrency_serial", "concurrency-serial-*.json"),
+        ("concurrency_parallel", "concurrency-parallel-*.json"),
     ):
         phase_reports = _glob_reports(dir_path, pattern)
         results = [r for report in phase_reports for r in report.get("results", [])]
@@ -212,7 +217,7 @@ def summarize(dir_path):
             else:
                 passed, total, seconds, peak_tokens, peak_vram = 0, 0, None, None, None
             if peak_vram is None:
-                peak_vram = _vram_peak(dir_path, vram_name, "vram-concurrency.json")
+                peak_vram = concurrency_peak_vram
             suites[phase] = _suite_dict(
                 passed, total, seconds, peak_tokens, peak_vram,
                 error=error_for(phase, "concurrency"))
