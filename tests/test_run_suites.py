@@ -152,7 +152,11 @@ class VramSamplerTest(unittest.TestCase):
         sampler = run_suites.VramSampler("unused", interval=0.01,
                                          runner=lambda: next(values, None))
         with sampler:
-            sampler.stop.wait(0.05)
+            # Wait for real samples, not a fixed sleep: a loaded CI host may
+            # not schedule the thread within a few milliseconds.
+            deadline = time.monotonic() + 10
+            while len(sampler.samples) < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
         report = sampler.report()
         self.assertGreaterEqual(len(report["samples_mib"]), 1)
         self.assertEqual(report["peak_mib"], max(report["samples_mib"]))
@@ -171,7 +175,10 @@ class BuildMetaTest(unittest.TestCase):
         self.assertEqual(meta, {"model": "m", "ctx": 32768, "parallel": 1, "gpu": "RTX 3070 Ti",
                                 "commit": "abc1234", "run_id": "42",
                                 "created_utc": "2026-09-26T00:00:00+00:00",
-                                "suites": ["fixture", "long_context"]})
+                                "suites": ["fixture", "long_context"],
+                                "suite_settings": {
+                                    "fixture": {"ctx": 32768, "parallel": 1},
+                                    "long_context": {"ctx": 32768, "parallel": 1}}})
 
     def test_merging_a_second_invocation_unions_suites_and_keeps_first_created_utc(self):
         existing = {"model": "m", "ctx": 32768, "parallel": 1, "gpu": "RTX 3070 Ti",
@@ -184,6 +191,59 @@ class BuildMetaTest(unittest.TestCase):
         self.assertEqual(meta["suites"], ["fixture", "long_context", "live_web", "concurrency"])
         self.assertEqual(meta["ctx"], 49152)
         self.assertEqual(meta["parallel"], 2)
+
+    def test_suite_settings_keep_each_phase_server(self):
+        """The concurrency phase runs on a different server: its ctx must not
+        overwrite the settings the earlier suites ran with."""
+        first = run_suites.build_meta(None, make_args(suites=["fixture"], ctx=32768, parallel=1),
+                                      "abc1234", None, "42", "2026-09-26T00:00:00+00:00")
+        second = run_suites.build_meta(first, make_args(suites=["concurrency"], ctx=49152, parallel=2),
+                                       "abc1234", None, "42", "2026-09-26T01:00:00+00:00")
+        self.assertEqual(second["suite_settings"], {
+            "fixture": {"ctx": 32768, "parallel": 1},
+            "concurrency": {"ctx": 49152, "parallel": 2}})
+
+
+class TimeBudgetTest(unittest.TestCase):
+    """The workflow sizes its step caps and refuses too many repetitions
+    from these numbers, so the restore step always fits in the job."""
+
+    ALL_PHASE1 = ["fixture", "long_context", "live_web"]
+
+    def test_batch_count_matches_build_plan(self):
+        args = make_args(suites=["fixture", "long_context", "live_web", "concurrency"],
+                         parallel=2, repetitions=3)
+        batches, _ = run_suites.build_plan(args, pathlib.Path("/tmp/out"))
+        for suite in args.suites:
+            planned = sum(1 for b in batches if b[0]["suite"] == suite)
+            self.assertEqual(run_suites.batch_count(suite, 3), planned, suite)
+
+    def test_step_cap_covers_every_job_timeout(self):
+        reps = 2
+        args = make_args(repetitions=reps)
+        floor = sum(run_suites.batch_count(s, reps) * run_suites.job_timeout_for(s, args)
+                    for s in self.ALL_PHASE1)
+        self.assertGreater(run_suites.step_minutes(self.ALL_PHASE1, reps) * 60, floor)
+
+    def test_no_suites_means_no_step_time(self):
+        self.assertEqual(run_suites.step_minutes([], 5), 0)
+
+    def test_max_repetitions_fits_and_one_more_does_not(self):
+        for phase1, phase2 in ((self.ALL_PHASE1, ["concurrency"]), (["fixture"], []),
+                               (["live_web"], ["concurrency"])):
+            with self.subTest(phase1=phase1, phase2=phase2):
+                most = run_suites.max_repetitions(phase1, phase2)
+                self.assertGreaterEqual(most, 1)
+                self.assertTrue(run_suites.fits_job(phase1, phase2, most))
+                self.assertFalse(run_suites.fits_job(phase1, phase2, most + 1))
+                total = (run_suites.step_minutes(phase1, most) + run_suites.step_minutes(phase2, most)
+                         + run_suites.RESERVED_MINUTES)
+                self.assertLessEqual(total, run_suites.JOB_TIMEOUT_MINUTES)
+
+    def test_default_suites_cap_is_two_repetitions(self):
+        # Documented in docs/benchmark-action.md; update both together.
+        self.assertEqual(run_suites.max_repetitions(self.ALL_PHASE1, ["concurrency"]), 2)
+        self.assertEqual(run_suites.max_repetitions(self.ALL_PHASE1, []), 2)
 
 
 class JobTimeoutTest(unittest.TestCase):
@@ -267,8 +327,10 @@ class RunJobTest(unittest.TestCase):
                    "cmd": [sys.executable, "-c",
                            f"import json,pathlib,time; "
                            f"pathlib.Path({str(output)!r}).write_text(json.dumps({{'results': [1]}})); "
-                           f"time.sleep(5)"]}
-            reason = run_suites.run_job(job, timeout=0.3)
+                           f"time.sleep(30)"]}
+            # 3 s: the child must start Python and write before the kill,
+            # even on a slow, loaded CI host.
+            reason = run_suites.run_job(job, timeout=3)
             self.assertIsNotNone(reason)
             self.assertIn("timed out", reason)
             self.assertIn("kept the partial report", reason)
@@ -284,7 +346,8 @@ class RunJobTest(unittest.TestCase):
             output = pathlib.Path(tmp) / "out.json"
             job = {"suite": "fixture", "output": output,
                    "cmd": ["bash", "-c", f"sleep 30 & echo $! > {pidfile}; wait"]}
-            reason = run_suites.run_job(job, timeout=0.3)
+            # 2 s: bash must have started the grandchild before the kill.
+            reason = run_suites.run_job(job, timeout=2)
             self.assertIn("timed out", reason)
             deadline = time.monotonic() + 5
             pid = None
@@ -327,30 +390,31 @@ class RunBatchTest(unittest.TestCase):
         EVERY job in the pair a fresh full `timeout`, so a job checked later
         effectively gets (time already elapsed + a full fresh timeout)
         instead of sharing one deadline that starts when the pair starts.
-        Both jobs launch concurrently at t=0; `slow` needs 0.65s (more than
-        the shared 0.6s deadline, so the fix must kill it) but less than
-        (fast's 0.35s + a fresh 0.6s = 0.95s), which is exactly the window
-        the bug would have given it."""
+        Both jobs launch concurrently at t=0; `slow` needs 2.6 s (more than
+        the shared 2.0 s deadline, so the fix must kill it) but less than
+        (fast's 1.0 s + a fresh 2.0 s = 3.0 s), which is exactly the window
+        the bug would have given it. The gaps are whole fractions of a
+        second so a loaded CI host (slow Python start-up) cannot blur them."""
         with tempfile.TemporaryDirectory() as tmp:
             fast_output = pathlib.Path(tmp) / "fast.json"
             slow_output = pathlib.Path(tmp) / "slow.json"
             fast = {"suite": "concurrency", "output": fast_output,
                     "cmd": [sys.executable, "-c",
-                            f"import json,time,pathlib; time.sleep(0.35); "
+                            f"import json,time,pathlib; time.sleep(1.0); "
                             f"pathlib.Path({str(fast_output)!r}).write_text(json.dumps({{'status':'PASS'}}))"]}
             slow = {"suite": "concurrency", "output": slow_output,
                     "cmd": [sys.executable, "-c",
-                            f"import json,time,pathlib; time.sleep(0.65); "
+                            f"import json,time,pathlib; time.sleep(2.6); "
                             f"pathlib.Path({str(slow_output)!r}).write_text(json.dumps({{'status':'PASS'}}))"]}
             started = time.monotonic()
-            suite, reason = run_suites.run_batch([fast, slow], timeout=0.6)
+            suite, reason = run_suites.run_batch([fast, slow], timeout=2.0)
             elapsed = time.monotonic() - started
             self.assertIn("timed out", reason)
             self.assertTrue(fast_output.exists())
             self.assertFalse(slow_output.exists(),
                              "slow job got a fresh timeout instead of sharing the pair's deadline")
-            self.assertLess(elapsed, 0.65,
-                            "ran past the shared deadline up to slow's own natural finish time")
+            self.assertLess(elapsed, 2.5,
+                            "ran past the shared deadline towards slow's own natural finish time")
 
 
 class RunIntegrationTest(unittest.TestCase):

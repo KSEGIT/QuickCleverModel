@@ -53,6 +53,11 @@ class SummarizeRun32kTest(unittest.TestCase):
         self.assertEqual(s["median_seconds"], 49.5)
         self.assertEqual(s["peak_vram_mib"], 6120)
 
+    def test_suites_without_settings_default_to_the_run_ctx(self):
+        for key in ("fixture", "live_web"):
+            s = self.summary["suites"][key]
+            self.assertEqual((s["ctx"], s["parallel"]), (32768, 1), key)
+
     def test_long_context_absent_when_not_requested(self):
         self.assertNotIn("long_context", self.summary["suites"])
         self.assertNotIn("concurrency_serial", self.summary["suites"])
@@ -93,6 +98,32 @@ class SummarizeRun2x24kTest(unittest.TestCase):
     def test_run_level_peak_is_max_across_suites(self):
         peaks = [s["peak_vram_mib"] for s in self.summary["suites"].values()]
         self.assertEqual(max(peaks), 6823)
+
+    def test_concurrency_suites_carry_the_2_slot_server_settings(self):
+        for key in ("concurrency_serial", "concurrency_parallel"):
+            s = self.summary["suites"][key]
+            self.assertEqual((s["ctx"], s["parallel"]), (49152, 2), key)
+
+
+class SummarizeMergedPhasesTest(unittest.TestCase):
+    """A run with both phases: meta.json keeps the 1-slot ctx at the top,
+    and suite_settings says concurrency ran on the 2-slot server. Each
+    suite's ctx must be the one its own server used."""
+
+    def test_each_suite_gets_its_own_server_ctx(self):
+        with tempfile.TemporaryDirectory() as d:
+            meta = {"model": "m", "ctx": 32768, "parallel": 1, "run_id": "1",
+                    "created_utc": "2026-09-26T00:00:00+00:00",
+                    "suites": ["long_context", "concurrency"],
+                    "suite_settings": {"concurrency": {"ctx": 49152, "parallel": 2}}}
+            with open(os.path.join(d, "meta.json"), "w") as f:
+                json.dump(meta, f)
+            summary = collect.summarize(d)
+        self.assertEqual(summary["ctx"], 32768)
+        suites = summary["suites"]
+        self.assertEqual((suites["long_context"]["ctx"], suites["long_context"]["parallel"]), (32768, 1))
+        for key in ("concurrency_serial", "concurrency_parallel"):
+            self.assertEqual((suites[key]["ctx"], suites[key]["parallel"]), (49152, 2), key)
 
 
 class SummarizeRun64kTest(unittest.TestCase):

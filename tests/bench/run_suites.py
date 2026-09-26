@@ -13,6 +13,7 @@ Run from the repository root: python3 tests/bench/run_suites.py ...
 import argparse
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 SUITE_ORDER = ("fixture", "long_context", "live_web", "concurrency")
@@ -48,6 +50,23 @@ JOB_STARTUP_MARGIN = 60  # same, for suites that are a single request/task
 # sample's own subprocess timeout must exceed that or it kills the SSH
 # connection before it even finishes connecting.
 VRAM_SAMPLE_TIMEOUT = 20
+# The concurrency suite: four one-at-a-time runs, then two concurrent pairs.
+CONCURRENCY_SERIAL_RUNS = 4
+CONCURRENCY_PAIRS = 2
+# Worst-case extra time per batch past its job timeout: _kill_process_group
+# waits up to 10 s + 5 s per process, and a pair kills two in turn.
+BATCH_KILL_GRACE = 30
+
+# Workflow time budget (.github/workflows/benchmark.yml). The job has
+# JOB_TIMEOUT_MINUTES in total. RESERVED_MINUTES covers everything that is
+# not a suite step: set-up and tailnet join (~10), both `worker.sh up` steps
+# (10 each, their own step caps), merge/summarize/uploads (~5), and the
+# `worker.sh down` restore step (20, its own step cap). A suite step's cap is
+# its worst case plus STEP_MARGIN_MINUTES, so the step cap only fires if
+# run_suites.py itself hangs.
+JOB_TIMEOUT_MINUTES = 240
+RESERVED_MINUTES = 60
+STEP_MARGIN_MINUTES = 5
 
 
 def job_timeout_for(suite, args):
@@ -62,6 +81,50 @@ def job_timeout_for(suite, args):
     if suite == "concurrency":
         return CONCURRENCY_TASK_TIMEOUT + JOB_STARTUP_MARGIN
     raise ValueError(f"unknown suite: {suite}")
+
+
+def batch_count(suite, repetitions):
+    """Pure: how many batches build_plan() schedules for `suite`."""
+    if suite in ("fixture", "long_context"):
+        return 1
+    if suite == "live_web":
+        return repetitions
+    if suite == "concurrency":
+        return CONCURRENCY_SERIAL_RUNS + CONCURRENCY_PAIRS
+    raise ValueError(f"unknown suite: {suite}")
+
+
+def worst_case_seconds(suites, repetitions):
+    """Pure: the longest one run_suites.py invocation for `suites` can take
+    before every job has hit its own timeout and been killed."""
+    args = SimpleNamespace(repetitions=repetitions)
+    return sum(batch_count(suite, repetitions) * (job_timeout_for(suite, args) + BATCH_KILL_GRACE)
+               for suite in suites)
+
+
+def step_minutes(suites, repetitions):
+    """Pure: the workflow step cap (whole minutes) for one invocation; 0 when
+    there are no suites (the step is skipped)."""
+    if not suites:
+        return 0
+    return math.ceil(worst_case_seconds(suites, repetitions) / 60) + STEP_MARGIN_MINUTES
+
+
+def fits_job(phase1, phase2, repetitions):
+    """Pure: whether both suite steps plus the reserve fit in the job."""
+    return (step_minutes(phase1, repetitions) + step_minutes(phase2, repetitions)
+            + RESERVED_MINUTES) <= JOB_TIMEOUT_MINUTES
+
+
+def max_repetitions(phase1, phase2, limit=1000):
+    """Pure: the largest repetitions value that still fits the job (0 when
+    even 1 does not)."""
+    best = 0
+    for repetitions in range(1, limit + 1):
+        if not fits_job(phase1, phase2, repetitions):
+            break
+        best = repetitions
+    return best
 
 
 def _kill_process_group(process):
@@ -145,11 +208,11 @@ def build_plan(args, out_dir, root=ROOT):
         if args.parallel != 2:
             errors["concurrency"] = f"concurrency requires --parallel 2 (got {args.parallel})"
         else:
-            for n in range(1, 5):
+            for n in range(1, CONCURRENCY_SERIAL_RUNS + 1):
                 output = out_dir / f"concurrency-serial-{n}.json"
                 batches.append([{"suite": "concurrency", "output": output,
                                  "cmd": concurrency_command(args, output, root)}])
-            for pair in range(2):
+            for pair in range(CONCURRENCY_PAIRS):
                 group = []
                 for slot in range(2):
                     n = pair * 2 + slot + 1
@@ -184,12 +247,18 @@ def build_meta(existing, args, commit, gpu, run_id, now):
     """Pure: meta.json for this out-dir. A second run_suites.py invocation
     against the same --out-dir (the workflow's non-concurrency then
     concurrency phases) merges in rather than starting over: the suites list
-    is unioned and created_utc is kept from the first invocation."""
+    is unioned and created_utc is kept from the first invocation.
+    suite_settings records the server ctx/parallel each suite actually ran
+    with, since the two phases use different servers."""
     existing = existing or {}
     suites = list(dict.fromkeys((existing.get("suites") or []) + list(args.suites)))
+    suite_settings = dict(existing.get("suite_settings") or {})
+    for suite in args.suites:
+        suite_settings[suite] = {"ctx": args.ctx, "parallel": args.parallel}
     return {"model": args.model, "ctx": args.ctx, "parallel": args.parallel,
             "gpu": gpu, "commit": commit, "run_id": run_id,
-            "created_utc": existing.get("created_utc") or now, "suites": suites}
+            "created_utc": existing.get("created_utc") or now, "suites": suites,
+            "suite_settings": suite_settings}
 
 
 class VramSampler:
@@ -372,7 +441,7 @@ def run(args):
             existing = json.loads(meta_path.read_text())
         except (OSError, ValueError):
             existing = None
-    gpu = args.gpu or os.environ.get("BENCH_GPU_NAME")
+    gpu = args.gpu or os.environ.get("BENCH_GPU_NAME") or None
     run_id = args.run_id or os.environ.get("GITHUB_RUN_ID") or str(int(time.time()))
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     meta = build_meta(existing, args, get_commit(ROOT), gpu, run_id, now)

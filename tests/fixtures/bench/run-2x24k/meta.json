@@ -1,6 +1,6 @@
 {
   "model": "qwen3.5-9b-q4_k_m",
-  "ctx": 24576,
+  "ctx": 49152,
   "parallel": 2,
   "gpu": "RTX 3070 Ti",
   "commit": "b2ac901",
@@ -8,5 +8,11 @@
   "created_utc": "2026-09-25T21:10:00+00:00",
   "suites": [
     "concurrency"
-  ]
+  ],
+  "suite_settings": {
+    "concurrency": {
+      "ctx": 49152,
+      "parallel": 2
+    }
+  }
 }

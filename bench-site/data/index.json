@@ -16,7 +16,9 @@
           "pass_rate": 100.0,
           "median_seconds": 15.7,
           "peak_vram_mib": 6269,
-          "peak_prompt_tokens": 4874
+          "peak_prompt_tokens": 4874,
+          "ctx": 32768,
+          "parallel": 1
         },
         "live_web": {
           "passed": 1,
@@ -24,7 +26,9 @@
           "pass_rate": 50.0,
           "median_seconds": 49.5,
           "peak_vram_mib": 6120,
-          "peak_prompt_tokens": 11124
+          "peak_prompt_tokens": 11124,
+          "ctx": 32768,
+          "parallel": 1
         }
       },
       "sample": true
@@ -35,7 +39,7 @@
       "created_utc": "2026-09-25T21:10:00+00:00",
       "commit": "b2ac901",
       "model": "qwen3.5-9b-q4_k_m",
-      "ctx": 24576,
+      "ctx": 49152,
       "gpu": "RTX 3070 Ti",
       "suites": {
         "concurrency_serial": {
@@ -44,7 +48,9 @@
           "pass_rate": 75.0,
           "median_seconds": 16.3,
           "peak_vram_mib": 6823,
-          "peak_prompt_tokens": 6801
+          "peak_prompt_tokens": 6801,
+          "ctx": 49152,
+          "parallel": 2
         },
         "concurrency_parallel": {
           "passed": 2,
@@ -52,7 +58,9 @@
           "pass_rate": 50.0,
           "median_seconds": 29.7,
           "peak_vram_mib": 6823,
-          "peak_prompt_tokens": 6659
+          "peak_prompt_tokens": 6659,
+          "ctx": 49152,
+          "parallel": 2
         }
       },
       "sample": true
@@ -72,7 +80,9 @@
           "pass_rate": 100.0,
           "median_seconds": 26.1,
           "peak_vram_mib": 7323,
-          "peak_prompt_tokens": 59906
+          "peak_prompt_tokens": 59906,
+          "ctx": 65536,
+          "parallel": 1
         },
         "live_web": {
           "passed": 2,
@@ -80,7 +90,9 @@
           "pass_rate": 66.7,
           "median_seconds": 69.5,
           "peak_vram_mib": 7100,
-          "peak_prompt_tokens": 11124
+          "peak_prompt_tokens": 11124,
+          "ctx": 65536,
+          "parallel": 1
         }
       },
       "sample": true

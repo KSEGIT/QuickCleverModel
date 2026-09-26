@@ -3,7 +3,8 @@
  *   - latest-run suite cards
  *   - pass-rate-over-runs line chart (one line per suite)
  *   - median-time-over-runs line chart (one line per suite)
- *   - peak-VRAM-vs-context scatter, with an 8,192 MiB reference line
+ *   - peak-VRAM-vs-context scatter, one point per suite at the ctx of the
+ *     server that suite ran on, with an 8,192 MiB reference line
  *   - a runs table (date, commit link, model, ctx, suites)
  * Charts are drawn as inline SVG built with the DOM API — no canvas
  * libraries, no chart frameworks. Colour is never the only signal: every
@@ -74,13 +75,11 @@
     return sha.length > 7 ? sha.slice(0, 7) : sha;
   }
 
-  function runPeakVram(run) {
-    var peak = null;
-    Object.keys(run.suites || {}).forEach(function (key) {
-      var v = run.suites[key].peak_vram_mib;
-      if (v !== null && v !== undefined && (peak === null || v > peak)) peak = v;
-    });
-    return peak;
+  // The context size of the server a suite ran on. The concurrency suites
+  // run on their own 2-slot server, so a suite's own ctx wins; older
+  // summaries without it fall back to the run's ctx.
+  function suiteCtx(run, suite) {
+    return suite.ctx != null ? suite.ctx : run.ctx;
   }
 
   // ---------------------------------------------------------------------
@@ -217,12 +216,18 @@
     var marginL = 54, marginR = 16, marginT = 16, marginB = 34;
     var plotW = W - marginL - marginR, plotH = H - marginT - marginB;
 
-    var points = runs.map(function (run) {
-      return { ctx: run.ctx, vram: runPeakVram(run), run: run };
-    }).filter(function (p) { return p.ctx != null && p.vram != null; });
+    var points = [];
+    runs.forEach(function (run) {
+      Object.keys(run.suites || {}).forEach(function (key) {
+        var suite = run.suites[key];
+        var ctx = suiteCtx(run, suite);
+        if (ctx == null || suite.peak_vram_mib == null) return;
+        points.push({ ctx: ctx, vram: suite.peak_vram_mib, run: run, meta: suiteMeta(key), parallel: suite.parallel });
+      });
+    });
 
     if (points.length === 0) {
-      return el("p", { class: "panel-note", text: "No run yet has both a context size and a peak VRAM reading." });
+      return el("p", { class: "panel-note", text: "No suite yet has both a context size and a peak VRAM reading." });
     }
 
     var xs = points.map(function (p) { return p.ctx; });
@@ -261,14 +266,25 @@
 
     points.forEach(function (p) {
       var cx = xAt(p.ctx), cy = yAt(p.vram);
-      var color = cssVar("--series-fixture");
-      var title = el("title", { text: (p.run.model || "run") + " — ctx " + fmtNum(p.ctx) + ", peak " + fmtNum(p.vram) + " MiB" });
-      svg.appendChild(el("circle", { class: "series-point", cx: cx, cy: cy, r: 5, fill: color }, [title]));
-      svg.appendChild(el("text", { x: cx, y: cy - 10, "text-anchor": "middle", "font-size": "10", text: fmtNum(p.vram) + " MiB" }));
+      var slots = p.parallel != null ? ", " + p.parallel + (p.parallel === 1 ? " slot" : " slots") : "";
+      var title = el("title", { text: p.meta.label + " — " + (p.run.model || "run") + ", " + fmtDate(p.run.created_utc) +
+        " — ctx " + fmtNum(p.ctx) + slots + ", peak " + fmtNum(p.vram) + " MiB" });
+      svg.appendChild(el("circle", { class: "series-point", cx: cx, cy: cy, r: 5, fill: cssVar(p.meta.color) }, [title]));
     });
+
+    var shown = SUITES.filter(function (meta) {
+      return points.some(function (p) { return p.meta.key === meta.key; });
+    });
+    var legend = el("div", { class: "legend" }, shown.map(function (meta) {
+      return el("span", { class: "legend-item" }, [
+        el("span", { class: "swatch", style: "background:" + cssVar(meta.color) + ";" }),
+        document.createTextNode(meta.label)
+      ]);
+    }));
 
     return el("div", {}, [
       el("div", { class: "chart-wrap" }, [svg]),
+      legend,
       el("p", { class: "panel-note", text: "Dashed line: 8,192 MiB, the RTX 3070 Ti's VRAM budget." })
     ]);
   }
@@ -293,7 +309,10 @@
       var tags = el("span", { class: "suite-tags" }, Object.keys(run.suites || {}).map(function (key) {
         var suite = run.suites[key];
         var meta = suiteMeta(key);
-        return el("span", { class: "suite-tag", text: meta.label + " · " + fmtNum(suite.pass_rate, 0) + "%" });
+        var ctx = suiteCtx(run, suite);
+        // Name the ctx only where it differs from the run's Ctx column.
+        var ctxNote = ctx != null && ctx !== run.ctx ? " · ctx " + fmtNum(ctx) : "";
+        return el("span", { class: "suite-tag", text: meta.label + " · " + fmtNum(suite.pass_rate, 0) + "%" + ctxNote });
       }));
       var dateText = fmtDate(run.created_utc);
       if (run.sample) dateText += " (sample)";
@@ -346,7 +365,7 @@
     if (runs.length === 0) {
       app.appendChild(el("div", { class: "empty-note" }, [
         el("p", { text: "No runs yet." }),
-        el("p", { text: "Trigger the “RTX benchmark” workflow from the Actions tab to populate this dashboard." })
+        el("p", { text: "Run the “benchmark” workflow from the Actions tab to populate this dashboard." })
       ]));
       return;
     }
@@ -360,7 +379,7 @@
     app.appendChild(panel("Median time over runs", "Median wall-clock seconds per suite.",
       drawLineChart(runs, { valueFn: function (s) { return s.median_seconds; }, yFormat: function (v) { return fmtNum(v, 0) + "s"; }, ariaLabel: "Median seconds per suite across runs" })));
 
-    app.appendChild(panel("Peak VRAM vs. context", "Each point is one run: its context size and the highest VRAM use seen across its suites.",
+    app.appendChild(panel("Peak VRAM vs. context", "Each point is one suite in one run: the context size of the server that suite ran on, and its highest VRAM use.",
       drawVramScatter(runs)));
 
     app.appendChild(panel("All runs", null, renderTable(runs)));

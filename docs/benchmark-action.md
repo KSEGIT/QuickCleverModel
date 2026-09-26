@@ -37,8 +37,8 @@ A repository owner does these steps once, before the first run.
    tag `tag:ci`.
 2. Add a Tailscale ACL rule that lets `tag:ci` reach the worker on port 22
    only. Do not give it any wider access.
-3. Store the OAuth client ID and secret as repository secrets (see the table
-   below). An auth key works too, as a fallback.
+3. Store the OAuth client ID and secret as `rtx-benchmark` environment
+   secrets (see the table below). An auth key works too, as a fallback.
 
 ### 2. A dedicated SSH key
 
@@ -49,17 +49,24 @@ A repository owner does these steps once, before the first run.
 3. Run `ssh-keyscan <worker-host>` by hand, once, from a machine you trust.
    Look at the output and check it names the worker's real host key before
    you store it. Do not skip this check.
-4. Store the private key and the `ssh-keyscan` output as repository secrets.
+4. Store the private key and the `ssh-keyscan` output as `rtx-benchmark`
+   environment secrets.
 
 Never write the worker's real Tailscale IP address or its SSH username in a
 doc, an issue, or a commit message. Use a placeholder such as `100.x.y.z` or
 `<worker-host>` instead. The setup below keeps both out of the workflow's
 visible inputs for the same reason.
 
-### 3. Repository secrets and variables
+### 3. Environment secrets and variables
 
 Create a GitHub Environment named `rtx-benchmark`, and add these secrets and
-variables to it.
+variables to it. Put them on the environment, not on the repository.
+
+**Limit the environment to `main`.** In **Settings → Environments →
+rtx-benchmark**, set **Deployment branches and tags** to **Selected
+branches** and add only `main`. Without this rule, a user with write access
+can push a changed workflow to another branch and run it. That run gets the
+SSH key.
 
 **Secrets** (never shown on the run page, even in this public repository):
 
@@ -69,14 +76,23 @@ variables to it.
 | `TS_OAUTH_SECRET` | The Tailscale OAuth client secret (or use `TS_AUTHKEY` instead, with a Tailscale auth key) |
 | `WORKER_SSH_KEY` | The private half of the dedicated SSH key from step 2 |
 | `WORKER_KNOWN_HOSTS` | The checked `ssh-keyscan` output for the worker |
+| `WORKER_HOST` | Optional, but best: the worker's tailnet name or address (see below) |
+| `WORKER_SSH_USER` | Optional, but best: the SSH account the job connects as |
+
+The logs of this public repository are public. GitHub hides a secret's
+value in every log line. So store `WORKER_HOST` and `WORKER_SSH_USER` as
+secrets. You can use variables of the same names instead. The first step
+("Resolve settings") then masks them, but a variable is plain text before
+that step, so it can show in that step's header.
 
 **Variables** (defaults for a run; not secret, but still worth keeping out of
 public docs where they'd be specific to your worker):
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `WORKER_HOST` | The worker's tailnet name or address | none — must be set |
-| `WORKER_SSH_USER` | The SSH account the job connects as | none — must be set |
+| `WORKER_HOST` | The worker's tailnet name or address, if not a secret | none — set it here or as a secret |
+| `WORKER_SSH_USER` | The SSH account the job connects as, if not a secret | none — set it here or as a secret |
+| `BENCH_GPU_NAME` | The GPU name the dashboard shows for each run, for example `RTX 3070 Ti` | none — the run records no GPU name |
 | `LIVE_CONTAINER` | The production container the job pauses and restores | `bonsai-llama-1` |
 | `LIVE_HEALTH_URL` | Health-check URL for the live container, checked on the worker | `http://127.0.0.1:8080/health` |
 | `LIVE_ENV_FILE` | Worker path to the live container's env file, if it needs one | none — no key is sent if unset |
@@ -85,7 +101,7 @@ public docs where they'd be specific to your worker):
 | `TEMPLATE_FILE` | Worker path to the chat template for the test server | none — must be set |
 
 A `workflow_dispatch` run also takes `worker_host` and `ssh_user` inputs that
-can override these variables. Leave them blank when you start a run — the
+can override these values. Leave them blank when you start a run — the
 job then uses the variables above. If you type a value instead, it shows on
 the run's page, and this repository is public.
 
@@ -109,7 +125,8 @@ dedicated SSH account (from step 2) can read this file directly.
    allows a specific branch (often the default branch), and you dispatch a
    benchmark run from a different branch, the publish job stalls or is
    blocked — the environment rule never matches. Add every branch you might
-   dispatch a run from, or set the rule to allow all branches.
+   dispatch a run from. Since `rtx-benchmark` allows only `main`, allowing
+   `main` here is enough.
 
 ## Starting a run
 
@@ -125,11 +142,26 @@ dedicated SSH account (from step 2) can read this file directly.
 | `model_preset` | Which model to benchmark: `qwen3.5-9b` or `qwen3.5-4b` | `qwen3.5-9b` |
 | `ctx` | Context size, in tokens | `32768` |
 | `suites` | Space-separated list of suites to run: `fixture`, `long_context`, `live_web`, `concurrency` | `fixture long_context live_web` |
-| `repetitions` | How many times to repeat each suite's tasks | `1` |
+| `repetitions` | How many times to repeat the `fixture` tasks and the `live_web` run. `long_context` and `concurrency` ignore it. | `1` |
 | `restore_production` | Restart the live container when the run ends | `true` |
 
 3. Anyone with write access to the repository can start a run, but only the
    repository owner should — see "Why a manual trigger only" above.
+
+### The `repetitions` limit
+
+The job has 240 minutes. It must always keep time to put the live container
+back. So the first step works out the longest time each suite step can
+take, from the suites you chose and `repetitions`. Each suite step gets
+that time as its own limit. If the total does not fit, the run stops at
+once, with an error that gives the highest `repetitions` that fits.
+
+- With the default suites, the most is 2, with or without `concurrency`.
+  With `fixture` alone, the most is 3.
+- Without `fixture`, the limit is much higher (26 for `live_web` alone).
+
+`tests/bench/run_suites.py` holds the numbers (`step_minutes`,
+`max_repetitions`), so the workflow and the suites always agree.
 4. Click **Run workflow** and wait. A run can take a while, because it
    downloads nothing new but does run real browser tasks against a live
    model, one suite at a time.
@@ -159,9 +191,11 @@ hand right after the run.
 
    For `concurrency`, the job restarts the test server first, with 2 slots
    and a 49,152-token context, because that suite needs two agents running
-   at once.
-4. It saves raw results and any saved images as workflow artifacts, so you
-   can look at them even without the dashboard.
+   at once. If this restart or the `concurrency` suite fails, the job goes
+   on: it records the error under `concurrency`, and still publishes the
+   other suites' results.
+4. It saves raw results, with any saved images, as one workflow artifact,
+   so you can look at them even without the dashboard.
 5. At the end, whether or not a suite failed, it stops the test server and
    starts the live container again (unless you set `restore_production` to
    `false`). It checks the live container's health endpoint. If that check
@@ -190,7 +224,10 @@ has published. The dashboard shows:
 - A pass-rate history chart, per suite, across all runs.
 - A median-time history chart.
 - A peak-VRAM-versus-context chart, with a line at 8,192 MiB (the worker's
-  total VRAM).
+  total VRAM). It has one point for each suite in each run. A point uses
+  the context size of the server that suite ran on. So the `concurrency`
+  points show 49,152 tokens, even when the other suites in that run used a
+  different `ctx`.
 - A table of every run, with its date, commit, model, context, and suites.
 
 ## Stopping production, on purpose

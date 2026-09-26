@@ -132,7 +132,9 @@ def _live_web_stats(reports):
     return passed, total, seconds, peak_tokens
 
 
-def _suite_dict(passed, total, seconds, peak_tokens, peak_vram, error=None):
+def _suite_dict(passed, total, seconds, peak_tokens, peak_vram, error=None,
+                settings=None):
+    settings = settings or {}
     suite = {
         "passed": passed,
         "total": total,
@@ -140,6 +142,9 @@ def _suite_dict(passed, total, seconds, peak_tokens, peak_vram, error=None):
         "median_seconds": _round_or_none(seconds),
         "peak_vram_mib": _int_or_none(peak_vram),
         "peak_prompt_tokens": _int_or_none(peak_tokens),
+        # The server this suite ran against (the phases use different ones).
+        "ctx": settings.get("ctx"),
+        "parallel": settings.get("parallel"),
     }
     if error:
         suite["error"] = error
@@ -157,6 +162,15 @@ def summarize(dir_path):
     def error_for(suite_key, top_level_key):
         return errors.get(suite_key) or errors.get(top_level_key)
 
+    suite_settings = meta.get("suite_settings") or {}
+
+    def settings_for(top_level_key):
+        """meta.json's suite_settings entry for the suite as run_suites.py
+        names it; each field falls back to the run's own ctx/parallel."""
+        own = suite_settings.get(top_level_key) or {}
+        return {"ctx": own.get("ctx", meta.get("ctx")),
+                "parallel": own.get("parallel", meta.get("parallel"))}
+
     suites = {}
 
     # fixture
@@ -172,7 +186,7 @@ def summarize(dir_path):
             peak_vram = _vram_peak(dir_path, "vram-fixture.json")
         suites["fixture"] = _suite_dict(
             passed, total, seconds, peak_tokens, peak_vram,
-            error=error_for("fixture", "fixture"))
+            error=error_for("fixture", "fixture"), settings=settings_for("fixture"))
 
     # long_context
     lc_report = load_json(os.path.join(dir_path, "long_context.json"))
@@ -188,7 +202,7 @@ def summarize(dir_path):
         peak_vram = _vram_peak(dir_path, "vram-long_context.json")
         suites["long_context"] = _suite_dict(
             passed, total, seconds, peak_tokens, peak_vram,
-            error=error_for("long_context", "long_context"))
+            error=error_for("long_context", "long_context"), settings=settings_for("long_context"))
 
     # live_web (one or more live_web-<n>.json repetitions)
     live_reports = _glob_reports(dir_path, "live_web-*.json")
@@ -197,7 +211,7 @@ def summarize(dir_path):
         peak_vram = _vram_peak(dir_path, "vram-live_web.json")
         suites["live_web"] = _suite_dict(
             passed, total, seconds, peak_tokens, peak_vram,
-            error=error_for("live_web", "live_web"))
+            error=error_for("live_web", "live_web"), settings=settings_for("live_web"))
 
     # concurrency: serial and parallel phases, each its own suite key.
     # run_suites.py samples VRAM once for the whole concurrency suite (both
@@ -220,7 +234,8 @@ def summarize(dir_path):
                 peak_vram = concurrency_peak_vram
             suites[phase] = _suite_dict(
                 passed, total, seconds, peak_tokens, peak_vram,
-                error=error_for(phase, "concurrency"))
+                error=error_for(phase, "concurrency"),
+                settings=settings_for("concurrency"))
 
     return {
         "schema": SCHEMA,

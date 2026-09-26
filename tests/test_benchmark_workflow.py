@@ -178,6 +178,56 @@ class BenchmarkWorkflowTest(unittest.TestCase):
         self.assertIn("/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf", self.text)
         self.assertIn("qwen3.5-4b-q4_k_m", self.text)
 
+    def test_worker_identity_masked_before_any_step_can_print_it(self):
+        """Public logs: the host and user are masked first thing in Resolve
+        settings, which runs before the tailnet ping, and never echoed."""
+        benchmark = self.text[:self.text.index("\n  publish:")]
+        resolve = self.text.index("- name: Resolve settings")
+        mask_host = self.text.index('echo "::add-mask::$IN_WORKER_HOST"')
+        mask_user = self.text.index('echo "::add-mask::$IN_SSH_USER"')
+        first_check = self.text.index('[[ -n "$IN_WORKER_HOST" ]]')
+        self.assertLess(resolve, mask_host)
+        self.assertLess(max(mask_host, mask_user), first_check)
+        self.assertLess(mask_host, self.text.index("ping: ${{ env.WORKER_HOST }}"))
+        # Only Resolve settings holds them; no job-level env entry.
+        self.assertEqual(benchmark.count("IN_WORKER_HOST:"), 1)
+        self.assertEqual(benchmark.count("IN_SSH_USER:"), 1)
+        # No echo prints them, except the mask itself and the lines the
+        # grouped block writes to $GITHUB_ENV (NAME=value, not the log).
+        for m in re.finditer(r'echo "([^"]*)"', benchmark):
+            said = m.group(1)
+            if said.startswith("::add-mask::") or re.match(r"^[A-Z0-9_]+=", said):
+                continue
+            for name in ("$IN_WORKER_HOST", "$IN_SSH_USER", "$WORKER_SSH", "$WORKER_HOST"):
+                self.assertNotIn(name, said)
+
+    def test_suite_steps_have_time_caps(self):
+        for name, cap in (("Run single-slot suites", "fromJSON(env.PHASE1_TIMEOUT_MIN)"),
+                          ("Run concurrency suite", "fromJSON(env.PHASE2_TIMEOUT_MIN)")):
+            step = next(s for s in steps(self.text) if name in s[0])
+            self.assertTrue(any("timeout-minutes:" in l and cap in l for l in step), name)
+        for name in ("Start test server (1 slot)", "Restart test server (2 slots)",
+                     "Restore production (worker.sh down)"):
+            step = next(s for s in steps(self.text) if name in s[0])
+            self.assertTrue(any("timeout-minutes:" in l for l in step), name)
+
+    def test_phase_2_failure_does_not_fail_the_job(self):
+        for name in ("Restart test server (2 slots)", "Run concurrency suite"):
+            step = next(s for s in steps(self.text) if name in s[0])
+            self.assertTrue(any("continue-on-error: true" in l for l in step), name)
+        merge = next(s for s in steps(self.text) if "Merge phase reports" in s[0])
+        self.assertIn('errors["concurrency"]', "\n".join(merge))
+
+    def test_benchmark_checkout_drops_credentials(self):
+        benchmark = self.text[:self.text.index("\n  publish:")]
+        self.assertIn("persist-credentials: false", benchmark)
+
+    def test_images_uploaded_once(self):
+        self.assertNotIn("bench-images-", self.text)
+
+    def test_gpu_name_from_variable(self):
+        self.assertIn("BENCH_GPU_NAME: ${{ vars.BENCH_GPU_NAME }}", self.text)
+
     def test_publish_job_permissions(self):
         publish = self.text[self.text.index("\n  publish:"):]
         self.assertIn("needs: benchmark", publish)

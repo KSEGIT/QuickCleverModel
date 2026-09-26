@@ -42,7 +42,7 @@ on:
         type: string
         default: 'fixture long_context live_web'
       repetitions:
-        description: 'Repetitions per fixture task'
+        description: 'Repetitions of fixture tasks and live_web runs (capped to fit the job time)'
         required: false
         type: string
         default: '1'
@@ -67,9 +67,9 @@ jobs:
     timeout-minutes: 240
     env:
       # Inputs reach shell steps only through env, never by ${{ }} inside a
-      # script, so an input value cannot inject shell code.
-      IN_WORKER_HOST: ${{ inputs.worker_host || vars.WORKER_HOST }}
-      IN_SSH_USER: ${{ inputs.ssh_user || vars.WORKER_SSH_USER }}
+      # script, so an input value cannot inject shell code. The worker host
+      # and SSH user are not here: only "Resolve settings" sees them, and it
+      # masks them before any other step can print them.
       IN_MODEL_PRESET: ${{ inputs.model_preset || 'qwen3.5-9b' }}
       IN_CTX: ${{ inputs.ctx || '32768' }}
       IN_SUITES: ${{ inputs.suites || 'fixture long_context live_web' }}
@@ -80,15 +80,23 @@ jobs:
       TEST_IMAGE: ${{ vars.TEST_IMAGE || 'qcm-rtx-validation:922be44' }}
       MODELS_DIR: ${{ vars.MODELS_DIR }}
       TEMPLATE_FILE: ${{ vars.TEMPLATE_FILE }}
+      # GPU name for meta.json (run_suites.py reads it); empty means unknown.
+      BENCH_GPU_NAME: ${{ vars.BENCH_GPU_NAME }}
       TEST_CONTAINER: qcm-bench
       TEST_PORT: '18080'
       LOCAL_PORT: '18080'
+      # The 2-slot server for the concurrency suite: 24,576 tokens per slot.
+      PHASE2_CTX: '49152'
+      PHASE2_PARALLEL: '2'
       # Same Playwright as @playwright/mcp@0.0.82 in start-playwright-mcp.sh.
       PLAYWRIGHT_VERSION: 1.64.0-alpha-1789764292000
       # Secrets cannot appear in a step `if:`; these booleans can.
       HAS_TS_OAUTH: ${{ secrets.TS_OAUTH_CLIENT_ID != '' && secrets.TS_OAUTH_SECRET != '' }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # This job pushes nothing; keep the token out of .git/config.
+          persist-credentials: false
 
       - uses: actions/setup-python@v7
         with:
@@ -99,8 +107,17 @@ jobs:
           node-version: '22'
 
       - name: Resolve settings
+        env:
+          # A secret is masked in every log line; a variable is plain text
+          # until the add-mask below. Prefer the secrets (see the docs).
+          IN_WORKER_HOST: ${{ inputs.worker_host || secrets.WORKER_HOST || vars.WORKER_HOST }}
+          IN_SSH_USER: ${{ inputs.ssh_user || secrets.WORKER_SSH_USER || vars.WORKER_SSH_USER }}
         run: |
           set -euo pipefail
+          # First, before anything can print them: this repo's logs are
+          # public, and later steps (the tailnet ping, ssh) name the worker.
+          [[ -z "$IN_WORKER_HOST" ]] || echo "::add-mask::$IN_WORKER_HOST"
+          [[ -z "$IN_SSH_USER" ]] || echo "::add-mask::$IN_SSH_USER"
           [[ -n "$IN_WORKER_HOST" ]] || { echo "::error::worker_host input or WORKER_HOST variable is required"; exit 1; }
           [[ -n "$IN_SSH_USER" ]] || { echo "::error::ssh_user input or WORKER_SSH_USER variable is required"; exit 1; }
           [[ -n "$MODELS_DIR" ]] || { echo "::error::MODELS_DIR variable is required"; exit 1; }
@@ -136,15 +153,37 @@ jobs:
           set +f
           [[ ${#phase1[@]} -gt 0 || -n "$phase2" ]] || { echo "::error::no suites selected"; exit 1; }
 
+          # Step caps from run_suites.py's own job timeouts, so the restore
+          # always fits in the job's 240 minutes. Too many repetitions would
+          # not fit: refuse the run instead of cutting the restore short.
+          budget="$(python3 - "${phase1[*]:-}" "$phase2" "$IN_REPETITIONS" <<'EOF'
+          import sys
+          sys.path.insert(0, "tests/bench")
+          import run_suites as r
+          p1, p2, reps = sys.argv[1].split(), sys.argv[2].split(), int(sys.argv[3])
+          print(r.step_minutes(p1, reps), r.step_minutes(p2, reps), r.max_repetitions(p1, p2))
+          EOF
+          )"
+          read -r phase1_min phase2_min max_reps <<<"$budget"
+          (( 10#$IN_REPETITIONS >= 1 )) || { echo "::error::repetitions must be at least 1"; exit 1; }
+          if (( 10#$IN_REPETITIONS > max_reps )); then
+            echo "::error::repetitions $IN_REPETITIONS does not fit the 240-minute job with these suites; the most is $max_reps"
+            exit 1
+          fi
+
           {
+            echo "WORKER_HOST=$IN_WORKER_HOST"
             echo "WORKER_SSH=$IN_SSH_USER@$IN_WORKER_HOST"
             echo "MODEL_FILE=$model_file"
             echo "MODEL_ALIAS=$model_alias"
             echo "PHASE1_SUITES=${phase1[*]}"
             echo "PHASE2_SUITES=$phase2"
+            # Never 0: a skipped step's cap must still be a valid number.
+            echo "PHASE1_TIMEOUT_MIN=$(( phase1_min > 0 ? phase1_min : 1 ))"
+            echo "PHASE2_TIMEOUT_MIN=$(( phase2_min > 0 ? phase2_min : 1 ))"
           } >> "$GITHUB_ENV"
-          echo "worker: $IN_SSH_USER@$IN_WORKER_HOST  model: $model_alias  ctx: $IN_CTX"
-          echo "phase 1: ${phase1[*]:-none}  phase 2: ${phase2:-none}"
+          echo "model: $model_alias  ctx: $IN_CTX  repetitions: $IN_REPETITIONS (most: $max_reps)"
+          echo "phase 1: ${phase1[*]:-none} (cap ${phase1_min} min)  phase 2: ${phase2:-none} (cap ${phase2_min} min)"
 
       # ubuntu-latest (24.04) ships Google Chrome (runner-images readme),
       # which is what the Playwright MCP uses (--browser chrome). Install it
@@ -166,7 +205,7 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
           hostname: gh-bench-${{ github.run_id }}
-          ping: ${{ env.IN_WORKER_HOST }}
+          ping: ${{ env.WORKER_HOST }}
 
       - name: Join tailnet (auth key)
         if: env.HAS_TS_OAUTH != 'true'
@@ -174,7 +213,7 @@ jobs:
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
           hostname: gh-bench-${{ github.run_id }}
-          ping: ${{ env.IN_WORKER_HOST }}
+          ping: ${{ env.WORKER_HOST }}
 
       - name: Configure SSH
         env:
@@ -206,6 +245,7 @@ jobs:
 
       - name: Start test server (1 slot)
         if: env.PHASE1_SUITES != ''
+        timeout-minutes: 10
         env:
           CTX: ${{ env.IN_CTX }}
           PARALLEL: '1'
@@ -230,6 +270,7 @@ jobs:
 
       - name: Run single-slot suites
         if: env.PHASE1_SUITES != ''
+        timeout-minutes: ${{ fromJSON(env.PHASE1_TIMEOUT_MIN) }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2086 # PHASE1_SUITES is a word list on purpose
@@ -245,22 +286,31 @@ jobs:
 
       # `down` is not called between phases: the live container stays
       # stopped, and `up` replaces the 1-slot test container.
+      # Phase 2 may fail without failing the job: the merge step records the
+      # failure under "concurrency" in errors.json, and phase 1's results
+      # still get summarized and published.
       - name: Restart test server (2 slots)
+        id: up2
         if: env.PHASE2_SUITES != ''
+        continue-on-error: true
+        timeout-minutes: 10
         env:
-          CTX: '49152'
-          PARALLEL: '2'
+          CTX: ${{ env.PHASE2_CTX }}
+          PARALLEL: ${{ env.PHASE2_PARALLEL }}
         run: tests/bench/worker.sh up
 
       - name: Run concurrency suite
-        if: env.PHASE2_SUITES != ''
+        id: concurrency
+        if: env.PHASE2_SUITES != '' && steps.up2.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: ${{ fromJSON(env.PHASE2_TIMEOUT_MIN) }}
         run: |
           set -euo pipefail
           python3 tests/bench/run_suites.py \
             --base-url "http://127.0.0.1:${LOCAL_PORT}" \
             --model "$MODEL_ALIAS" \
-            --ctx 49152 \
-            --parallel 2 \
+            --ctx "$PHASE2_CTX" \
+            --parallel "$PHASE2_PARALLEL" \
             --suites concurrency \
             --repetitions "$IN_REPETITIONS" \
             --out-dir bench-out/raw-concurrency \
@@ -268,34 +318,60 @@ jobs:
 
       # collect.py reads one raw directory. Fold the 2-slot phase into it:
       # its report files move over, errors merge, and meta.json lists every
-      # suite. meta.json keeps the 1-slot phase's ctx/parallel when both ran.
+      # suite. meta.json keeps the 1-slot phase's ctx/parallel when both ran;
+      # suite_settings records the server each suite really used, so the
+      # dashboard plots concurrency VRAM at the 2-slot ctx.
       - name: Merge phase reports
-        if: always() && env.PHASE2_SUITES != ''
+        if: always() && env.PHASE2_SUITES != '' && env.MODEL_ALIAS != ''
+        env:
+          UP2_OUTCOME: ${{ steps.up2.outcome }}
+          RUN2_OUTCOME: ${{ steps.concurrency.outcome }}
         run: |
           set -euo pipefail
-          [[ -d bench-out/raw-concurrency ]] || exit 0
+          mkdir -p bench-out/raw
           python3 - <<'EOF'
-          import json, pathlib, shutil
+          import datetime, json, os, pathlib, shutil
           src, dst = pathlib.Path("bench-out/raw-concurrency"), pathlib.Path("bench-out/raw")
-          if not (dst / "meta.json").exists():
-              shutil.copytree(src, dst, dirs_exist_ok=True)
-              raise SystemExit
-          for path in src.iterdir():
-              if path.name in ("meta.json", "errors.json"):
-                  continue
-              target = dst / path.name
-              if path.is_dir():
-                  shutil.copytree(path, target, dirs_exist_ok=True)
-              else:
-                  shutil.copy2(path, target)
           def load(p):
-              return json.loads(p.read_text()) if p.exists() else {}
+              try:
+                  return json.loads(p.read_text())
+              except (OSError, ValueError):
+                  return {}
+          src_meta = load(src / "meta.json")
+          if src.is_dir():
+              for path in src.iterdir():
+                  if path.name in ("meta.json", "errors.json"):
+                      continue
+                  target = dst / path.name
+                  if path.is_dir():
+                      shutil.copytree(path, target, dirs_exist_ok=True)
+                  else:
+                      shutil.copy2(path, target)
           errors = {**load(dst / "errors.json"), **load(src / "errors.json")}
+          if os.environ["UP2_OUTCOME"] == "failure":
+              errors["concurrency"] = "the 2-slot test server did not start (worker.sh up failed)"
+          elif os.environ["UP2_OUTCOME"] != "success":
+              errors["concurrency"] = "not run: an earlier step failed"
+          elif os.environ["RUN2_OUTCOME"] == "failure" and "concurrency" not in errors:
+              errors["concurrency"] = "the concurrency step failed or hit its time cap"
           if errors:
-              (dst / "errors.json").write_text(json.dumps(errors, indent=2))
-          meta = load(dst / "meta.json")
-          meta["suites"] = list(dict.fromkeys(meta.get("suites", []) + load(src / "meta.json").get("suites", [])))
-          (dst / "meta.json").write_text(json.dumps(meta, indent=2))
+              (dst / "errors.json").write_text(json.dumps(errors, indent=2) + "\n")
+          ctx, parallel = int(os.environ["PHASE2_CTX"]), int(os.environ["PHASE2_PARALLEL"])
+          # No phase-1 meta (concurrency only): start from phase 2's, or a
+          # minimal one when phase 2 never wrote any, so the failure still
+          # reaches the dashboard.
+          meta = load(dst / "meta.json") or src_meta or {
+              "model": os.environ["MODEL_ALIAS"], "ctx": ctx, "parallel": parallel,
+              "gpu": os.environ.get("BENCH_GPU_NAME") or None,
+              "commit": os.environ.get("GITHUB_SHA", "")[:7] or None,
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "suites": []}
+          meta["suites"] = list(dict.fromkeys(meta.get("suites", []) + src_meta.get("suites", []) + ["concurrency"]))
+          settings = meta.setdefault("suite_settings", {})
+          settings.update(src_meta.get("suite_settings", {}))
+          settings["concurrency"] = {"ctx": ctx, "parallel": parallel}
+          (dst / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
           EOF
 
       - name: Summarize
@@ -313,22 +389,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
+          # Holds the saved live_web images too (live-images/).
           name: bench-raw-${{ github.run_id }}
           path: bench-out/raw
-          if-no-files-found: ignore
-          retention-days: 90
-
-      - name: Upload saved images
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: bench-images-${{ github.run_id }}
-          path: |
-            bench-out/raw/**/*.png
-            bench-out/raw/**/*.jpg
-            bench-out/raw/**/*.jpeg
-            bench-out/raw/**/*.gif
-            bench-out/raw/**/*.webp
           if-no-files-found: ignore
           retention-days: 90
 
@@ -351,6 +414,9 @@ jobs:
       # covers a longer network drop.
       - name: Restore production (worker.sh down)
         if: always() && inputs.restore_production && env.WORKER_SSH != ''
+        # Two full worker.sh down passes take about 11 minutes at worst;
+        # run_suites.RESERVED_MINUTES keeps this cap free in the job.
+        timeout-minutes: 20
         run: |
           set -euo pipefail
           if ! tests/bench/worker.sh down; then

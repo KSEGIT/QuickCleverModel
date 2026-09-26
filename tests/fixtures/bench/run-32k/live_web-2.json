@@ -4,7 +4,7 @@
   "task": "live_web image search",
   "status": "PASS (image saved; subject needs visual check)",
   "saved": {
-    "path": "/Users/admin/Source/models/.worktrees/playwright-model-expansion/run/live-orange-images/orange-1790401570.jpg",
+    "path": "run/live-orange-images/orange-1790401570.jpg",
     "bytes": 123461,
     "kind": "jpg",
     "url": "https://www.verywellhealth.com/thmb/hMLdauaWPybp8_-TTltweU6J8Kw=/1500x0/filters:no_upscale():max_bytes(150000):strip_icc()/VWH-GettyImages-1205638014-6cee1ce220bd45829eaa069b79b7c3b5.jpg"

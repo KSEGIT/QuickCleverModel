@@ -4,7 +4,7 @@
   "task": "live_web image search",
   "status": "PASS (image saved; subject needs visual check)",
   "saved": {
-    "path": "/Users/admin/Source/models/.worktrees/playwright-model-expansion/run/live-orange-images/orange-1790401892.jpg",
+    "path": "run/live-orange-images/orange-1790401892.jpg",
     "bytes": 366229,
     "kind": "jpg",
     "url": "https://wallpapers.com/images/hd/bunch-of-orange-fruits-emqolx6janwpicfm.jpg"
