@@ -1,0 +1,30 @@
+{
+  "created_utc": "2026-09-26T05:50:24.113256+00:00",
+  "model": "qwen3.5-9b-q4_k_m",
+  "task": "live_web image search",
+  "status": "PASS (image saved; subject needs visual check)",
+  "saved": {
+    "path": "run/live-orange-images/orange-1790401892.jpg",
+    "bytes": 366229,
+    "kind": "jpg",
+    "url": "https://wallpapers.com/images/hd/bunch-of-orange-fruits-emqolx6janwpicfm.jpg"
+  },
+  "seconds": 69.53,
+  "turns": [
+    {
+      "number": 1,
+      "llm_seconds": 1.23,
+      "prompt_tokens": 4162
+    },
+    {
+      "number": 2,
+      "llm_seconds": 0.34,
+      "prompt_tokens": 4268
+    },
+    {
+      "number": 3,
+      "llm_seconds": 3.61,
+      "prompt_tokens": 11124
+    }
+  ]
+}

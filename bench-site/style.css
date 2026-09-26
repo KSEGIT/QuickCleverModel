@@ -1,0 +1,364 @@
+/* RTX benchmark dashboard — plain CSS, no build step.
+   Palette: validated default from the dataviz skill (references/palette.md).
+   Light is the default; dark applies automatically via prefers-color-scheme. */
+
+:root {
+  color-scheme: light;
+
+  --page-bg: #f9f9f7;
+  --surface: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --gridline: #e1e0d9;
+  --baseline: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+
+  --status-good: #0ca30c;
+  --status-critical: #d03b3b;
+
+  /* Categorical, slots 1-5, fixed order — never reassigned per run. */
+  --series-fixture: #2a78d6;             /* blue   */
+  --series-long-context: #eb6834;        /* orange */
+  --series-live-web: #1baf7a;            /* aqua   */
+  --series-concurrency-serial: #eda100;  /* yellow */
+  --series-concurrency-parallel: #e87ba4;/* magenta*/
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --page-bg: #0d0d0d;
+    --surface: #1a1a19;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --gridline: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+
+    --status-good: #0ca30c;
+    --status-critical: #e66767;
+
+    --series-fixture: #3987e5;
+    --series-long-context: #d95926;
+    --series-live-web: #199e70;
+    --series-concurrency-serial: #c98500;
+    --series-concurrency-parallel: #d55181;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--page-bg);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.45;
+  /* Never scroll the whole page sideways, even if a child misbehaves. */
+  overflow-x: hidden;
+}
+
+.page {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+header.site-header {
+  margin-bottom: 16px;
+}
+
+header.site-header h1 {
+  font-size: 1.4rem;
+  margin: 0 0 4px;
+}
+
+header.site-header p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--surface);
+  white-space: nowrap;
+}
+
+.badge.badge-sample {
+  color: #7a5b00;
+  border-color: #eda100;
+}
+@media (prefers-color-scheme: dark) {
+  .badge.badge-sample {
+    color: #f0c04a;
+    border-color: #c98500;
+  }
+}
+
+.empty-note {
+  border: 1px dashed var(--baseline);
+  border-radius: 8px;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+section.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 20px;
+}
+
+section.panel h2 {
+  font-size: 1.05rem;
+  margin: 0 0 4px;
+}
+
+section.panel .panel-note {
+  margin: 0 0 12px;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+/* Latest-run suite cards */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.suite-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.suite-card .suite-name {
+  font-weight: 600;
+  font-size: 0.92rem;
+  margin: 0 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.suite-card .swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex: 0 0 auto;
+  display: inline-block;
+}
+
+.suite-card dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 2px 8px;
+  font-size: 0.85rem;
+}
+
+.suite-card dt {
+  color: var(--text-secondary);
+}
+
+.suite-card dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.status-pill {
+  font-weight: 700;
+  font-size: 0.78rem;
+  border-radius: 4px;
+  padding: 1px 6px;
+  display: inline-block;
+}
+
+.status-pill.status-good {
+  color: var(--status-good);
+  border: 1px solid var(--status-good);
+}
+
+.status-pill.status-critical {
+  color: var(--status-critical);
+  border: 1px solid var(--status-critical);
+}
+
+.suite-card .error-text {
+  margin-top: 8px;
+  font-size: 0.78rem;
+  color: var(--status-critical);
+  word-break: break-word;
+}
+
+/* Charts */
+.chart-wrap {
+  width: 100%;
+  overflow: hidden;
+}
+
+svg.chart {
+  width: 100%;
+  height: auto;
+  display: block;
+  font-family: var(--font-sans);
+}
+
+svg.chart text {
+  fill: var(--text-secondary);
+}
+
+svg.chart .axis-line {
+  stroke: var(--baseline);
+  stroke-width: 1;
+}
+
+svg.chart .gridline {
+  stroke: var(--gridline);
+  stroke-width: 1;
+}
+
+svg.chart .ref-line {
+  stroke: var(--text-muted);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+}
+
+svg.chart .series-line {
+  fill: none;
+  stroke-width: 2;
+}
+
+svg.chart .series-point {
+  stroke: var(--surface);
+  stroke-width: 1.5;
+}
+
+svg.chart .end-label {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-top: 8px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-item .swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+/* Runs table: the table itself may scroll sideways in its own box; the
+   page never does. */
+.table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+table.runs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  min-width: 520px;
+}
+
+table.runs-table th,
+table.runs-table td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--gridline);
+  white-space: nowrap;
+}
+
+table.runs-table th {
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+table.runs-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+table.runs-table a {
+  color: var(--series-fixture);
+}
+
+.suite-tags {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.suite-tag {
+  font-size: 0.72rem;
+  border-radius: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+footer.site-footer {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  text-align: center;
+  padding: 12px 0 24px;
+}
+
+/* Phone width: stack cards fully, keep type legible, no page-level
+   horizontal scroll (the table box handles its own overflow). */
+@media (max-width: 480px) {
+  .page {
+    padding: 12px;
+  }
+
+  header.site-header h1 {
+    font-size: 1.2rem;
+  }
+
+  .card-grid {
+    grid-template-columns: 1fr;
+  }
+}
