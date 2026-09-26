@@ -33,6 +33,7 @@ EXECUTABLE = [
     "claude-bonsai.sh",
     "update.sh",
     "cache-viz.py",
+    "tests/bench/worker.sh",
 ]
 
 
