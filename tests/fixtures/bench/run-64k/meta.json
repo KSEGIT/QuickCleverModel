@@ -1,0 +1,13 @@
+{
+  "model": "qwen3.5-9b-q4_k_m",
+  "ctx": 65536,
+  "parallel": 1,
+  "gpu": "RTX 3070 Ti",
+  "commit": "c77e410",
+  "run_id": "2026092503",
+  "created_utc": "2026-09-26T05:50:24+00:00",
+  "suites": [
+    "long_context",
+    "live_web"
+  ]
+}

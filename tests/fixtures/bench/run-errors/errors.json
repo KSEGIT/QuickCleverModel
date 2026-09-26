@@ -1,0 +1,3 @@
+{
+  "fixture": "llama-server returned 500 on /v1/chat/completions"
+}

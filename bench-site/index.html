@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RTX benchmark dashboard</title>
+<meta name="description" content="Manual GitHub Actions benchmark results for the local LLM browser agent, on RTX hardware.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page">
+
+  <header class="site-header">
+    <h1>RTX benchmark dashboard</h1>
+    <p id="header-note">Loading run data&hellip;</p>
+  </header>
+
+  <div id="app" role="main">
+    <!-- Filled in by app.js. Kept empty here so the page never ships
+         stale numbers baked into the HTML. -->
+  </div>
+
+  <footer class="site-footer">
+    Data from <code>data/index.json</code>, written by <code>tests/bench/collect.py</code>
+    after each manual run of the benchmark workflow.
+  </footer>
+
+</div>
+
+<noscript>
+  <p style="padding:16px;">This dashboard needs JavaScript to read
+  <code>data/index.json</code> and draw the charts. Enable JavaScript, or
+  open that file directly to see the raw numbers.</p>
+</noscript>
+
+<script src="app.js"></script>
+</body>
+</html>

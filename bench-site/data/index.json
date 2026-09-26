@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "runs": [
+    {
+      "schema": 1,
+      "run_id": "2026092501",
+      "created_utc": "2026-09-25T20:01:34+00:00",
+      "commit": "9f1c2ab",
+      "model": "qwen3.5-9b-q4_k_m",
+      "ctx": 32768,
+      "gpu": "RTX 3070 Ti",
+      "suites": {
+        "fixture": {
+          "passed": 1,
+          "total": 1,
+          "pass_rate": 100.0,
+          "median_seconds": 15.7,
+          "peak_vram_mib": 6269,
+          "peak_prompt_tokens": 4874
+        },
+        "live_web": {
+          "passed": 1,
+          "total": 2,
+          "pass_rate": 50.0,
+          "median_seconds": 49.5,
+          "peak_vram_mib": 6120,
+          "peak_prompt_tokens": 11124
+        }
+      },
+      "sample": true
+    },
+    {
+      "schema": 1,
+      "run_id": "2026092502",
+      "created_utc": "2026-09-25T21:10:00+00:00",
+      "commit": "b2ac901",
+      "model": "qwen3.5-9b-q4_k_m",
+      "ctx": 24576,
+      "gpu": "RTX 3070 Ti",
+      "suites": {
+        "concurrency_serial": {
+          "passed": 3,
+          "total": 4,
+          "pass_rate": 75.0,
+          "median_seconds": 16.3,
+          "peak_vram_mib": 6400,
+          "peak_prompt_tokens": 6801
+        },
+        "concurrency_parallel": {
+          "passed": 2,
+          "total": 4,
+          "pass_rate": 50.0,
+          "median_seconds": 29.7,
+          "peak_vram_mib": 6823,
+          "peak_prompt_tokens": 6659
+        }
+      },
+      "sample": true
+    },
+    {
+      "schema": 1,
+      "run_id": "2026092503",
+      "created_utc": "2026-09-26T05:50:24+00:00",
+      "commit": "c77e410",
+      "model": "qwen3.5-9b-q4_k_m",
+      "ctx": 65536,
+      "gpu": "RTX 3070 Ti",
+      "suites": {
+        "long_context": {
+          "passed": 1,
+          "total": 1,
+          "pass_rate": 100.0,
+          "median_seconds": 26.1,
+          "peak_vram_mib": 7323,
+          "peak_prompt_tokens": 59906
+        },
+        "live_web": {
+          "passed": 2,
+          "total": 3,
+          "pass_rate": 66.7,
+          "median_seconds": 69.5,
+          "peak_vram_mib": 7100,
+          "peak_prompt_tokens": 11124
+        }
+      },
+      "sample": true
+    }
+  ]
+}

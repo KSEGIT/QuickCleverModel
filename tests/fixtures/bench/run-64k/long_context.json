@@ -1,0 +1,8 @@
+{
+  "status": "PASS",
+  "prompt_tokens": 59906,
+  "seconds": 26.1,
+  "target_tokens": 65536,
+  "answer": "Line 29953: The quick benchmark fox jumps over 29953 lazy GPUs.",
+  "reason": null
+}

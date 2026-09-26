@@ -1,0 +1,30 @@
+{
+  "created_utc": "2026-09-26T05:51:33.794489+00:00",
+  "model": "qwen3.5-9b-q4_k_m",
+  "task": "live_web image search",
+  "status": "PASS (image saved; subject needs visual check)",
+  "saved": {
+    "path": "/Users/admin/Source/models/.worktrees/playwright-model-expansion/run/live-orange-images/orange-1790401935.jpg",
+    "bytes": 123461,
+    "kind": "jpg",
+    "url": "https://www.verywellhealth.com/thmb/hMLdauaWPybp8_-TTltweU6J8Kw=/1500x0/filters:no_upscale():max_bytes(150000):strip_icc()/VWH-GettyImages-1205638014-6cee1ce220bd45829eaa069b79b7c3b5.jpg"
+  },
+  "seconds": 42.68,
+  "turns": [
+    {
+      "number": 1,
+      "llm_seconds": 1.22,
+      "prompt_tokens": 4162
+    },
+    {
+      "number": 2,
+      "llm_seconds": 0.33,
+      "prompt_tokens": 4268
+    },
+    {
+      "number": 3,
+      "llm_seconds": 3.58,
+      "prompt_tokens": 11124
+    }
+  ]
+}
