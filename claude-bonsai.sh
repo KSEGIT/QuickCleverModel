@@ -42,15 +42,17 @@ fi
 API_KEY="${BONSAI_SERVER_KEY:-${BONSAI_API_KEY:-}}"
 [[ -n "$API_KEY" ]] || err "no BONSAI_SERVER_KEY or BONSAI_API_KEY in $ENV_FILE"
 
-# The text-only preset: no mmproj, so the prompt cache survives, and it is the
-# only preset with the larger context. models.ini.in explains both.
+# Keep the existing default until the target-GPU agent matrix is measured.
 MODEL="${BONSAI_CLAUDE_MODEL:-bonsai-27b-ternary-text}"
 
-# Claude Code assumes 200k for a model it does not recognise, compacts too late,
-# and the server then truncates the oldest turns without saying so. Advertise
-# the real window: BONSAI_CTX_TEXT if set, else the shared context, else the
-# 131072 the text preset ships with.
-CONTEXT="${BONSAI_CTX_TEXT:-${BONSAI_CTX:-131072}}"
+# Match the selected preset, including the separate agent context controls.
+case "$MODEL" in
+  qwen3.5-9b-q4_k_m) CONTEXT="${QCM_QWEN9_CTX:-${QCM_AGENT_CTX:-8192}}" ;;
+  qwen3.5-4b-q4_k_m) CONTEXT="${QCM_QWEN4_CTX:-${QCM_AGENT_CTX:-8192}}" ;;
+  granite-4.1-8b-q4_k_m) CONTEXT="${QCM_GRANITE_CTX:-${QCM_AGENT_CTX:-8192}}" ;;
+  bonsai-27b-ternary-text) CONTEXT="${BONSAI_CTX_TEXT:-${BONSAI_CTX:-8192}}" ;;
+  *) CONTEXT="${BONSAI_CTX:-8192}" ;;
+esac
 
 export ANTHROPIC_BASE_URL="$BASE_URL"
 export ANTHROPIC_AUTH_TOKEN="$API_KEY"

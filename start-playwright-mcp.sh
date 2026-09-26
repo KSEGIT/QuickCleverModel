@@ -58,14 +58,16 @@ OUTPUT_DIR="${PW_MCP_OUTPUT_DIR:-$ROOT/.playwright-mcp}"
 OUTPUT_MAX_SIZE="${PW_MCP_OUTPUT_MAX_SIZE:-536870912}"
 MAX_SIZE_ARGS=(--output-max-size "$OUTPUT_MAX_SIZE")
 [[ "$OUTPUT_MAX_SIZE" == "0" ]] && MAX_SIZE_ARGS=()
+# The ${a[@]+"${a[@]}"} form below is for macOS /bin/bash 3.2: under set -u it
+# treats "${a[@]}" of an empty array as unbound and aborts (fixed in bash 4.4).
 
-exec npx -y @playwright/mcp@latest \
+exec npx -y @playwright/mcp@0.0.82 \
   --port "$PORT" \
   --host 127.0.0.1 \
   --browser "$BROWSER" \
   --isolated \
   --snapshot-mode "${PW_MCP_SNAPSHOT:-none}" \
   --output-dir "$OUTPUT_DIR" \
-  "${MAX_SIZE_ARGS[@]}" \
+  ${MAX_SIZE_ARGS[@]+"${MAX_SIZE_ARGS[@]}"} \
   --image-responses omit \
   "$@"

@@ -49,7 +49,7 @@ MCP servers work. Add one for a single session:
 
 ```bash
 cat > mcp.json <<'JSON'
-{ "mcpServers": { "playwright": { "command": "npx", "args": ["-y", "@playwright/mcp@latest"] } } }
+{ "mcpServers": { "playwright": { "command": "npx", "args": ["-y", "@playwright/mcp@0.0.82", "--isolated", "--snapshot-mode", "none", "--image-responses", "omit"] } } }
 JSON
 
 ./claude-bonsai.sh --mcp-config mcp.json -p 'Open https://example.com and tell me the page title.'

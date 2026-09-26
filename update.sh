@@ -73,7 +73,7 @@ ENV_FILE="$ROOT/.env"
 STATE="$ROOT/run/update-state"
 LLAMA_IMAGE="bonsai-llama:cuda"
 ROLLBACK_IMAGE="bonsai-llama:rollback"
-WEBUI_IMAGE="ghcr.io/open-webui/open-webui:main"
+WEBUI_IMAGE="ghcr.io/open-webui/open-webui:v0.11.3"
 LLAMA_CONTAINER="bonsai-llama-1"
 
 log()  { printf '%s  %s\n' "$(date -u +%H:%M:%S)" "$*"; }
@@ -135,8 +135,8 @@ for m in d.get("data", []):
 is_pinned_bad_image() {
   # Whether THIS open-webui image digest already broke the chat UI here.
   #
-  # Only code was ever pinned, so a permanently broken upstream :main looped
-  # forever: the rollback retags the old image, so next week the local digest
+  # Earlier floating UI tags could repeatedly fetch a broken upstream image.
+  # The rollback retags the old image, so next week the local digest
   # differs from the registry again, the "nothing to do" exit is skipped, and
   # the run rebuilds, pulls the same broken image, fails, and force-recreates
   # — evicting the resident 27B model and forcing a second cold smoke sweep,
@@ -612,7 +612,7 @@ RETRY_SLEEP="${BONSAI_SMOKE_RETRY_SLEEP:-15}"
 HEALTH_TIMEOUT="${BONSAI_HEALTH_TIMEOUT:-900}"
 
 # Open WebUI gets its own deadline, as generous as llama's. Its first start
-# after a :main pull runs database migrations, which outlast a llama restart
+# after an image pull runs database migrations, which outlast a llama restart
 # on a slow disk — and blowing this rolls back an otherwise-good update,
 # throwing away a full CUDA rebuild and a smoke sweep. It was 300s against
 # llama's 900s while both comments called it "longer", which is the worst of
@@ -634,7 +634,10 @@ PRECHECK_TIMEOUT="${BONSAI_PRECHECK_TIMEOUT:-30}"
 # alias is skipped and a healthy box degrades to "cannot judge".
 SMOKE_SWEEP_MAX="${BONSAI_SMOKE_SWEEP_MAX:-$(( CHAT_TIMEOUT * 4 ))}"
 
-compose() { docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+compose() {
+  QCM_REVISION="$(git -C "$ROOT" rev-parse HEAD)" \
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+}
 
 local_image_digest() {
   # RepoDigests holds the manifest digest the image was pulled by, which is
@@ -1190,7 +1193,7 @@ pulled — so this is the commit, not the registry"
   else
     warn "the chat UI at $WEBUI_URL did not answer after a new image was
 pulled — not blaming the commit for it"
-    # Pin the IMAGE instead, so the same broken :main is not pulled again
+    # Pin the IMAGE digest too, so a broken or republished tag is not pulled again
     # every week. Written before the rollback, which retags the old image.
     # Guarded, or a repeating failure appends the same digest every week.
     if [[ -n "$webui_after" ]] && ! is_pinned_bad_image "$webui_after"; then

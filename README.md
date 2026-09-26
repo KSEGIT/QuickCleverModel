@@ -18,6 +18,19 @@ browser.
 
 ## Quick setup
 
+This branch upgrades Prism and adds Qwen3.5 9B/4B and Granite 4.1 8B Q4_K_M.
+Read the [runtime migration and version record](docs/runtime-versions.md)
+before updating an existing installation. The legacy ternary Q2_0 file must
+remain for rollback; `./fetch-models.sh bonsai` downloads its official PQ2_0
+replacement separately. Target RTX validation is still pending.
+
+Download new text models with `./fetch-models.sh agents` (about 13.8 GB), then
+restart to expose them in model discovery. They use native templates and 8K
+starting contexts. `./version.sh` prints pins and installed build information
+without network access. See [API and client tests](docs/runtime-testing.md).
+Current PASS, FAIL and SKIPPED results are in the
+[runtime validation record](docs/runtime-validation.md).
+
 **Linux + NVIDIA** (tested on Ubuntu, RTX 3070 Ti 8 GB) — two commands:
 
 ```bash

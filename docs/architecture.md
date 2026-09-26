@@ -24,7 +24,7 @@ Docker Desktop's registry proxy wedged mid-setup — see
 │                                                                             │
 │   llama-server ROUTER  ──────────────────────────────  0.0.0.0:8080         │
 │   (prism fork, source-built)                       ▲        ▲               │
-│     ├─ child: bonsai-27b-ternary  Q2_0  6.7 GB  ─┐ │        │               │
+│     ├─ child: bonsai-27b-ternary  PQ2_0 6.7 GB  ─┐ │        │               │
 │     └─ child: bonsai-27b-1bit     Q1_0  3.8 GB  ─┤ │        │               │
 │          both on Metal / MTLGPUFamilyApple10     │ │        │               │
 │          one resident at a time (--models-max 1) ┘ │        │               │
@@ -46,7 +46,7 @@ flowchart LR
     subgraph MAC["macOS host (Apple Silicon)"]
         UI["Open WebUI<br/>127.0.0.1:9090"]
         RTR["llama-server ROUTER<br/>0.0.0.0:8080 + api-key"]
-        T["child: bonsai-27b-ternary<br/>Q2_0 · 6.7 GB"]
+        T["child: bonsai-27b-ternary<br/>PQ2_0 · 6.7 GB"]
         B["child: bonsai-27b-1bit<br/>Q1_0 · 3.8 GB"]
         PW["Playwright MCP<br/>:8931"]
         CV["cache-viz :8090"]
@@ -70,14 +70,18 @@ flowchart LR
 The router loads no model itself. It spawns one child `llama-server` per model in
 `models.ini` and proxies each request to the right child, so both quantizations
 appear in the Open WebUI dropdown and you switch between them without a restart.
+The diagrams show the original Bonsai pair; the optional Qwen3.5 and Granite
+presets use the same router and appear after their pinned GGUFs are installed.
 
 ## Linux/NVIDIA shape — all Docker
 
 The same stack runs fully containerised on a Linux box with an NVIDIA GPU —
 developed against an RTX 3070 Ti (8 GB VRAM, sm_86). `docker/Dockerfile` builds
-the prism fork's `llama-server` with CUDA (the fork's Q1_0/Q2_0 kernels work on
-the standard MMQ path, sm_86 included), and `docker/compose.linux.yaml` runs it
+the prism fork's `llama-server` with CUDA for sm_86, and
+`docker/compose.linux.yaml` runs it
 alongside Open WebUI.
+The new Prism/PQ2_0 CUDA build still needs target GPU validation; see
+[runtime validation](runtime-validation.md).
 
 ```mermaid
 flowchart LR
@@ -88,7 +92,7 @@ flowchart LR
         UIW -->|"http://llama:8080/v1"| LL
         LL --- VOL
     end
-    GPU["NVIDIA GPU sm_86+<br/>CUDA MMQ kernels for Q1_0/Q2_0"]
+    GPU["NVIDIA GPU sm_86<br/>PQ2_0 and Q1_0 validation pending"]
     LL --> GPU
     SETUP["setup-nvidia.sh<br/>driver + docker + toolkit"] -.-> DOCKER
 ```
@@ -118,8 +122,8 @@ up manually:
 - Docker (with the Compose plugin) + **nvidia-container-toolkit**, then
   `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`
 - the `hf` CLI for the weight download — on Ubuntu >= 23.04 use
-  `pipx install huggingface_hub[cli]` (a bare `pip install` hits PEP 668's
-  externally-managed error); older releases can use `pip install -U "huggingface_hub[cli]"`
+  `pipx install huggingface_hub==1.32.0` (a bare `pip install` hits PEP 668's
+  externally-managed error); older releases can use `pip install --user "huggingface_hub==1.32.0"`
 
 ```bash
 ./fetch-models.sh        # ~11 GB, both models — lands in models/.
@@ -139,7 +143,7 @@ UI on http://127.0.0.1:9090, API on :8080 — same router mode, same model ids,
 same `.env` key as the macOS stack.
 
 **8 GB VRAM caveat.** Compose defaults to `BONSAI_CTX=8192` so the KV cache
-fits next to the weights. The ternary Q2_0 (7.3 GB with mmproj) is tight at
+fits next to the weights. The ternary PQ2_0 (7.3 GB with mmproj) is tight at
 that ctx; the 1-bit Q1_0 is comfortable and can go much higher:
 
 ```bash
@@ -173,7 +177,7 @@ Open WebUI dropdown:
 
 | model id | quant | file | vendor quality | vision |
 |---|---|---|---|---|
-| `bonsai-27b-ternary` | `Q2_0`, 2.125 bpw | 6.7 GB | 94.6% of FP16 | ✓ |
+| `bonsai-27b-ternary` | `PQ2_0`, 2.125 bpw | 6.7 GB | 94.6% of FP16 | ✓ |
 | `bonsai-27b-1bit` | `Q1_0`, 1.125 bpw | 3.8 GB | 89.5% of FP16 | ✓ |
 
 Both run on Metal — `Q1_0` is a first-class type in this fork (`llama-quantize`

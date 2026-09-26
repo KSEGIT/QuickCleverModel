@@ -154,11 +154,13 @@ class DriftCheckTest(Harness):
         self.write_env(BONSAI_API_KEY=LOCAL_KEY,
                        BONSAI_SERVER_URL="http://10.1.2.3:8080/v1")
         self.assertEqual(self.run_script().returncode, 0)
-        before = open(self.cfg).read()
+        with open(self.cfg) as config:
+            before = config.read()
         self.write_env(BONSAI_API_KEY="bonsai-somethingelse0",
                        BONSAI_SERVER_URL="http://10.9.9.9:8080/v1")
         self.run_script("--check")
-        self.assertEqual(open(self.cfg).read(), before, "--check modified the config")
+        with open(self.cfg) as config:
+            self.assertEqual(config.read(), before, "--check modified the config")
 
     def test_context_mismatch_is_a_note_when_env_is_silent(self):
         """A remote server's context is unknowable from here — do not fail on a guess."""
@@ -176,6 +178,22 @@ class DriftCheckTest(Harness):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("context", proc.stderr)
 
+    def test_new_models_have_separate_agent_contexts(self):
+        self.write_env(BONSAI_API_KEY=LOCAL_KEY, BONSAI_CTX="65536",
+                       BONSAI_CTX_TEXT="131072", QCM_QWEN9_CTX="12288")
+        proc = self.run_script()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(self.cfg) as config:
+            models = json.load(config)["provider"]["bonsai"]["models"]
+        self.assertEqual(models["qwen3.5-9b-q4_k_m"]["limit"]["context"], 12288)
+        self.assertEqual(models["qwen3.5-4b-q4_k_m"]["limit"]["context"], 8192)
+        self.assertEqual(models["granite-4.1-8b-q4_k_m"]["limit"]["context"], 8192)
+
+    def test_agent_context_drift_is_an_error_when_explicit(self):
+        proc = self.render_then(QCM_AGENT_CTX="12288")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("context", proc.stderr)
+
 
 class PreservedKeysTest(Harness):
     """The script must not delete config it does not own.
@@ -189,7 +207,7 @@ class PreservedKeysTest(Harness):
     MCP = {
         "playwright": {
             "type": "local",
-            "command": ["npx", "-y", "@playwright/mcp@latest"],
+            "command": ["npx", "-y", "@playwright/mcp@0.0.82"],
             "enabled": True,
         }
     }
@@ -253,7 +271,9 @@ class TextModelContextTest(Harness):
         """Unset must behave exactly as before this knob existed."""
         self.write_env(BONSAI_API_KEY=LOCAL_KEY, BONSAI_CTX="32768")
         self.assertEqual(self.run_script().returncode, 0)
-        self.assertEqual({32768}, set(self.limits().values()))
+        limits = self.limits()
+        self.assertEqual({32768}, {value for name, value in limits.items() if name.startswith("bonsai-")})
+        self.assertEqual({8192}, {value for name, value in limits.items() if not name.startswith("bonsai-")})
 
     def test_check_compares_the_text_model_against_its_own_value(self):
         self.write_env(BONSAI_API_KEY=LOCAL_KEY, BONSAI_CTX="65536",

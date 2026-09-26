@@ -2208,7 +2208,7 @@ class RollbackAvoidsNoOpRecreate(unittest.TestCase):
                 'image:bonsai-llama:rollback) echo sha256:llama;; '
                 'image:bonsai-llama:cuda) echo sha256:llama;; '
                 'image:sha256:webui) return 0;; '
-                'image:ghcr.io/open-webui/open-webui:main) echo sha256:webui;; '
+                'image:ghcr.io/open-webui/open-webui:v0.11.3) echo sha256:webui;; '
                 'tag:*) echo "TAG RAN";; esac; }; '
                 'compose() { echo "COMPOSE RAN"; }; '
                 'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
