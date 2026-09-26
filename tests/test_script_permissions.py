@@ -34,6 +34,9 @@ EXECUTABLE = [
     "update.sh",
     "cache-viz.py",
     "tests/bench/worker.sh",
+    "tests/live_image_agent.py",
+    "tests/long_context_probe.py",
+    "tests/bench/run_suites.py",
 ]
 
 

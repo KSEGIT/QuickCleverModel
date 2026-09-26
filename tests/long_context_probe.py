@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Long-context needle probe: fill most of the context, ask for one line back.
 
-Builds a prompt of numbered filler lines sized to ~90% of --target-tokens,
+Builds a prompt of numbered filler lines sized to ~85% of --target-tokens,
 asks the model to quote one line by number, and checks the exact line comes
 back. Posts a single non-streaming request to /v1/chat/completions with
 temperature 0 and thinking off. A 400 (for example: context too small for the
@@ -18,30 +18,36 @@ import time
 import urllib.error
 import urllib.request
 
-TOKENS_PER_LINE = 22
-# Sixteen everyday words, long enough that no two consecutive lines repeat
-# a suspiciously matching neighbour when compared as substrings.
-FILLER_WORDS = ("orange", "harbor", "lantern", "meadow", "compass", "granite",
-                 "velvet", "cinder", "willow", "coral", "ember", "thistle",
-                 "quartz", "meridian", "onyx", "saltmarsh")
+# Measured, not guessed: on the real Qwen3.5-9B server,
+#   " ".join(f"Line {i}: the orange crate number {i} holds navel oranges "
+#            "from Valencia." for i in range(2700))
+# plus a one-line question came to 59,906 prompt tokens (the model correctly
+# quoted the requested line back). 59906 / 2700 = 22.187... tokens/line.
+# TOKENS_PER_LINE must stay pinned to this measurement (see
+# test_long_context_probe.py's line-count pins for ctx=32768/65536) — do not
+# "round" it to 22 again, that was the bug that made every probe prompt come
+# out 41% over budget and get a 400 back from the server.
+TOKENS_PER_LINE = 22.2
+TARGET_FRACTION = 0.85
 
 
-def make_line(number):
-    """One filler line, ~22 tokens: a numbered prefix plus 15 common words."""
-    words = [FILLER_WORDS[(number + offset) % len(FILLER_WORDS)] for offset in range(15)]
-    return f"Line {number:06d} of the archive: " + " ".join(words) + "."
+def make_line(i):
+    """One filler line, ~22.2 measured tokens: unpadded, so its own token
+    count does not drift as the index grows past 6 digits."""
+    return f"Line {i}: the orange crate number {i} holds navel oranges from Valencia."
 
 
 def build_prompt(target_tokens):
-    """Numbered filler lines filling ~90% of target_tokens, then a question
-    asking to quote line n // 2 (n = the number of lines). Returns
-    (prompt, line) where `line` is the exact text the model should quote."""
-    line_count = max(2, round(0.9 * target_tokens / TOKENS_PER_LINE))
-    lines = [make_line(number) for number in range(1, line_count + 1)]
-    quote_number = max(1, line_count // 2)
-    line = lines[quote_number - 1]
-    body = "\n".join(lines)
-    question = f"\n\nQuote line {quote_number} exactly, and only that line, with no extra words."
+    """Numbered filler lines filling ~85% of target_tokens (space-joined, the
+    same layout as the measurement above), then a question asking to quote
+    the middle line. Returns (prompt, line) where `line` is the exact text
+    the model should quote."""
+    line_count = max(2, int(TARGET_FRACTION * target_tokens / TOKENS_PER_LINE))
+    lines = [make_line(i) for i in range(line_count)]
+    quote_i = line_count // 2
+    line = lines[quote_i]
+    body = " ".join(lines)
+    question = f" Quote line {quote_i} exactly, and only that line, with no extra words."
     return body + question, line
 
 

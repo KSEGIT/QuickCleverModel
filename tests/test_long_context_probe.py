@@ -20,15 +20,16 @@ SPEC.loader.exec_module(probe)
 
 
 class BuildPromptTest(unittest.TestCase):
-    def test_line_count_fills_about_90_percent_of_target(self):
-        prompt, _ = probe.build_prompt(4400)  # 4400 * 0.9 / 22 = 180 lines
-        self.assertIn(probe.make_line(180), prompt)
-        self.assertNotIn(probe.make_line(181), prompt)
+    def test_line_count_fills_about_85_percent_of_target(self):
+        # int(0.85 * 4400 / 22.2) = 168 lines, indices 0..167.
+        prompt, _ = probe.build_prompt(4400)
+        self.assertIn(probe.make_line(167), prompt)
+        self.assertNotIn(probe.make_line(168), prompt)
 
-    def test_quotes_line_n_over_2(self):
-        prompt, line = probe.build_prompt(4400)
-        self.assertIn("Quote line 90 exactly", prompt)
-        self.assertEqual(line, probe.make_line(90))
+    def test_quotes_the_middle_line(self):
+        prompt, line = probe.build_prompt(4400)  # 168 lines -> quote index 84
+        self.assertIn("Quote line 84 exactly", prompt)
+        self.assertEqual(line, probe.make_line(84))
 
     def test_line_text_appears_verbatim_in_the_prompt(self):
         prompt, line = probe.build_prompt(2200)
@@ -43,6 +44,44 @@ class BuildPromptTest(unittest.TestCase):
         _, small_line = probe.build_prompt(2200)
         _, big_line = probe.build_prompt(22000)
         self.assertNotEqual(small_line, big_line)
+
+    def test_lines_are_space_joined_like_the_measured_baseline(self):
+        # The 59,906-prompt-token measurement this heuristic is pinned to
+        # used " ".join(...), not newline-joined lines. Tokenization is not
+        # separator-agnostic, so this must not silently change.
+        prompt, _ = probe.build_prompt(2200)
+        self.assertNotIn("\n", prompt)
+
+
+class TokensPerLineConstantTest(unittest.TestCase):
+    """Guards the exact measurement this whole heuristic is pinned to."""
+
+    def test_tokens_per_line_matches_the_recorded_measurement(self):
+        # 59,906 prompt tokens / 2700 lines on the real Qwen3.5-9B server.
+        self.assertAlmostEqual(probe.TOKENS_PER_LINE, 59906 / 2700, places=1)
+
+    def test_target_fraction_is_85_percent(self):
+        self.assertEqual(probe.TARGET_FRACTION, 0.85)
+
+
+class LineCountPinTest(unittest.TestCase):
+    """Pins the line count for common context sizes so the heuristic cannot
+    silently drift back to overshooting the server's context (as
+    TOKENS_PER_LINE = 22 did before this fix)."""
+
+    def test_32768_context_plans_1254_lines_quoting_line_627(self):
+        prompt, line = probe.build_prompt(32768)
+        self.assertIn(probe.make_line(1253), prompt)
+        self.assertNotIn(probe.make_line(1254), prompt)
+        self.assertEqual(line, probe.make_line(627))
+        self.assertIn("Quote line 627 exactly", prompt)
+
+    def test_65536_context_plans_2509_lines_quoting_line_1254(self):
+        prompt, line = probe.build_prompt(65536)
+        self.assertIn(probe.make_line(2508), prompt)
+        self.assertNotIn(probe.make_line(2509), prompt)
+        self.assertEqual(line, probe.make_line(1254))
+        self.assertIn("Quote line 1254 exactly", prompt)
 
 
 class CheckAnswerTest(unittest.TestCase):

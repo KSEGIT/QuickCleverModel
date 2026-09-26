@@ -15,6 +15,7 @@ import datetime
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
@@ -28,6 +29,64 @@ SUITE_ORDER = ("fixture", "long_context", "live_web", "concurrency")
 CONCURRENCY_FLAGS = ("--tasks", "job_application", "--repetitions", "1",
                       "--task-timeout", "120", "--max-tokens", "512",
                       "--context", "24576", "--reasoning", "off")
+
+# Per-suite job timeouts scale with the work each suite actually schedules
+# instead of one flat number: a flat 900s killed normal fixture runs (10
+# cases per repetition x up to 300s each is already 3,000s for a single
+# repetition) while leaving a genuinely hung single-request suite waiting
+# needlessly long. These mirror the *other* scripts' own defaults, which
+# run_suites.py does not override for fixture/long_context/live_web.
+FIXTURE_CASES = 10  # playwright_agent_bench.py's default 9 tasks, +1 extra
+                     # variant because conditional_application runs twice.
+DEFAULT_TASK_TIMEOUT = 300  # playwright_agent_bench.py --task-timeout default
+LONG_CONTEXT_REQUEST_TIMEOUT = 120  # long_context_probe.py --request-timeout default
+LIVE_WEB_TASK_TIMEOUT = 300  # live_image_agent.py --task-timeout default
+CONCURRENCY_TASK_TIMEOUT = 120  # matches --task-timeout in CONCURRENCY_FLAGS
+STARTUP_MARGIN = 120  # model/MCP/browser start-up overhead, multi-case suites
+JOB_STARTUP_MARGIN = 60  # same, for suites that are a single request/task
+# The worker.sh `remote()` helper uses `ssh -o ConnectTimeout=15`; the VRAM
+# sample's own subprocess timeout must exceed that or it kills the SSH
+# connection before it even finishes connecting.
+VRAM_SAMPLE_TIMEOUT = 20
+
+
+def job_timeout_for(suite, args):
+    """Pure: the wall-clock cap for one job of `suite`, given how much work
+    run_suites.py itself asked that job to do (repetitions, in particular)."""
+    if suite == "fixture":
+        return FIXTURE_CASES * args.repetitions * DEFAULT_TASK_TIMEOUT + STARTUP_MARGIN
+    if suite == "long_context":
+        return LONG_CONTEXT_REQUEST_TIMEOUT + JOB_STARTUP_MARGIN
+    if suite == "live_web":
+        return LIVE_WEB_TASK_TIMEOUT + JOB_STARTUP_MARGIN
+    if suite == "concurrency":
+        return CONCURRENCY_TASK_TIMEOUT + JOB_STARTUP_MARGIN
+    raise ValueError(f"unknown suite: {suite}")
+
+
+def _kill_process_group(process):
+    """Kill a whole process group, not just the direct child: bench scripts
+    launch Playwright MCP/Chrome as their own children, and Popen.kill()
+    (or subprocess.run(timeout=...)'s internal kill) only reaches the
+    process we spawned directly, orphaning the rest. Requires the process to
+    have been started with start_new_session=True."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def fixture_command(args, output, root=ROOT):
@@ -144,15 +203,29 @@ class VramSampler:
         self.runner = runner or self._shell_runner
         self.stop = threading.Event()
         self.samples = []
+        self._frozen_count = None
+        self._process_lock = threading.Lock()
+        self._process = None
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _shell_runner(self):
         try:
-            result = subprocess.run(self.cmd, shell=True, capture_output=True,
-                                    text=True, timeout=max(10, self.interval * 2))
-        except (OSError, subprocess.SubprocessError):
+            process = subprocess.Popen(self.cmd, shell=True, start_new_session=True,
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                       text=True)
+        except OSError:
             return None
-        return parse_vram_sample(result.stdout)
+        with self._process_lock:
+            self._process = process
+        try:
+            stdout, _ = process.communicate(timeout=VRAM_SAMPLE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+            return None
+        finally:
+            with self._process_lock:
+                self._process = None
+        return parse_vram_sample(stdout)
 
     def _run(self):
         while not self.stop.is_set():
@@ -166,34 +239,71 @@ class VramSampler:
 
     def __exit__(self, *exc_info):
         self.stop.set()
+        # An in-flight sample can block for up to VRAM_SAMPLE_TIMEOUT; do not
+        # wait that long here — kill it so shutdown stays bounded.
+        with self._process_lock:
+            process = self._process
+        if process is not None:
+            _kill_process_group(process)
         if self.thread.is_alive():
             self.thread.join(timeout=5)
+        # Freeze the sample count now: a sample that still lands after this
+        # (the thread refusing to die, or a scheduling fluke) belongs to
+        # whatever runs next, not to the report we are about to write.
+        self._frozen_count = len(self.samples)
 
     def report(self):
-        values = [value for value in self.samples if isinstance(value, int)]
+        count = self._frozen_count if self._frozen_count is not None else len(self.samples)
+        values = [value for value in self.samples[:count] if isinstance(value, int)]
         return {"samples_mib": values, "peak_mib": vram_peak(values)}
 
 
+def _finalize(job, timed_out, timeout):
+    """After a subprocess has been waited on (and killed if it timed out),
+    decide whether its output counts as a kept result or a crash. A timeout
+    is not by itself a reason to discard a report: playwright_agent_bench.py
+    writes fixture.json after every completed case, so a job killed near its
+    deadline can still have a fully valid, merely incomplete, report — keep
+    it, and just note that it timed out."""
+    if job["output"].exists():
+        try:
+            json.loads(job["output"].read_text())
+        except (OSError, ValueError) as error:
+            return f"invalid report JSON: {error}"
+        if timed_out:
+            return f"job timed out after {timeout:.0f}s; kept the partial report"
+        return None
+    if timed_out:
+        return f"job timed out after {timeout:.0f}s"
+    return "subprocess exited without writing a report"
+
+
 def run_job(job, timeout=None):
-    """Run one subprocess to completion. Returns None on success (including
-    when the benchmark itself recorded a FAIL — that is a normal result, not
-    a crash) or a short reason string when the job crashed."""
+    """Run one subprocess to completion in its own process group, so a
+    timeout can kill Playwright/Chrome children too, not just the Python
+    process. Returns None on success (including when the benchmark itself
+    recorded a FAIL — that is a normal result, not a crash) or a short
+    reason string when the job crashed or timed out."""
     try:
-        subprocess.run(job["cmd"], timeout=timeout)
-    except (OSError, subprocess.SubprocessError) as error:
+        process = subprocess.Popen(job["cmd"], start_new_session=True)
+    except OSError as error:
         return f"{type(error).__name__}: {error}"
-    if not job["output"].exists():
-        return "subprocess exited without writing a report"
+    timed_out = False
     try:
-        json.loads(job["output"].read_text())
-    except (OSError, ValueError) as error:
-        return f"invalid report JSON: {error}"
-    return None
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(process)
+        timed_out = True
+    return _finalize(job, timed_out, timeout)
 
 
 def run_batch(batch, timeout=None):
-    """Run every job in a batch (concurrently when there is more than one).
-    Returns (suite, reason) — reason is the first crash found, or None."""
+    """Run every job in a batch (concurrently when there is more than one),
+    each in its own process group. The batch's deadline starts when the
+    batch starts, not afresh at each job's wait() — otherwise two jobs in a
+    pair could together run for up to 2x timeout instead of sharing it, the
+    same way `for job in batch: job.wait(timeout=timeout)` would. Returns
+    (suite, reason) — reason is the first crash/timeout found, or None."""
     suite = batch[0]["suite"]
     if len(batch) == 1:
         return suite, run_job(batch[0], timeout)
@@ -201,24 +311,21 @@ def run_batch(batch, timeout=None):
     reason = None
     for job in batch:
         try:
-            processes.append((job, subprocess.Popen(job["cmd"])))
+            processes.append((job, subprocess.Popen(job["cmd"], start_new_session=True)))
         except OSError as error:
             reason = reason or f"{type(error).__name__}: {error}"
+    deadline = None if timeout is None else time.monotonic() + timeout
     for job, process in processes:
+        remaining = None if deadline is None else max(0, deadline - time.monotonic())
+        timed_out = False
         try:
-            process.wait(timeout=timeout)
+            process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
-            reason = reason or "subprocess timed out"
-            continue
-        if not job["output"].exists():
-            reason = reason or "subprocess exited without writing a report"
-            continue
-        try:
-            json.loads(job["output"].read_text())
-        except (OSError, ValueError) as error:
-            reason = reason or f"invalid report JSON: {error}"
+            _kill_process_group(process)
+            timed_out = True
+        job_reason = _finalize(job, timed_out, timeout)
+        if job_reason and reason is None:
+            reason = job_reason
     return suite, reason
 
 
@@ -243,12 +350,13 @@ def run(args):
         if suite not in args.suites or suite in errors:
             continue
         suite_batches = [batch for batch in batches if batch[0]["suite"] == suite]
+        timeout = args.job_timeout if args.job_timeout else job_timeout_for(suite, args)
         sampler = VramSampler(args.vram_cmd)
         crash = None
         with sampler:
             for batch in suite_batches:
                 ran += len(batch)
-                _, reason = run_batch(batch, timeout=args.job_timeout)
+                _, reason = run_batch(batch, timeout=timeout)
                 if reason and crash is None:
                     crash = reason
                     break
@@ -288,8 +396,10 @@ def main():
     parser.add_argument("--key-env", default="BONSAI_API_KEY")
     parser.add_argument("--gpu", default=None, help="GPU name for meta.json; falls back to $BENCH_GPU_NAME")
     parser.add_argument("--run-id", default=None, help="Run id for meta.json; falls back to $GITHUB_RUN_ID")
-    parser.add_argument("--job-timeout", type=float, default=900,
-                        help="Hard wall-clock cap per subprocess, in seconds")
+    parser.add_argument("--job-timeout", type=float, default=None,
+                        help="Override the per-suite wall-clock cap (seconds); by "
+                             "default it scales with the suite's own work, see "
+                             "job_timeout_for()")
     args = parser.parse_args()
     if args.repetitions < 1:
         parser.error("--repetitions must be positive")
