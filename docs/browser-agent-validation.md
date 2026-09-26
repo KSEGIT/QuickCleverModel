@@ -296,6 +296,48 @@ a reliable production setting. The current preset still defaults to 8K; set
 Do not infer 32K support for other model presets or claim worker-side browser
 VRAM headroom from these numbers.
 
+## Live web and 64K follow-up, 2026-09-26
+
+After a worker reboot the GPU had no driver: the new kernel `7.0.0-34` had no
+NVIDIA module (installed only up to `-31`), and `bonsai-llama-1` exited at boot.
+Installing `linux-modules-nvidia-595-open-generic` (`7.0.0-34.34+1`) and loading
+the module fixed it. Check `nvidia-smi` after any kernel update.
+
+**64K context.** Qwen3.5 9B Q4_K_M loaded with `--ctx-size 65536 --parallel 1`
+and f16 GPU K/V, all layers on the GPU. Idle VRAM was 7,313 / 8,192 MiB. A
+59,906-token prompt ran in 26.1 seconds, the model quoted the requested line
+correctly, and VRAM peaked at 7,323 MiB. That leaves about 870 MiB free: enough
+for inference alone, but a browser on the same GPU is not measured.
+
+**Live DuckDuckGo image task.** A one-off harness (not in this repo) gave the
+model real headless Chrome via Playwright MCP 0.0.82, starting at
+duckduckgo.com: search for oranges, open Images, pick a picture, find its
+full-size URL, and call a harness `save_image` tool. That tool saves only real
+JPEG/PNG/GIF/WebP data. Navigation was limited to duckduckgo.com, and each
+saved picture was checked by eye.
+
+- Headless Chrome's default user agent got **"No images found"** from
+  DuckDuckGo. A normal Chrome user agent (`--user-agent`) fixed it.
+- The Images page snapshot is about 175,000 characters, mostly ad-tracking
+  links. Run 1 (32K, full history) went past 32K tokens and the server refused
+  the request after 22 turns.
+- The harness then shortened links over 300 characters and kept only the
+  newest large page view in history. With that, runs peaked at 14.6K–24.3K
+  prompt tokens.
+
+| Run | Context | Result | Time | Note |
+| --- | --- | --- | --- | --- |
+| 1 | 32K | FAIL | 55.3 s | Context overflow; DuckDuckGo showed no images |
+| 2 | 32K | PASS | 43.7 s | Saved an orange photo (verywellhealth.com) |
+| 3 | 64K | FAIL | 133.6 s | Found image URLs but wrote its plan as text instead of calling `save_image` |
+| 4 | 64K | PASS | 69.5 s | Saved an orange photo (wallpapers.com) |
+| 5 | 64K | PASS | 42.7 s | Saved the same photo as run 2 |
+
+With the context fixes, **3/4 passed**. The one failure was a model error, not a
+context error. 64K was not needed for this task once old page views were
+removed, but it gives room for pages that cannot be trimmed. Raw reports:
+`run/rtx-qwen9-*-live-orange-*.json`; images: `run/live-orange-images/`.
+
 The sections below describe the earlier Apple Metal checks. Their prior
 statement that the RTX host was unavailable applies to **2026-09-23 only**.
 
