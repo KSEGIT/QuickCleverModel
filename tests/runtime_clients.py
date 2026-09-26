@@ -77,7 +77,9 @@ def command(client, args, root, fixture, env, prompt, browser=False):
                     "ANTHROPIC_DEFAULT_HAIKU_MODEL": args.model,
                     "ANTHROPIC_DEFAULT_SONNET_MODEL": args.model,
                     "ANTHROPIC_DEFAULT_OPUS_MODEL": args.model,
-                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(args.context)})
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(args.context),
+                    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(min(2048, args.context // 4)),
+                    "DISABLE_COMPACT": "1", "MAX_THINKING_TOKENS": "0"})
         settings = root / "claude-settings.json"
         settings.write_text(json.dumps({"permissions": {
             "allow": ["Read(./**)", "Write(./**)", "Edit(./**)"] +
@@ -151,7 +153,9 @@ def run_client(client, args, browser=False):
         subprocess.run(["git", "init", "--quiet", str(fixture)], check=True, env=env,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         prompt = ("Read input.txt using a file tool. Create output.txt containing exactly the same "
-                  "token followed by one newline. Do not change input.txt. Then say which file you wrote. "
+                  "token followed by one newline. The Read tool may show line numbers: do not copy "
+                  "a line number, tab, or other display prefix. Do not change input.txt. "
+                  "Then say which file you wrote. "
                   "Work only in this temporary directory; do not inspect other directories.")
         http_server = None
         expected_output = token + "\n"

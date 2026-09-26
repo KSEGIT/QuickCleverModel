@@ -31,6 +31,25 @@ without network access. See [API and client tests](docs/runtime-testing.md).
 Current PASS, FAIL and SKIPPED results are in the
 [runtime validation record](docs/runtime-validation.md).
 
+For the browser-agent expansion, download one model at a time:
+
+```bash
+./fetch-models.sh --model qwen3.6-35b-a3b           # Q4_K_XL, 22.36 GB
+./fetch-models.sh --model gemma4-e4b                 # official QAT Q4, 5.15 GB
+./fetch-models.sh --model qwen3.6-35b-a3b --quant IQ4_XS
+```
+
+The last command is an optional comparison, not a replacement for the default
+file. `--all` still downloads every catalogue artifact, including alternatives
+(about 92 GiB of weights); check disk space first. See [browser-agent models](docs/browser-agent-models.md)
+and [the opt-in Playwright benchmark](docs/playwright-agent-benchmark.md).
+See [validation status](docs/browser-agent-validation.md) before choosing a
+production browser-agent model; RTX 3070 Ti comparisons are still pending.
+OpenCode's generated model list is static; it may show either new alias before
+its selected GGUF exists. The router advertises an alias only after that file
+is installed. Keep `QCM_QWEN36_QUANT` or `QCM_GEMMA4_QUANT` aligned with the
+downloaded variant.
+
 **Linux + NVIDIA** (tested on Ubuntu, RTX 3070 Ti 8 GB) — two commands:
 
 ```bash

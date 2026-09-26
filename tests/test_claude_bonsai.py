@@ -144,6 +144,14 @@ class ModelAndContextTest(Harness):
                        BONSAI_CLAUDE_MODEL="granite-4.1-8b-q4_k_m")
         self.assertEqual("8192", self.handed()["CTX"])
 
+    def test_browser_models_use_separate_contexts(self):
+        for model, key, expected in (("qwen3.6-35b-a3b", "QCM_QWEN36_CTX", "16384"),
+                                     ("gemma4-e4b", "QCM_GEMMA4_CTX", "12288")):
+            with self.subTest(model=model):
+                self.write_env(BONSAI_API_KEY=KEY, BONSAI_CTX_TEXT="131072",
+                               BONSAI_CLAUDE_MODEL=model, **{key: expected})
+                self.assertEqual(expected, self.handed()["CTX"])
+
     def test_context_falls_back_to_the_shared_value(self):
         self.write_env(BONSAI_API_KEY=KEY, BONSAI_CTX="65536")
         self.assertEqual("65536", self.handed()["CTX"])

@@ -1,0 +1,1 @@
+"""QuickCleverModel test modules."""

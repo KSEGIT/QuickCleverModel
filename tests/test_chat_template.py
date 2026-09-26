@@ -26,6 +26,7 @@ The render tests use Python jinja2. llama.cpp renders with minja, a C++ subset,
 so a green run here is necessary but not sufficient -- it proves the template
 logic, not minja parity. Parity is checked against the live server after deploy.
 """
+import hashlib
 import os
 import re
 import struct
@@ -45,6 +46,9 @@ GGUF_TEMPLATE = os.path.join(ROOT, "tests", "fixtures", "gguf-chat-template.jinj
 # The exact call the GGUF template makes. Its presence anywhere in our copy
 # means the fix has been reverted or a template refresh overwrote it.
 SYSTEM_POSITION_RAISE = "System message must be at the beginning."
+QWEN_TEMPLATE = os.path.join(ROOT, "qwen3.5-chat-template.jinja")
+QWEN_NATIVE_SHA256 = "7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+QWEN_PATCHED_SHA256 = "25f597df3371a86717074a45f77aba1cc90ec83917a28c495df9c6b00baf91e9"
 
 try:
     import jinja2
@@ -165,10 +169,10 @@ class Wiring(unittest.TestCase):
             "the text preset must take its context from BONSAI_CTX_TEXT",
         )
         for vision in ("bonsai-27b-ternary", "bonsai-27b-1bit"):
-            self.assertNotIn(
-                "c",
-                sections[vision],
-                f"[{vision}] must inherit [*] c -- it cannot afford the text "
+            self.assertEqual(
+                "@CTX@",
+                sections[vision].get("c"),
+                f"[{vision}] must retain BONSAI_CTX without inheriting the text "
                 "preset's context",
             )
 
@@ -184,6 +188,53 @@ class Wiring(unittest.TestCase):
             SYSTEM_POSITION_RAISE in read(TEMPLATE),
             "the system-position raise is back -- Codex will 400 again",
         )
+
+
+class Qwen35Wiring(unittest.TestCase):
+    """The Qwen override changes one guard, not its tool or thinking grammar."""
+
+    def test_template_is_exactly_pinned_and_shipped(self):
+        source = read(QWEN_TEMPLATE)
+        self.assertEqual(QWEN_PATCHED_SHA256, hashlib.sha256(source.encode()).hexdigest())
+        self.assertNotIn(SYSTEM_POSITION_RAISE, source)
+        self.assertIn("tool_call.arguments is mapping", source)
+        self.assertIn("enable_thinking is defined and enable_thinking is true", source)
+        self.assertRegex(read(DOCKERFILE),
+            r"(?m)^COPY .*\bqwen3\.5-chat-template\.jinja\b.*\s/app/\s*$")
+
+    def test_native_gguf_diff_is_only_late_system_guard_when_weights_available(self):
+        paths = (
+            os.path.join(ROOT, "models", "Qwen3.5-9B-GGUF", "Qwen3.5-9B-Q4_K_M.gguf"),
+            os.path.join(ROOT, "models", "Qwen3.5-4B-GGUF", "Qwen3.5-4B-Q4_K_M.gguf"),
+        )
+        available = [path for path in paths if os.path.isfile(path)]
+        if not available:
+            self.skipTest("Qwen3.5 GGUF weights are not downloaded in this checkout")
+        old = "            {{- raise_exception('System message must be at the beginning.') }}"
+        new = ("            {%- set content = render_content(message.content, false, true)|trim %}\n"
+               "            {%- if content %}\n"
+               "                {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n"
+               "            {%- endif %}")
+        for path in available:
+            with self.subTest(path=path):
+                native = gguf_chat_template(path)
+                self.assertEqual(QWEN_NATIVE_SHA256, hashlib.sha256(native.encode()).hexdigest())
+                self.assertEqual(1, native.count(old))
+                self.assertEqual(read(QWEN_TEMPLATE).rstrip("\n"),
+                                 native.replace(old, new).rstrip("\n"))
+
+
+@unittest.skipIf(jinja2 is None and not ON_CI, "jinja2 not installed")
+class Qwen35Rendering(unittest.TestCase):
+    def test_multiple_system_messages_render(self):
+        rendered = compile_template(read(QWEN_TEMPLATE)).render(
+            messages=[{"role": "system", "content": "First instruction"},
+                      {"role": "system", "content": "Second instruction"},
+                      {"role": "user", "content": "Hello"}],
+            tools=[], add_generation_prompt=True, enable_thinking=False)
+        self.assertIn("<|im_start|>system\nFirst instruction<|im_end|>", rendered)
+        self.assertIn("<|im_start|>system\nSecond instruction<|im_end|>", rendered)
+        self.assertIn("<|im_start|>user\nHello<|im_end|>", rendered)
 
 
 @unittest.skipIf(jinja2 is None and not ON_CI, "jinja2 not installed")
