@@ -22,6 +22,13 @@ FAKE_SSH = textwrap.dedent("""\
     import json, os, sys
     with open(os.environ["FAKE_SSH_LOG"], "a") as log:
         log.write(json.dumps(sys.argv[1:]) + "\\n")
+    with open(os.environ["FAKE_SSH_LOG"]) as log:
+        n_calls = sum(1 for _ in log)
+    # FAKE_SSH_FAIL_FIRST=N: the first N connections fail like a dropped link.
+    if n_calls <= int(os.environ.get("FAKE_SSH_FAIL_FIRST", "0")):
+        print("ssh: connect to host rtx-worker port 22: Connection timed out",
+              file=sys.stderr)
+        sys.exit(255)
     cmd = sys.argv[-1]
     if "docker inspect" in cmd:
         rc = int(os.environ.get("FAKE_TEST_RC", "0"))
@@ -67,6 +74,7 @@ class WorkerScriptTest(unittest.TestCase):
             "POLL_INTERVAL": "0",
             "UP_TIMEOUT": "1",
             "DOWN_TIMEOUT": "1",
+            "RETRY_SLEEP": "0",
         }
 
     def run_script(self, *args, **env):
@@ -170,6 +178,24 @@ class WorkerScriptTest(unittest.TestCase):
         start_live = self.index_of("docker start bonsai-llama-1")
         self.assertLess(stop_test, start_live)
         self.assertGreater(self.index_of("http_code"), start_live)
+
+    def test_down_survives_ssh_failures_and_still_starts_live(self):
+        # Calls 1-3 fail: stop test (1), start live (2), stop test (3).
+        # Attempt 2's live start (call 4) succeeds, then health passes.
+        out = self.run_script("down", FAKE_SSH_FAIL_FIRST="3")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        cmds = self.commands()
+        starts = [i for i, c in enumerate(cmds) if "docker start bonsai-llama-1" in c]
+        self.assertEqual(starts, [1, 3])
+        self.assertIn("http_code", cmds[4])
+        self.assertIn("attempt 2/5", out.stderr)
+
+    def test_down_gives_up_after_all_start_attempts(self):
+        out = self.run_script("down", FAKE_SSH_FAIL_FIRST="100", START_ATTEMPTS="3")
+        self.assertEqual(out.returncode, 1)
+        starts = [c for c in self.commands() if "docker start bonsai-llama-1" in c]
+        self.assertEqual(len(starts), 3)
+        self.assertIn("after 3 attempts", out.stderr)
 
     def test_down_fails_when_live_is_unhealthy(self):
         out = self.run_script("down", FAKE_LIVE_CODE="401")

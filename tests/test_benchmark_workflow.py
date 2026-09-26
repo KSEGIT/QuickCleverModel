@@ -116,6 +116,8 @@ class BenchmarkWorkflowTest(unittest.TestCase):
         self.assertEqual(len(ifs), 1)
         self.assertIn("always()", ifs[0])
         self.assertIn("inputs.restore_production", ifs[0])
+        # Skip only when settings never resolved (nothing was stopped).
+        self.assertIn("env.WORKER_SSH != ''", ifs[0])
 
     def test_down_is_last_benchmark_step(self):
         all_steps = steps(self.text)

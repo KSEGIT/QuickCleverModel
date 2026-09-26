@@ -123,6 +123,8 @@ jobs:
           esac
 
           # Split the suites: concurrency needs a 2-slot server, the rest 1.
+          # set -f: split the list on spaces without expanding globs.
+          set -f
           phase1=() ; phase2=""
           for s in $IN_SUITES; do
             case "$s" in
@@ -131,6 +133,7 @@ jobs:
               *) echo "::error::unknown suite: $s"; exit 1 ;;
             esac
           done
+          set +f
           [[ ${#phase1[@]} -gt 0 || -n "$phase2" ]] || { echo "::error::no suites selected"; exit 1; }
 
           {
@@ -191,6 +194,12 @@ jobs:
             StrictHostKeyChecking yes
             BatchMode yes
             ServerAliveInterval 30
+            ServerAliveCountMax 4
+            # One shared connection for worker.sh calls: --vram-cmd polls
+            # every 2 s, and down should not pay a fresh handshake per try.
+            ControlMaster auto
+            ControlPath ~/.ssh/cm-%C
+            ControlPersist 10m
           EOF
           ssh "$WORKER_SSH" true
           echo "SSH to the worker works"
@@ -208,7 +217,10 @@ jobs:
           # -E and the redirects detach the background ssh from the step's
           # output pipes, so the step ends when the tunnel is up.
           log="$RUNNER_TEMP/tunnel.log"
+          # Its own connection, not the shared master: the tunnel must own
+          # its forward and live until the job ends.
           if ! ssh -f -N -E "$log" -o ExitOnForwardFailure=yes \
+              -o ControlMaster=no -o ControlPath=none \
               -L "${LOCAL_PORT}:127.0.0.1:${TEST_PORT}" "$WORKER_SSH" \
               </dev/null >/dev/null; then
             cat "$log" >&2
@@ -334,9 +346,18 @@ jobs:
         run: pkill -f "${LOCAL_PORT}:127.0.0.1:${TEST_PORT}" || true
 
       # Always last. A restore failure fails the job (and so skips publish).
+      # Skipped only when settings never resolved: then nothing was stopped.
+      # worker.sh retries the live start itself; one more whole pass here
+      # covers a longer network drop.
       - name: Restore production (worker.sh down)
-        if: always() && inputs.restore_production
-        run: tests/bench/worker.sh down
+        if: always() && inputs.restore_production && env.WORKER_SSH != ''
+        run: |
+          set -euo pipefail
+          if ! tests/bench/worker.sh down; then
+            echo "::warning::worker.sh down failed; retrying once in 20 s"
+            sleep 20
+            tests/bench/worker.sh down
+          fi
 
   publish:
     needs: benchmark

@@ -34,6 +34,8 @@ PARALLEL="${PARALLEL:-1}"
 UP_TIMEOUT="${UP_TIMEOUT:-180}"
 DOWN_TIMEOUT="${DOWN_TIMEOUT:-120}"
 POLL_INTERVAL="${POLL_INTERVAL:-2}"
+START_ATTEMPTS="${START_ATTEMPTS:-5}"
+RETRY_SLEEP="${RETRY_SLEEP:-3}"
 
 die() { echo "worker.sh: $*" >&2; exit 1; }
 
@@ -132,11 +134,24 @@ $(q "$TEST_IMAGE") \
   echo "worker.sh: test server healthy on worker 127.0.0.1:$TEST_PORT" >&2
 }
 
+# The path that must not give up: production depends on it. Each attempt
+# stops the test container (best effort: it may already be gone, or SSH may
+# drop) and starts the live one. `docker start` on a running container is a
+# no-op, so a retry after a lost reply is safe.
 cmd_down() {
-  echo "worker.sh: stopping test container $TEST_CONTAINER" >&2
-  remote "docker stop $(q "$TEST_CONTAINER") >/dev/null 2>&1 || true"
-  echo "worker.sh: starting live container $LIVE_CONTAINER" >&2
-  remote "docker start $(q "$LIVE_CONTAINER") >/dev/null" || die "could not start $LIVE_CONTAINER"
+  local attempt started=0
+  is_int "$START_ATTEMPTS" && (( START_ATTEMPTS > 0 )) || START_ATTEMPTS=5
+  for (( attempt = 1; attempt <= START_ATTEMPTS; attempt++ )); do
+    echo "worker.sh: stopping $TEST_CONTAINER, starting $LIVE_CONTAINER (attempt $attempt/$START_ATTEMPTS)" >&2
+    remote "docker stop $(q "$TEST_CONTAINER") >/dev/null 2>&1 || true" \
+      || echo "worker.sh: could not reach worker to stop $TEST_CONTAINER; continuing" >&2
+    if remote "docker start $(q "$LIVE_CONTAINER") >/dev/null"; then
+      started=1
+      break
+    fi
+    if (( attempt < START_ATTEMPTS )); then sleep "$RETRY_SLEEP"; fi
+  done
+  (( started )) || die "could not start $LIVE_CONTAINER after $START_ATTEMPTS attempts"
   wait_for "$DOWN_TIMEOUT" live_ready || die "live container $LIVE_CONTAINER is not healthy (expected HTTP 200)"
   echo "worker.sh: live container healthy" >&2
 }
