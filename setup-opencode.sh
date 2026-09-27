@@ -313,6 +313,8 @@ AGENT_CONTEXT_KEYS = {
     "qwen3.5-9b-q4_k_m": "QCM_QWEN9_CTX",
     "granite-4.1-8b-q4_k_m": "QCM_GRANITE_CTX",
     "qwen3.5-4b-q4_k_m": "QCM_QWEN4_CTX",
+    "qwen3.6-35b-a3b": "QCM_QWEN36_CTX",
+    "gemma4-e4b": "QCM_GEMMA4_CTX",
 }
 contexts = {m: ctx_text if m == TEXT_MODEL else ctx for m in MODELS}
 for model, key in AGENT_CONTEXT_KEYS.items():

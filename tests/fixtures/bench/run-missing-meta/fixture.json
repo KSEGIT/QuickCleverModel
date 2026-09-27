@@ -1,0 +1,21 @@
+{
+  "results": [
+    {
+      "task": "job_application",
+      "variant": "eligible",
+      "status": "PASS",
+      "seconds": 12.3,
+      "peak_vram_mib": null,
+      "turns": [
+        {
+          "number": 1,
+          "usage": {
+            "prompt_tokens": 2000,
+            "completion_tokens": 10,
+            "total_tokens": 2010
+          }
+        }
+      ]
+    }
+  ]
+}

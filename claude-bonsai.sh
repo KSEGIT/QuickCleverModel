@@ -50,6 +50,8 @@ case "$MODEL" in
   qwen3.5-9b-q4_k_m) CONTEXT="${QCM_QWEN9_CTX:-${QCM_AGENT_CTX:-8192}}" ;;
   qwen3.5-4b-q4_k_m) CONTEXT="${QCM_QWEN4_CTX:-${QCM_AGENT_CTX:-8192}}" ;;
   granite-4.1-8b-q4_k_m) CONTEXT="${QCM_GRANITE_CTX:-${QCM_AGENT_CTX:-8192}}" ;;
+  qwen3.6-35b-a3b) CONTEXT="${QCM_QWEN36_CTX:-${QCM_AGENT_CTX:-8192}}" ;;
+  gemma4-e4b) CONTEXT="${QCM_GEMMA4_CTX:-${QCM_AGENT_CTX:-8192}}" ;;
   bonsai-27b-ternary-text) CONTEXT="${BONSAI_CTX_TEXT:-${BONSAI_CTX:-8192}}" ;;
   *) CONTEXT="${BONSAI_CTX:-8192}" ;;
 esac

@@ -51,6 +51,7 @@ class ServerStartup(unittest.TestCase):
         self.assertEqual(preset["model"], str(model))
         self.assertEqual(preset["c"], "12288")
         self.assertEqual(preset["ctk"], "f16")
+        self.assertEqual(preset["cache-reuse"], "256")
         self.assertEqual(preset["reasoning"], "off")
         self.assertNotIn("@", (self.root / "run/models.ini").read_text())
 
@@ -63,6 +64,46 @@ class ServerStartup(unittest.TestCase):
         result = self.run_launcher(QCM_QWEN_CTK="q1_0")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("QCM_QWEN_CTK", result.stderr)
+
+    def test_new_models_are_hidden_until_selected_artifact_exists(self):
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("qwen3.6-35b-a3b", self.presets())
+        self.assertNotIn("gemma4-e4b", self.presets())
+
+    def test_qwen36_fit_uses_headroom_and_optional_explicit_layer_limit(self):
+        model = self.root / "models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+        model.parent.mkdir(parents=True)
+        model.touch()
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        preset = self.presets()["qwen3.6-35b-a3b"]
+        self.assertEqual(preset["model"], str(model))
+        self.assertEqual(preset["c"], "8192")
+        self.assertEqual(preset["fit-target"], "1536")
+        self.assertNotIn("ngl", preset)
+        self.assertEqual(preset["reasoning"], "off")
+        result = self.run_launcher(QCM_QWEN36_NGL="12", QCM_QWEN36_FIT_TARGET="2048")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        preset = self.presets()["qwen3.6-35b-a3b"]
+        self.assertEqual(preset["ngl"], "12")
+        self.assertEqual(preset["fit-target"], "2048")
+
+    def test_alternative_quants_change_only_selected_new_model(self):
+        qwen = self.root / "models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"
+        gemma = self.root / "models/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q5_K_M.gguf"
+        for model in (qwen, gemma):
+            model.parent.mkdir(parents=True, exist_ok=True)
+            model.touch()
+        result = self.run_launcher(QCM_QWEN36_QUANT="IQ4_XS", QCM_GEMMA4_QUANT="Q5_K_M")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.presets()["qwen3.6-35b-a3b"]["model"], str(qwen))
+        self.assertEqual(self.presets()["gemma4-e4b"]["model"], str(gemma))
+
+    def test_invalid_quant_fails_before_server_start(self):
+        result = self.run_launcher(QCM_QWEN36_QUANT="Q2_K")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("QCM_QWEN36_QUANT", result.stderr)
 
     def test_legacy_model_requires_separate_current_artifact(self):
         old = self.root / "models/Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-Q2_0.gguf"

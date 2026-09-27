@@ -47,11 +47,12 @@ fi
 
 echo 'Configured model artifacts (presence does not certify loadability or hash):'
 if [[ -f "$ROOT/models.lock.tsv" ]]; then
-  while IFS=$'\t' read -r group repo revision file bytes sha; do
+  while IFS=$'\t' read -r group model_id quant primary repo revision file bytes sha; do
     [[ -z "$group" || "$group" == \#* ]] && continue
     presence=absent
     [[ ! -f "$ROOT/models/${repo#*/}/$file" ]] || presence=present
-    printf '  %s/%s @ %s [%s; %s bytes]\n    SHA256: %s\n' "$repo" "$file" "$revision" "$presence" "$bytes" "$sha"
+    printf '  %s %s: %s/%s @ %s [%s; %s bytes; default=%s]\n    SHA256: %s\n' \
+      "$model_id" "$quant" "$repo" "$file" "$revision" "$presence" "$bytes" "$primary" "$sha"
   done < "$ROOT/models.lock.tsv"
 else
   echo '  unavailable (models.lock.tsv missing)'

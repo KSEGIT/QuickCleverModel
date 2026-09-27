@@ -1,0 +1,54 @@
+{
+  "results": [
+    {
+      "task": "job_application",
+      "variant": "eligible",
+      "status": "FAIL",
+      "model": "qwen3.5-9b-q4_k_m",
+      "seconds": 34.37005141700001,
+      "peak_vram_mib": null,
+      "turns": [
+        {
+          "number": 1,
+          "llm_seconds": 2.604187374999924,
+          "finish_reason": "tool_calls",
+          "usage": {
+            "completion_tokens": 61,
+            "prompt_tokens": 2094,
+            "total_tokens": 2155
+          }
+        },
+        {
+          "number": 2,
+          "llm_seconds": 0.6229012079999166,
+          "finish_reason": "tool_calls",
+          "usage": {
+            "completion_tokens": 15,
+            "prompt_tokens": 2277,
+            "total_tokens": 2292
+          }
+        },
+        {
+          "number": 3,
+          "llm_seconds": 0.8088497500000358,
+          "finish_reason": "tool_calls",
+          "usage": {
+            "completion_tokens": 27,
+            "prompt_tokens": 2434,
+            "total_tokens": 2461
+          }
+        },
+        {
+          "number": 30,
+          "llm_seconds": 0.6123582500000566,
+          "finish_reason": "tool_calls",
+          "usage": {
+            "completion_tokens": 30,
+            "prompt_tokens": 6659,
+            "total_tokens": 6689
+          }
+        }
+      ]
+    }
+  ]
+}

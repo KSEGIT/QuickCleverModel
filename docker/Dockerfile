@@ -41,7 +41,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /runtime-bin/ /app/src/llama.cpp-prism/build/bin/
-COPY start-server.sh models.ini.in bonsai-chat-template.jinja version.sh models.lock.tsv runtime-versions.env /app/
+COPY start-server.sh models.ini.in bonsai-chat-template.jinja qwen3.5-chat-template.jinja version.sh models.lock.tsv runtime-versions.env /app/
 RUN printf '%s\n' "$QCM_REVISION" > /app/build-revision \
  && sed -i "s/^PRISM_SHA=.*/PRISM_SHA=$PRISM_SHA/;s/^PRISM_COMMIT_DATE=.*/PRISM_COMMIT_DATE=2026-09-21T16:31:15Z/;s/^LLAMA_UPSTREAM_SHA=.*/LLAMA_UPSTREAM_SHA=5ea87ddad22541a37053c7ba92b02ec1923617c6/" /app/runtime-versions.env
 ENTRYPOINT ["/app/start-server.sh"]
