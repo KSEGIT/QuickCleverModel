@@ -7,7 +7,7 @@
 # Docker Desktop maps to the macOS host.
 services:
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:v0.11.3
     container_name: bonsai-webui
     ports:
       # WEBUI_AUTH is false below — loopback-only, or the whole LAN gets an

@@ -84,7 +84,7 @@ fi
 if [[ $CHECK -eq 1 ]]; then
   echo
   info "later steps would:"
-  would "install the hf CLI (pipx install huggingface_hub[cli], pip --user fallback) — if missing"
+  would "install the hf CLI (pipx install huggingface_hub==1.32.0, pip --user fallback; Python >= 3.10) — if missing"
   would "./fetch-models.sh — ~11 GB of GGUF weights into models/ (idempotent, resumable)"
   would "generate .env with a random BONSAI_API_KEY (skipped if .env already exists)"
   would "docker compose --env-file .env -f docker/compose.linux.yaml up --build -d"
@@ -103,12 +103,12 @@ if command -v hf >/dev/null 2>&1; then
 else
   info "installing the hf CLI"
   # shellcheck disable=SC2086  # $SUDO is intentionally word-split ("" or "sudo")
-  if $SUDO apt-get update && $SUDO apt-get install -y pipx && pipx install "huggingface_hub[cli]"; then
+  if $SUDO apt-get update && $SUDO apt-get install -y --no-install-recommends pipx && pipx install "huggingface_hub==1.32.0"; then
     ok "hf installed via pipx"
   else
     warn "pipx route failed — falling back to pip --user"
-    python3 -m pip install --user "huggingface_hub[cli]" \
-      || die "could not install the hf CLI via pipx or pip — install huggingface_hub[cli] manually"
+    python3 -m pip install --user "huggingface_hub==1.32.0" \
+      || die "could not install the hf CLI via pipx or pip — install huggingface_hub==1.32.0 with Python >= 3.10 manually"
   fi
   # Both routes land in ~/.local/bin, which is not always on PATH in the
   # invoking shell (pipx only edits shell rc files for FUTURE logins).
@@ -177,9 +177,12 @@ fi
 # one — without this flag the OPENAI_API_KEY line in compose.linux.yaml fails
 # with "required variable is missing a value".
 COMPOSE=(compose --env-file .env -f docker/compose.linux.yaml)
+QCM_REVISION="$(git -C "$ROOT" rev-parse HEAD)"
+export QCM_REVISION
 warn "the first build takes 10-20 minutes — it compiles the llama.cpp fork with CUDA"
 info "building and starting the stack (llama-server + Open WebUI)"
-$DOCKER docker "${COMPOSE[@]}" up --build -d
+# Set the revision after sudo too; sudo normally drops exported shell variables.
+$DOCKER env QCM_REVISION="$QCM_REVISION" docker "${COMPOSE[@]}" up --build -d
 
 # --- 8. Readiness --------------------------------------------------------------
 # llama-server maps GBs of weights on first request, and Open WebUI runs DB

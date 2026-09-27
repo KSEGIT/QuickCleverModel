@@ -3,7 +3,7 @@
 #
 # Does two things and nothing else:
 #   1. checks opencode is installed; offers to install it if not
-#      (mac: Homebrew, Linux: install script, Windows/git-bash: npm)
+#      (all supported platforms: pinned npm release)
 #   2. writes the provider config (~/.config/opencode/opencode.json)
 #
 # One source of truth: the repo's .env. It reads:
@@ -192,11 +192,10 @@ fi
 if [[ "$MODE" != check ]] && ! command -v opencode >/dev/null; then
   info "opencode is not installed"
   case "$(uname -s)" in
-    Darwin) install_cmd="brew install opencode" ;;
-    Linux)  install_cmd="curl -fsSL https://opencode.ai/install | bash" ;;
-    MINGW*|MSYS*|CYGWIN*) install_cmd="npm install -g opencode-ai" ;;
+    Darwin|Linux|MINGW*|MSYS*|CYGWIN*) install_cmd="npm install -g opencode-ai@1.18.31" ;;
     *) err "unsupported OS — install opencode manually: https://opencode.ai/docs/" ;;
   esac
+  command -v npm >/dev/null || err "npm is required to install the pinned OpenCode release"
   printf 'Install it with:  %s   [y/N] ' "$install_cmd"
   read -r answer
   [[ "$answer" =~ ^[Yy]$ ]] || err "aborted — install opencode and re-run"
@@ -310,6 +309,21 @@ except ValueError:
 
 MODELS = ("bonsai-27b-1bit", "bonsai-27b-ternary", "bonsai-27b-ternary-text")
 TEXT_MODEL = "bonsai-27b-ternary-text"
+AGENT_CONTEXT_KEYS = {
+    "qwen3.5-9b-q4_k_m": "QCM_QWEN9_CTX",
+    "granite-4.1-8b-q4_k_m": "QCM_GRANITE_CTX",
+    "qwen3.5-4b-q4_k_m": "QCM_QWEN4_CTX",
+}
+contexts = {m: ctx_text if m == TEXT_MODEL else ctx for m in MODELS}
+for model, key in AGENT_CONTEXT_KEYS.items():
+    value = os.environ.get(key) or os.environ.get("QCM_AGENT_CTX") or "8192"
+    try:
+        contexts[model] = int(value)
+        if contexts[model] <= 0:
+            raise ValueError
+    except ValueError:
+        sys.exit(f"err  {key} must be a positive integer, got {value!r}")
+MODELS += tuple(AGENT_CONTEXT_KEYS)
 # Top-level keys this script does not own. opencode keeps MCP servers here,
 # and rewriting the file from `expected` alone silently deleted them.
 PRESERVED_KEYS = ("mcp", "agent", "instructions", "permission", "keybinds",
@@ -324,7 +338,7 @@ expected = {
             # The text preset gets its own context: it is the agent/coding
             # preset and models.ini.in lets it run larger than the vision ones.
             "models": {m: {"name": m,
-                           "limit": {"context": ctx_text if m == TEXT_MODEL else ctx,
+                           "limit": {"context": contexts[m],
                                      "output": 4096}}
                        for m in MODELS},
         }
@@ -373,10 +387,16 @@ if mode == "check":
         drift.append(f"models: config has {sorted(a_models)}, expected {sorted(MODELS)}")
     for name in sorted(set(a_models) & set(MODELS)):
         got = a_models[name].get("limit", {}).get("context")
-        want = ctx_text if name == TEXT_MODEL else ctx
+        want = contexts[name]
         if got != want:
-            msg = f"{name}: context {got}, {ctx_source} says {want}"
-            (drift if ctx_explicit else notes).append(msg)
+            if name in AGENT_CONTEXT_KEYS:
+                explicit = bool(os.environ.get(AGENT_CONTEXT_KEYS[name]) or os.environ.get("QCM_AGENT_CTX"))
+                source = AGENT_CONTEXT_KEYS[name] + "/QCM_AGENT_CTX"
+            else:
+                explicit = ctx_explicit or (name == TEXT_MODEL and bool(os.environ.get("BONSAI_CTX_TEXT")))
+                source = ctx_source
+            msg = f"{name}: context {got}, {source} says {want}"
+            (drift if explicit else notes).append(msg)
 
     if strip_ctx(actual) != strip_ctx(expected):
         found_specific = False

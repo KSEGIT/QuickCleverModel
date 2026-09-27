@@ -160,7 +160,7 @@ stop_one() {
   # playwright runs as `npx` -> `npm exec` -> `node playwright-mcp`. Only the node
   # child holds the port, so killing just that orphans the npm wrapper — they
   # accumulate one per up/down cycle. Take the parent too when it is the wrapper.
-  # The wrapper's cmdline is `npm exec @playwright/mcp@latest` — the node
+  # The wrapper's cmdline is `npm exec @playwright/mcp@0.0.82` — the node
   # signature "playwright-mcp" does NOT match it, so match both spellings.
   ppid="$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')"
   if [[ -n "$ppid" && "$ppid" != 1 ]] && ps -p "$ppid" -o command= 2>/dev/null | grep -qE "$(sig_of "$svc")|@playwright/mcp"; then

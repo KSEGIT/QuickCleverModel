@@ -4,6 +4,12 @@
 **Repo:** https://github.com/KSEGIT/QuickCleverModel
 **Date:** 2026-08-09
 
+This is the original v1 product record. The later Prism/PQ2_0 migration and
+optional Qwen/Granite presets are tracked in [runtime versions](runtime-versions.md)
+and [runtime validation](runtime-validation.md). References below to legacy
+Q2_0 and prior CUDA checks describe the v1 release, not acceptance of the
+new runtime.
+
 ## 1. Problem statement
 
 Running a 27B-parameter reasoning model locally usually means picking between

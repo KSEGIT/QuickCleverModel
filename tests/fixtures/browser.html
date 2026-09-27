@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>QCM browser fixture</title>
+<h1>Local booking fixture</h1>
+<form id="booking">
+  <label>Name <input name="name" required></label>
+  <label>Service <select name="service"><option>Review</option><option>Repair</option></select></label>
+  <button type="submit">Book</button>
+</form>
+<p id="result" role="status"></p>
+<script>
+document.querySelector('#booking').addEventListener('submit', event => {
+  event.preventDefault();
+  const data = new FormData(event.target);
+  document.querySelector('#result').textContent = `${data.get('name')}: ${data.get('service')} booked`;
+});
+</script>
+</html>
