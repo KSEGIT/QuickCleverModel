@@ -1,0 +1,54 @@
+{
+  "results": [
+    {
+      "task": "job_application",
+      "variant": "eligible",
+      "status": "PASS",
+      "model": "qwen3.5-9b-q4_k_m",
+      "seconds": 14.885879000000386,
+      "peak_vram_mib": null,
+      "turns": [
+        {
+          "number": 1,
+          "llm_seconds": 1.2157578750002358,
+          "finish_reason": "tool_calls",
+          "usage": {
+            "completion_tokens": 61,
+            "prompt_tokens": 2096,
+            "total_tokens": 2157
+          }
+        },
+        {
+          "number": 2,
+          "llm_seconds": 0.324584624999261,
+          "finish_reason": "tool_calls",
+          "usage": {
+            "completion_tokens": 15,
+            "prompt_tokens": 2279,
+            "total_tokens": 2294
+          }
+        },
+        {
+          "number": 3,
+          "llm_seconds": 0.4759779169999092,
+          "finish_reason": "tool_calls",
+          "usage": {
+            "completion_tokens": 27,
+            "prompt_tokens": 2436,
+            "total_tokens": 2463
+          }
+        },
+        {
+          "number": 18,
+          "llm_seconds": 0.3594307089997528,
+          "finish_reason": "stop",
+          "usage": {
+            "completion_tokens": 15,
+            "prompt_tokens": 4870,
+            "total_tokens": 4885
+          }
+        }
+      ]
+    }
+  ]
+}

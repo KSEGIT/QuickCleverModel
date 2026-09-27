@@ -56,6 +56,10 @@ tools to the model. Use `--force-first-tool` only for a separate required-choice
 comparison; the rest of each task uses `tool_choice=auto`. The default is auto
 for every turn.
 
+See [docs/benchmarks.md](benchmarks.md) for consolidated findings across
+models, and [docs/benchmark-action.md](benchmark-action.md) for the manual
+GitHub Actions job that runs this suite on the RTX worker.
+
 The benchmark uses the production MCP launcher with `--snapshot-mode none` and
 `--image-responses omit`. `browser_snapshot` and `browser_find` are available
 for deliberate inspection. It fails if an ordinary tool response contains an

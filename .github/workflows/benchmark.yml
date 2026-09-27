@@ -1,0 +1,492 @@
+name: benchmark
+
+# Runs the browser-agent suites against a local llama-server on the RTX
+# worker, keeps every run's results, and updates the GitHub Pages dashboard.
+#
+# Manual trigger only. This repo is public: a push or pull_request trigger
+# would let fork code reach the worker. Inputs show on the run page, so no
+# input may carry a secret -- secrets come from the `rtx-benchmark`
+# environment. An empty input falls back to the environment variable of the
+# same meaning, then to the built-in default.
+#
+# Setup (environment, secrets, variables, Pages): docs/benchmark-action.md.
+on:
+  workflow_dispatch:
+    inputs:
+      worker_host:
+        description: 'Worker SSH host on the tailnet (empty: vars.WORKER_HOST)'
+        required: false
+        type: string
+        default: ''
+      ssh_user:
+        description: 'SSH user on the worker (empty: vars.WORKER_SSH_USER)'
+        required: false
+        type: string
+        default: ''
+      model_preset:
+        description: 'Model preset'
+        required: false
+        type: choice
+        options:
+          - qwen3.5-9b
+          - qwen3.5-4b
+        default: qwen3.5-9b
+      ctx:
+        description: 'Context size for the single-slot phase'
+        required: false
+        type: string
+        default: '32768'
+      suites:
+        description: 'Space-separated: fixture long_context live_web concurrency'
+        required: false
+        type: string
+        default: 'fixture long_context live_web'
+      repetitions:
+        description: 'Repetitions of fixture tasks and live_web runs (capped to fit the job time)'
+        required: false
+        type: string
+        default: '1'
+      restore_production:
+        description: 'Stop the test server and restart the live container at the end'
+        required: false
+        type: boolean
+        default: true
+
+# One run at a time: the worker has one GPU, and gh-pages has one history.
+concurrency:
+  group: rtx-benchmark
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    environment: rtx-benchmark
+    timeout-minutes: 240
+    env:
+      # Inputs reach shell steps only through env, never by ${{ }} inside a
+      # script, so an input value cannot inject shell code. The worker host
+      # and SSH user are not here: only "Resolve settings" sees them, and it
+      # masks them before any other step can print them.
+      IN_MODEL_PRESET: ${{ inputs.model_preset || 'qwen3.5-9b' }}
+      IN_CTX: ${{ inputs.ctx || '32768' }}
+      IN_SUITES: ${{ inputs.suites || 'fixture long_context live_web' }}
+      IN_REPETITIONS: ${{ inputs.repetitions || '1' }}
+      LIVE_CONTAINER: ${{ vars.LIVE_CONTAINER || 'bonsai-llama-1' }}
+      LIVE_HEALTH_URL: ${{ vars.LIVE_HEALTH_URL || 'http://127.0.0.1:8080/health' }}
+      LIVE_ENV_FILE: ${{ vars.LIVE_ENV_FILE }}
+      TEST_IMAGE: ${{ vars.TEST_IMAGE || 'qcm-rtx-validation:922be44' }}
+      MODELS_DIR: ${{ vars.MODELS_DIR }}
+      TEMPLATE_FILE: ${{ vars.TEMPLATE_FILE }}
+      # GPU name for meta.json (run_suites.py reads it); empty means unknown.
+      BENCH_GPU_NAME: ${{ vars.BENCH_GPU_NAME }}
+      TEST_CONTAINER: qcm-bench
+      TEST_PORT: '18080'
+      LOCAL_PORT: '18080'
+      # The 2-slot server for the concurrency suite: 24,576 tokens per slot.
+      PHASE2_CTX: '49152'
+      PHASE2_PARALLEL: '2'
+      # Same Playwright as @playwright/mcp@0.0.82 in start-playwright-mcp.sh.
+      PLAYWRIGHT_VERSION: 1.64.0-alpha-1789764292000
+      # Secrets cannot appear in a step `if:`; these booleans can.
+      HAS_TS_OAUTH: ${{ secrets.TS_OAUTH_CLIENT_ID != '' && secrets.TS_OAUTH_SECRET != '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # This job pushes nothing; keep the token out of .git/config.
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Resolve settings
+        env:
+          # A secret is masked in every log line; a variable is plain text
+          # until the add-mask below. Prefer the secrets (see the docs).
+          IN_WORKER_HOST: ${{ inputs.worker_host || secrets.WORKER_HOST || vars.WORKER_HOST }}
+          IN_SSH_USER: ${{ inputs.ssh_user || secrets.WORKER_SSH_USER || vars.WORKER_SSH_USER }}
+        run: |
+          set -euo pipefail
+          # First, before anything can print them: this repo's logs are
+          # public, and later steps (the tailnet ping, ssh) name the worker.
+          [[ -z "$IN_WORKER_HOST" ]] || echo "::add-mask::$IN_WORKER_HOST"
+          [[ -z "$IN_SSH_USER" ]] || echo "::add-mask::$IN_SSH_USER"
+          [[ -n "$IN_WORKER_HOST" ]] || { echo "::error::worker_host input or WORKER_HOST variable is required"; exit 1; }
+          [[ -n "$IN_SSH_USER" ]] || { echo "::error::ssh_user input or WORKER_SSH_USER variable is required"; exit 1; }
+          [[ -n "$MODELS_DIR" ]] || { echo "::error::MODELS_DIR variable is required"; exit 1; }
+          [[ -n "$TEMPLATE_FILE" ]] || { echo "::error::TEMPLATE_FILE variable is required"; exit 1; }
+          [[ "$IN_WORKER_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || { echo "::error::bad worker_host"; exit 1; }
+          [[ "$IN_SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "::error::bad ssh_user"; exit 1; }
+          [[ "$IN_CTX" =~ ^[0-9]+$ ]] || { echo "::error::ctx must be an integer"; exit 1; }
+          [[ "$IN_REPETITIONS" =~ ^[0-9]+$ ]] || { echo "::error::repetitions must be an integer"; exit 1; }
+
+          # The one place a preset maps to a model. Both use the Qwen3.5
+          # template at TEMPLATE_FILE on the worker.
+          case "$IN_MODEL_PRESET" in
+            qwen3.5-9b)
+              model_file=/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf
+              model_alias=qwen3.5-9b-q4_k_m ;;
+            qwen3.5-4b)
+              model_file=/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf
+              model_alias=qwen3.5-4b-q4_k_m ;;
+            *) echo "::error::unknown model_preset: $IN_MODEL_PRESET"; exit 1 ;;
+          esac
+
+          # Split the suites: concurrency needs a 2-slot server, the rest 1.
+          # set -f: split the list on spaces without expanding globs.
+          set -f
+          phase1=() ; phase2=""
+          for s in $IN_SUITES; do
+            case "$s" in
+              fixture|long_context|live_web) phase1+=("$s") ;;
+              concurrency) phase2=concurrency ;;
+              *) echo "::error::unknown suite: $s"; exit 1 ;;
+            esac
+          done
+          set +f
+          [[ ${#phase1[@]} -gt 0 || -n "$phase2" ]] || { echo "::error::no suites selected"; exit 1; }
+
+          # Step caps from run_suites.py's own job timeouts, so the restore
+          # always fits in the job's 240 minutes. Too many repetitions would
+          # not fit: refuse the run instead of cutting the restore short.
+          budget="$(python3 - "${phase1[*]:-}" "$phase2" "$IN_REPETITIONS" <<'EOF'
+          import sys
+          sys.path.insert(0, "tests/bench")
+          import run_suites as r
+          p1, p2, reps = sys.argv[1].split(), sys.argv[2].split(), int(sys.argv[3])
+          print(r.step_minutes(p1, reps), r.step_minutes(p2, reps), r.max_repetitions(p1, p2))
+          EOF
+          )"
+          read -r phase1_min phase2_min max_reps <<<"$budget"
+          (( 10#$IN_REPETITIONS >= 1 )) || { echo "::error::repetitions must be at least 1"; exit 1; }
+          if (( 10#$IN_REPETITIONS > max_reps )); then
+            echo "::error::repetitions $IN_REPETITIONS does not fit the 240-minute job with these suites; the most is $max_reps"
+            exit 1
+          fi
+
+          {
+            echo "WORKER_HOST=$IN_WORKER_HOST"
+            echo "WORKER_SSH=$IN_SSH_USER@$IN_WORKER_HOST"
+            echo "MODEL_FILE=$model_file"
+            echo "MODEL_ALIAS=$model_alias"
+            echo "PHASE1_SUITES=${phase1[*]}"
+            echo "PHASE2_SUITES=$phase2"
+            # Never 0: a skipped step's cap must still be a valid number.
+            echo "PHASE1_TIMEOUT_MIN=$(( phase1_min > 0 ? phase1_min : 1 ))"
+            echo "PHASE2_TIMEOUT_MIN=$(( phase2_min > 0 ? phase2_min : 1 ))"
+          } >> "$GITHUB_ENV"
+          echo "model: $model_alias  ctx: $IN_CTX  repetitions: $IN_REPETITIONS (most: $max_reps)"
+          echo "phase 1: ${phase1[*]:-none} (cap ${phase1_min} min)  phase 2: ${phase2:-none} (cap ${phase2_min} min)"
+
+      # ubuntu-latest (24.04) ships Google Chrome (runner-images readme),
+      # which is what the Playwright MCP uses (--browser chrome). Install it
+      # only if the image ever lacks it.
+      - name: Ensure Google Chrome
+        run: |
+          set -euo pipefail
+          if command -v google-chrome >/dev/null 2>&1; then
+            google-chrome --version
+          else
+            npx -y "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chrome
+          fi
+
+      - name: Join tailnet (OAuth client)
+        if: env.HAS_TS_OAUTH == 'true'
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: gh-bench-${{ github.run_id }}
+          ping: ${{ env.WORKER_HOST }}
+
+      - name: Join tailnet (auth key)
+        if: env.HAS_TS_OAUTH != 'true'
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: gh-bench-${{ github.run_id }}
+          ping: ${{ env.WORKER_HOST }}
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.WORKER_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.WORKER_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/bench_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<'EOF'
+          Host *
+            IdentityFile ~/.ssh/bench_key
+            IdentitiesOnly yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ServerAliveInterval 30
+            ServerAliveCountMax 4
+            # One shared connection for worker.sh calls: --vram-cmd polls
+            # every 2 s, and down should not pay a fresh handshake per try.
+            ControlMaster auto
+            ControlPath ~/.ssh/cm-%C
+            ControlPersist 10m
+          EOF
+          ssh "$WORKER_SSH" true
+          echo "SSH to the worker works"
+
+      - name: Start test server (1 slot)
+        if: env.PHASE1_SUITES != ''
+        timeout-minutes: 10
+        env:
+          CTX: ${{ env.IN_CTX }}
+          PARALLEL: '1'
+        run: tests/bench/worker.sh up
+
+      - name: Open tunnel to the test server
+        run: |
+          set -euo pipefail
+          # -E and the redirects detach the background ssh from the step's
+          # output pipes, so the step ends when the tunnel is up.
+          log="$RUNNER_TEMP/tunnel.log"
+          # Its own connection, not the shared master: the tunnel must own
+          # its forward and live until the job ends.
+          if ! ssh -f -N -E "$log" -o ExitOnForwardFailure=yes \
+              -o ControlMaster=no -o ControlPath=none \
+              -L "${LOCAL_PORT}:127.0.0.1:${TEST_PORT}" "$WORKER_SSH" \
+              </dev/null >/dev/null; then
+            cat "$log" >&2
+            exit 1
+          fi
+          echo "tunnel: 127.0.0.1:${LOCAL_PORT} -> worker 127.0.0.1:${TEST_PORT}"
+
+      - name: Run single-slot suites
+        if: env.PHASE1_SUITES != ''
+        timeout-minutes: ${{ fromJSON(env.PHASE1_TIMEOUT_MIN) }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # PHASE1_SUITES is a word list on purpose
+          python3 tests/bench/run_suites.py \
+            --base-url "http://127.0.0.1:${LOCAL_PORT}" \
+            --model "$MODEL_ALIAS" \
+            --ctx "$IN_CTX" \
+            --parallel 1 \
+            --suites $PHASE1_SUITES \
+            --repetitions "$IN_REPETITIONS" \
+            --out-dir bench-out/raw \
+            --vram-cmd "tests/bench/worker.sh vram"
+
+      # `down` is not called between phases: the live container stays
+      # stopped, and `up` replaces the 1-slot test container.
+      # Phase 2 may fail without failing the job: the merge step records the
+      # failure under "concurrency" in errors.json, and phase 1's results
+      # still get summarized and published.
+      - name: Restart test server (2 slots)
+        id: up2
+        if: env.PHASE2_SUITES != ''
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          CTX: ${{ env.PHASE2_CTX }}
+          PARALLEL: ${{ env.PHASE2_PARALLEL }}
+        run: tests/bench/worker.sh up
+
+      - name: Run concurrency suite
+        id: concurrency
+        if: env.PHASE2_SUITES != '' && steps.up2.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: ${{ fromJSON(env.PHASE2_TIMEOUT_MIN) }}
+        run: |
+          set -euo pipefail
+          python3 tests/bench/run_suites.py \
+            --base-url "http://127.0.0.1:${LOCAL_PORT}" \
+            --model "$MODEL_ALIAS" \
+            --ctx "$PHASE2_CTX" \
+            --parallel "$PHASE2_PARALLEL" \
+            --suites concurrency \
+            --repetitions "$IN_REPETITIONS" \
+            --out-dir bench-out/raw-concurrency \
+            --vram-cmd "tests/bench/worker.sh vram"
+
+      # collect.py reads one raw directory. Fold the 2-slot phase into it:
+      # its report files move over, errors merge, and meta.json lists every
+      # suite. meta.json keeps the 1-slot phase's ctx/parallel when both ran;
+      # suite_settings records the server each suite really used, so the
+      # dashboard plots concurrency VRAM at the 2-slot ctx.
+      - name: Merge phase reports
+        if: always() && env.PHASE2_SUITES != '' && env.MODEL_ALIAS != ''
+        env:
+          UP2_OUTCOME: ${{ steps.up2.outcome }}
+          RUN2_OUTCOME: ${{ steps.concurrency.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p bench-out/raw
+          python3 - <<'EOF'
+          import datetime, json, os, pathlib, shutil
+          src, dst = pathlib.Path("bench-out/raw-concurrency"), pathlib.Path("bench-out/raw")
+          def load(p):
+              try:
+                  return json.loads(p.read_text())
+              except (OSError, ValueError):
+                  return {}
+          src_meta = load(src / "meta.json")
+          if src.is_dir():
+              for path in src.iterdir():
+                  if path.name in ("meta.json", "errors.json"):
+                      continue
+                  target = dst / path.name
+                  if path.is_dir():
+                      shutil.copytree(path, target, dirs_exist_ok=True)
+                  else:
+                      shutil.copy2(path, target)
+          errors = {**load(dst / "errors.json"), **load(src / "errors.json")}
+          if os.environ["UP2_OUTCOME"] == "failure":
+              errors["concurrency"] = "the 2-slot test server did not start (worker.sh up failed)"
+          elif os.environ["UP2_OUTCOME"] != "success":
+              errors["concurrency"] = "not run: an earlier step failed"
+          elif os.environ["RUN2_OUTCOME"] == "failure" and "concurrency" not in errors:
+              errors["concurrency"] = "the concurrency step failed or hit its time cap"
+          if errors:
+              (dst / "errors.json").write_text(json.dumps(errors, indent=2) + "\n")
+          ctx, parallel = int(os.environ["PHASE2_CTX"]), int(os.environ["PHASE2_PARALLEL"])
+          # No phase-1 meta (concurrency only): start from phase 2's, or a
+          # minimal one when phase 2 never wrote any, so the failure still
+          # reaches the dashboard.
+          meta = load(dst / "meta.json") or src_meta or {
+              "model": os.environ["MODEL_ALIAS"], "ctx": ctx, "parallel": parallel,
+              "gpu": os.environ.get("BENCH_GPU_NAME") or None,
+              "commit": os.environ.get("GITHUB_SHA", "")[:7] or None,
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "suites": []}
+          meta["suites"] = list(dict.fromkeys(meta.get("suites", []) + src_meta.get("suites", []) + ["concurrency"]))
+          settings = meta.setdefault("suite_settings", {})
+          settings.update(src_meta.get("suite_settings", {}))
+          settings["concurrency"] = {"ctx": ctx, "parallel": parallel}
+          (dst / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+          EOF
+
+      - name: Summarize
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ ! -f bench-out/raw/meta.json ]]; then
+            echo "::warning::no raw reports to summarize"
+            exit 0
+          fi
+          python3 tests/bench/collect.py summarize bench-out/raw --out bench-out/summary.json
+          cat bench-out/summary.json
+
+      - name: Upload raw reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          # Holds the saved live_web images too (live-images/).
+          name: bench-raw-${{ github.run_id }}
+          path: bench-out/raw
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Upload summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-summary
+          path: bench-out/summary.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Close tunnel
+        if: always()
+        run: pkill -f "${LOCAL_PORT}:127.0.0.1:${TEST_PORT}" || true
+
+      # Always last. A restore failure fails the job (and so skips publish).
+      # Skipped only when settings never resolved: then nothing was stopped.
+      # worker.sh retries the live start itself; one more whole pass here
+      # covers a longer network drop.
+      - name: Restore production (worker.sh down)
+        if: always() && inputs.restore_production && env.WORKER_SSH != ''
+        # Two full worker.sh down passes take about 11 minutes at worst;
+        # run_suites.RESERVED_MINUTES keeps this cap free in the job.
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          if ! tests/bench/worker.sh down; then
+            echo "::warning::worker.sh down failed; retrying once in 20 s"
+            sleep 20
+            tests/bench/worker.sh down
+          fi
+
+  publish:
+    needs: benchmark
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bench-summary
+          path: bench-out
+
+      - name: Check out gh-pages into site/
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch --depth=1 origin gh-pages
+            git worktree add -B gh-pages site FETCH_HEAD
+          else
+            git worktree add --orphan -b gh-pages site
+          fi
+
+      - name: Update history and site
+        run: |
+          set -euo pipefail
+          mkdir -p site/data/runs
+          cp bench-out/summary.json "site/data/runs/${GITHUB_RUN_ID}.json"
+          # The dashboard files; bench-site/data is a local preview sample.
+          rsync -a --exclude data/ bench-site/ site/
+          touch site/.nojekyll
+          python3 tests/bench/collect.py index site/data/runs --out site/data/index.json
+
+      - name: Push gh-pages
+        run: |
+          set -euo pipefail
+          cd site
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+          else
+            git commit -m "benchmark run ${GITHUB_RUN_ID} (${GITHUB_SHA::7})"
+            git push origin gh-pages
+          fi
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v5

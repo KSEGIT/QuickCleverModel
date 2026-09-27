@@ -1,0 +1,25 @@
+{
+  "created_utc": "2026-09-26T05:43:14.299641+00:00",
+  "model": "qwen3.5-9b-q4_k_m",
+  "task": "live_web image search",
+  "status": "FAIL",
+  "saved": null,
+  "seconds": 55.26,
+  "turns": [
+    {
+      "number": 1,
+      "llm_seconds": 2.0,
+      "prompt_tokens": 4162
+    },
+    {
+      "number": 2,
+      "llm_seconds": 0.42,
+      "prompt_tokens": 4268
+    },
+    {
+      "number": 3,
+      "llm_seconds": 3.56,
+      "prompt_tokens": 11124
+    }
+  ]
+}

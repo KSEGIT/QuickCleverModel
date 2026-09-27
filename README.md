@@ -179,6 +179,8 @@ On macOS, update by hand: `git pull` then `make restart`.
 - [docs/updating.md](docs/updating.md) — how updates and the weekly timer work.
 - [docs/codex.md](docs/codex.md) — using Codex CLI with this server as the model.
 - [docs/claude-code.md](docs/claude-code.md) — same for Claude Code, which also gets MCP.
+- [docs/benchmarks.md](docs/benchmarks.md) — browser-agent benchmark findings, all in one place.
+- [docs/benchmark-action.md](docs/benchmark-action.md) — the manual GitHub Actions job that runs the benchmark on the RTX worker.
 
 ## License
 

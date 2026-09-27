@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "run_id": "2026092502",
+  "created_utc": "2026-09-25T21:10:00+00:00",
+  "commit": "b2ac901",
+  "model": "qwen3.5-9b-q4_k_m",
+  "ctx": 24576,
+  "gpu": "RTX 3070 Ti",
+  "suites": {
+    "concurrency_serial": {
+      "passed": 3,
+      "total": 4,
+      "pass_rate": 75.0,
+      "median_seconds": 16.3,
+      "peak_vram_mib": 6400,
+      "peak_prompt_tokens": 3200
+    }
+  }
+}
