@@ -141,7 +141,7 @@ dedicated SSH account (from step 2) can read this file directly.
 | `ssh_user` | Overrides `WORKER_SSH_USER` for this run only | (environment variable) |
 | `model` | The LLM preset to benchmark. The choice list is every section name in `models.ini.in` (except `[*]`), in file order: `bonsai-27b-ternary`, `bonsai-27b-1bit`, `qwen3.5-9b-q4_k_m`, `granite-4.1-8b-q4_k_m`, `qwen3.5-4b-q4_k_m`, `qwen3.6-35b-a3b`, `gemma4-e4b`, `bonsai-27b-ternary-text` | `qwen3.5-9b-q4_k_m` |
 | `decision_model` | The decision model for the `decide` suite's GLiNER runner. Choices: `fastino/GLiNER2.5-Decide`, `fastino/GLiNER2.5-multi-Decide`, `fastino/GLiNER2.5-Decide-1B`, `fastino/gliner2.5-base-v1`, `fastino/gliner2.5-small-v1`, or `none` to skip GLiNER and run only the two Qwen runners | `fastino/GLiNER2.5-Decide` |
-| `ctx` | Context size, in tokens. Leave it empty to keep the chosen preset's own default — the job reads the real size back from the test server after start-up | (preset default) |
+| `ctx` | Context size, in tokens. Leave it empty to keep the chosen preset's own default. Either way, the job reads the real size back from the test server after start-up and records that | (preset default) |
 | `suites` | Space-separated list of suites to run: `fixture`, `long_context`, `live_web`, `decide`, `concurrency` | `fixture long_context live_web` |
 | `repetitions` | How many times to repeat the `fixture` tasks and the `live_web` run. `long_context`, `decide`, and `concurrency` ignore it. | `1` |
 | `restore_production` | Restart the live container when the run ends | `true` |
@@ -169,7 +169,13 @@ once, with an error that gives the highest `repetitions` that fits.
 
 - With the default suites, the most is 2, with or without `concurrency`.
   With `fixture` alone, the most is 3.
-- Without `fixture`, the limit is much higher (26 for `live_web` alone).
+- The default suites plus `decide` and `concurrency` allow only 1.
+- Without `fixture`, the limit is much higher (23 for `live_web` alone).
+
+The job keeps 80 minutes for every step that is not a suite step: about
+10 for set-up, 15 and 10 for the two test-server starts, 10 each for the
+GLiNER cache and install, about 5 for the reports, and 20 for the restore
+(both of its tries).
 
 `tests/bench/run_suites.py` holds the numbers (`step_minutes`,
 `max_repetitions`), so the workflow and the suites always agree.
@@ -192,10 +198,12 @@ hand right after the run.
    key only for the run, and masks it in the logs right away.
 2. If `decide` is one of the suites, and `decision_model` is not `none`, the
    job installs GLiNER on the runner itself (`gliner2[local]`, with
-   CPU-only PyTorch). It also restores a cached Hugging Face download of
-   the chosen decision model. GLiNER then runs on this runner's own CPU,
-   not on the worker's GPU. The dashboard labels its results
-   "cpu (CI runner)".
+   CPU-only PyTorch). It also downloads the chosen decision model, at the
+   commit pinned in `tests/fixtures/decide/decision_models.json`, or
+   restores it from the cache. All of this happens before the job touches
+   the worker, so it never adds to the time production is down. GLiNER
+   then runs on this runner's own CPU, not on the worker's GPU. The
+   dashboard labels its results "cpu (CI runner)".
 3. The job joins the tailnet, then connects to the worker over SSH.
 4. It stops the live container (`bonsai-llama-1` by default), and starts
    the test server in its place. The test server listens on the worker's
@@ -214,9 +222,13 @@ hand right after the run.
    Every suite that needs the preset then records an error, instead of
    crashing.
 
-   When you leave `ctx` empty, the job reads the preset's real context size
-   back from the running server (its `/props` endpoint). It uses that value
-   in the reports, and as `long_context`'s target.
+   After start-up, the job always reads the real context size back from
+   the running server (its `/props` endpoint). It uses that value in the
+   reports, and as `long_context`'s target. If you set `ctx` and the server
+   reports another size, the job logs a warning and records the server's
+   size. If the job cannot read the size, it records it as unknown (shown
+   as "–" on the dashboard), and `long_context` records an error instead
+   of running.
 5. It runs the suites you chose:
 
    | Suite | Server needs | What it runs | Pass means |

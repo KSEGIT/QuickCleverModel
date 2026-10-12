@@ -36,7 +36,9 @@
   // (median seconds -> milliseconds), separate from the all-suite seconds
   // chart below, since a decision takes a fraction of a second, not tens.
   var DECIDE_KEYS = ["decide_qwen_free", "decide_qwen_schema", "decide_gliner"];
-  var DECIDE_SUITES = SUITES.filter(function (s) { return DECIDE_KEYS.indexOf(s.key) !== -1; });
+  function isDecide(key) { return DECIDE_KEYS.indexOf(key) !== -1; }
+  var DECIDE_SUITES = SUITES.filter(function (s) { return isDecide(s.key); });
+  var NON_DECIDE_SUITES = SUITES.filter(function (s) { return !isDecide(s.key); });
 
   function suiteMeta(key) {
     for (var i = 0; i < SUITES.length; i++) {
@@ -72,6 +74,12 @@
   function fmtSeconds(n) {
     if (n === null || n === undefined) return "–";
     return fmtNum(n, 1) + " s";
+  }
+
+  // Decide suites store seconds, but one decision takes a fraction of one.
+  function fmtMs(seconds) {
+    if (seconds === null || seconds === undefined) return "–";
+    return fmtNum(seconds * 1000, 0) + " ms";
   }
 
   function fmtDate(iso) {
@@ -118,11 +126,23 @@
           class: "status-pill " + (passOk ? "status-good" : "status-critical"),
           text: (passOk ? "PASS " : "") + suite.passed + "/" + suite.total
         });
-        var dl = el("dl", {}, [
-          el("dt", { text: "Pass rate" }), el("dd", {}, [pill, document.createTextNode(" " + fmtNum(suite.pass_rate, 1) + "%")]),
-          el("dt", { text: "Median time" }), el("dd", { text: fmtSeconds(suite.median_seconds) }),
-          el("dt", { text: "Peak VRAM" }), el("dd", { text: suite.peak_vram_mib != null ? fmtNum(suite.peak_vram_mib) + " MiB" : "–" })
-        ]);
+        var rows = [
+          el("dt", { text: "Pass rate" }), el("dd", {}, [pill, document.createTextNode(" " + fmtNum(suite.pass_rate, 1) + "%")])
+        ];
+        if (isDecide(meta.key)) {
+          // Per decision, in milliseconds. Wall time for the Qwen runners
+          // includes the tailnet and SSH tunnel; server time does not.
+          rows.push(el("dt", { text: "Time per decision" }), el("dd", { text: fmtMs(suite.median_seconds) }));
+          if (suite.median_server_seconds !== undefined) {
+            rows.push(el("dt", { text: "Server time" }), el("dd", { text: fmtMs(suite.median_server_seconds) }));
+          }
+          rows.push(el("dt", { text: "Invalid answers" }), el("dd", { text: suite.invalid != null ? fmtNum(suite.invalid) : "–" }));
+          rows.push(el("dt", { text: "Runs on" }), el("dd", { text: suite.host || "–" }));
+        } else {
+          rows.push(el("dt", { text: "Median time" }), el("dd", { text: fmtSeconds(suite.median_seconds) }));
+        }
+        rows.push(el("dt", { text: "Peak VRAM" }), el("dd", { text: suite.peak_vram_mib != null ? fmtNum(suite.peak_vram_mib) + " MiB" : "–" }));
+        var dl = el("dl", {}, rows);
         card.appendChild(dl);
         if (suite.error) {
           card.appendChild(el("p", { class: "error-text", text: "Error: " + suite.error }));
@@ -391,14 +411,14 @@
     app.appendChild(panel("Pass rate over runs", "One line per suite; a suite with no data for a run is skipped, not zero.",
       drawLineChart(runs, { valueFn: function (s) { return s.total > 0 ? s.pass_rate : null; }, yFormat: function (v) { return fmtNum(v) + "%"; }, yMax: 100, ariaLabel: "Pass rate per suite across runs, 0 to 100 percent" })));
 
-    app.appendChild(panel("Median time over runs", "Median wall-clock seconds per suite.",
-      drawLineChart(runs, { valueFn: function (s) { return s.median_seconds; }, yFormat: function (v) { return fmtNum(v, 0) + "s"; }, ariaLabel: "Median seconds per suite across runs" })));
+    app.appendChild(panel("Median time over runs", "Median wall-clock seconds per suite. The decide runners have their own chart below.",
+      drawLineChart(runs, { suites: NON_DECIDE_SUITES, valueFn: function (s) { return s.median_seconds; }, yFormat: function (v) { return fmtNum(v, 0) + "s"; }, ariaLabel: "Median seconds per suite across runs" })));
 
     var hasDecide = runs.some(function (run) {
       return DECIDE_KEYS.some(function (key) { return run.suites && run.suites[key]; });
     });
     if (hasDecide) {
-      app.appendChild(panel("Time per decision", "Median milliseconds per decision, for the three decide runners.",
+      app.appendChild(panel("Time per decision", "Median wall-clock milliseconds per decision, for the three decide runners. Qwen's time includes the tailnet and SSH tunnel; GLiNER runs on the CI runner's CPU. The cards show Qwen's server-only time.",
         drawLineChart(runs, {
           suites: DECIDE_SUITES,
           valueFn: function (s) { return s.median_seconds != null ? s.median_seconds * 1000 : null; },

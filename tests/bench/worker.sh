@@ -15,8 +15,8 @@
 #                     MODEL_ALIAS (the preset name, warmed up after start) and
 #                     BENCH_API_KEY (the test server's bearer key). CTX is
 #                     optional: empty keeps the preset's own default; a value
-#                     sets every preset ctx variable (QCM_AGENT_CTX,
-#                     BONSAI_CTX, BONSAI_CTX_TEXT). LIVE_ENV_FILE, when
+#                     sets every ctx variable start-server.sh reads
+#                     (CTX_VARS below). LIVE_ENV_FILE, when
 #                     set, goes in as --env-file, so the router gets the
 #                     live server's .env knobs; the -e values above win.
 #                     A preset that fails to load only warns: the router
@@ -81,6 +81,12 @@ need() {
 }
 
 is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+# Every context-size variable start-server.sh reads. The per-model QCM_*_CTX
+# values win over QCM_AGENT_CTX there, and LIVE_ENV_FILE may set them, so a
+# CTX override must set all of them or a preset keeps the file's value.
+CTX_VARS=(BONSAI_CTX BONSAI_CTX_TEXT QCM_AGENT_CTX QCM_QWEN9_CTX QCM_QWEN4_CTX
+  QCM_GRANITE_CTX QCM_QWEN36_CTX QCM_GEMMA4_CTX)
 
 # Run one shell command string on the worker. BatchMode: never prompt for a
 # password. StrictHostKeyChecking=yes: the host key must already be in
@@ -179,7 +185,10 @@ router_run_cmd() {
     env_file="--env-file $(q "$LIVE_ENV_FILE") "
   fi
   if [[ -n "$CTX" ]]; then
-    ctx_env="-e QCM_AGENT_CTX=$(q "$CTX") -e BONSAI_CTX=$(q "$CTX") -e BONSAI_CTX_TEXT=$(q "$CTX") "
+    local var
+    for var in "${CTX_VARS[@]}"; do
+      ctx_env+="-e $var=$(q "$CTX") "
+    done
   fi
   printf '%s' "docker run -d --rm --gpus all --name $(q "$TEST_CONTAINER") \
 -p 127.0.0.1:$(q "$TEST_PORT"):8080 \

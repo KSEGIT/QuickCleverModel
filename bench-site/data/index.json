@@ -117,7 +117,8 @@
           "ctx": 32768,
           "parallel": 1,
           "invalid": 4,
-          "host": "rtx"
+          "host": "rtx",
+          "median_server_seconds": null
         },
         "decide_qwen_schema": {
           "passed": 57,
@@ -129,7 +130,8 @@
           "ctx": 32768,
           "parallel": 1,
           "invalid": 0,
-          "host": "rtx"
+          "host": "rtx",
+          "median_server_seconds": 0.284
         },
         "decide_gliner": {
           "passed": 51,

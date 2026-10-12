@@ -178,6 +178,24 @@ comparable. For each runner and task, the suite reports:
 - **time per decision** — median milliseconds for one answer, pooled across
   all three tasks for that runner. The first item is a warm-up and does not
   count.
+- **server time** (Qwen runners only) — median of llama-server's own time
+  for one answer (`timings.prompt_ms + timings.predicted_ms`). The summary
+  JSON calls it `median_server_seconds`; it is null when the server sent no
+  timings.
+
+If one request fails (an HTTP error or a time-out), that runner stops. Its
+results for the run are then only that error; the other runners still run.
+
+### Comparing times fairly
+
+The three times do not measure the same path:
+
+- Qwen's time per decision is wall time on the GitHub runner. It includes
+  the tailnet and the SSH tunnel to the worker, both ways.
+- GLiNER runs on the GitHub runner's own CPU. It has no network hop, but
+  also no GPU.
+- Qwen's server time is the fair, model-only number. Compare GLiNER with
+  that, not with Qwen's wall time.
 
 ### The dataset
 
@@ -198,7 +216,15 @@ text", "Decide: Qwen + schema", and "Decide: GLiNER (CPU)" — plus a
 dedicated time-per-decision chart. GLiNER's results carry the host label
 "cpu (CI runner)". The GitHub Actions job runs GLiNER on the runner's own
 CPU, not the RTX worker's GPU. Accuracy does not depend on the hardware it
-runs on.
+runs on. Each decide card shows time per decision in milliseconds, the
+Qwen server time, the invalid-answer count, and where the runner ran. The
+"Median time over runs" chart leaves the decide runners out; they have
+their own chart.
+
+Each decision model loads from a pinned Hugging Face commit, listed in
+`tests/fixtures/decide/decision_models.json`. The raw `decide.json` records
+it as `decision_model_revision`. To move to a newer model
+version, update the commit there.
 
 This page gives no GLiNER numbers. Read them from the dashboard after a
 run. That way, this page never goes stale.
@@ -215,10 +241,21 @@ python3 tests/decide_bench.py \
   --output run/decide.json
 ```
 
-This runs all three runners against the 60-item dataset. To check only the
-two LLM runners, add `--runners qwen-free qwen-schema`. The `gliner`
-runner needs its own install, in a virtual environment, before you add it
-to `--runners`:
+This runs all three runners against the 60-item dataset: `gliner` is in
+the default `--runners`. Without `gliner2` installed, the `gliner` runner
+records an `ImportError` (`ModuleNotFoundError: No module named 'gliner2'`)
+as its result, and the two LLM runners still run. For a server-only run,
+name the two LLM runners:
+
+```sh
+python3 tests/decide_bench.py \
+  --base-url http://127.0.0.1:18080 \
+  --model qwen3.5-9b-q4_k_m \
+  --runners qwen-free qwen-schema \
+  --output run/decide.json
+```
+
+The `gliner` runner needs its own install, in a virtual environment:
 
 ```sh
 python3 -m venv .venv-decide
@@ -227,7 +264,8 @@ pip install "gliner2[local]==2.1.0"
 ```
 
 Pick the decision model with `--decision-model` (default
-`fastino/GLiNER2.5-Decide`). The GitHub Actions job installs the same
+`fastino/GLiNER2.5-Decide`). It loads the pinned commit from
+`decision_models.json`; `--decision-model-revision` picks another one. The GitHub Actions job installs the same
 package, but with CPU-only PyTorch first, to keep a large CUDA wheel off
 the runner; a local run can use whatever PyTorch is already on your
 machine.
@@ -243,6 +281,7 @@ See [docs/benchmark-action.md](benchmark-action.md) for the `decide` and
 | Fenced JSON | The model gets the facts and the decision right, but wraps its JSON answer in a Markdown code fence. The strict-JSON check does not accept a fence, so the task fails even though the answer is correct. | Not fixed. Seen across Qwen3.5 9B, Qwen3.5 4B, and Qwen3.6 35B A3B. Needs a prompt change or a parser that strips fences. |
 | DuckDuckGo headless block | Headless Chrome's default user agent gets "No images found" from DuckDuckGo, even though a normal browser gets results. | Fixed. Set a normal Chrome user agent with `--user-agent`. |
 | Snapshot size | The DuckDuckGo Images page snapshot is about 175,000 characters, mostly ad-tracking links. A full run with all of that text overflows a 32K context after about 22 turns. | Fixed for this task. Shorten links over 300 characters and keep only the newest large page view in history. Runs then peak at 14.6K–24.3K prompt tokens. |
+| Decide p95 time | The decide summary gives only median times, no p95. | Known debt. `decide.json` keeps every latency (`latencies_ms`, `server_ms`), so a p95 can come later from the raw report. |
 | Kernel/driver trap | After a worker reboot to a new kernel, the matching NVIDIA driver module was missing, so the live model container could not start. | Fixed. Install the matching `linux-modules-nvidia` package and load the module. Check `nvidia-smi` after any kernel update, before a benchmark run. |
 
 ## Recommendations

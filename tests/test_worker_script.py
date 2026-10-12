@@ -8,6 +8,7 @@ answers are steered with FAKE_* environment variables.
 """
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -272,6 +273,29 @@ class WorkerScriptTest(unittest.TestCase):
         docker_run = next(l for l in log if "docker run" in l)
         for var in ("QCM_AGENT_CTX=32768", "BONSAI_CTX=32768", "BONSAI_CTX_TEXT=32768"):
             self.assertIn(var, docker_run)
+
+    def test_router_ctx_covers_every_ctx_variable_start_server_reads(self):
+        """start-server.sh reads QCM_QWEN9_CTX and friends before
+        QCM_AGENT_CTX, and LIVE_ENV_FILE may set them: each one needs an -e
+        override, or the preset keeps the file's context size."""
+        with open(os.path.join(ROOT, "start-server.sh")) as f:
+            source = f.read()
+        names = set(re.findall(r"\$\{((?:BONSAI|QCM)_[A-Z0-9_]*CTX(?:_TEXT)?)[:}-]", source))
+        self.assertTrue({"QCM_QWEN9_CTX", "QCM_GEMMA4_CTX", "BONSAI_CTX"} <= names, names)
+        log = self.run_worker("up", MODE="router", MODEL_ALIAS="qwen3.5-9b-q4_k_m",
+                              MODELS_DIR="/srv/models", BENCH_API_KEY="k",
+                              LIVE_ENV_FILE="/srv/bonsai/.env", CTX="32768")
+        docker_run = next(l for l in log if "docker run" in l)
+        for name in sorted(names):
+            self.assertIn(f"-e {name}=32768 ", docker_run)
+        # -e after --env-file, so these win over the file.
+        self.assertLess(docker_run.index("--env-file"), docker_run.index("-e QCM_QWEN9_CTX="))
+
+    def test_router_without_ctx_sets_no_per_model_ctx(self):
+        log = self.run_worker("up", MODE="router", MODEL_ALIAS="qwen3.5-9b-q4_k_m",
+                              MODELS_DIR="/srv/models", BENCH_API_KEY="k", CTX="")
+        docker_run = next(l for l in log if "docker run" in l)
+        self.assertNotRegex(docker_run, r"QCM_[A-Z0-9]+_CTX")
 
     def test_router_up_warms_the_chosen_model(self):
         log = self.run_worker("up", MODE="router", MODEL_ALIAS="granite-4.1-8b-q4_k_m",

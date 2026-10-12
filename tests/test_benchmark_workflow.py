@@ -9,6 +9,8 @@ machine. A push or pull_request trigger would run fork code on it; an input
 named like a secret would print that secret on the run page; a `down` step
 without always() would leave production stopped after any failure.
 """
+import importlib.util
+import json
 import os
 import re
 import unittest
@@ -16,6 +18,11 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "benchmark.yml")
 MODELS_INI = os.path.join(ROOT, "models.ini.in")
+PINS = os.path.join(ROOT, "tests", "fixtures", "decide", "decision_models.json")
+_spec = importlib.util.spec_from_file_location(
+    "run_suites", os.path.join(ROOT, "tests", "bench", "run_suites.py"))
+run_suites = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(run_suites)
 
 
 def load():
@@ -280,9 +287,67 @@ class BenchmarkWorkflowTest(unittest.TestCase):
             step = next(s for s in steps(self.text) if name in s[0])
             self.assertTrue(any("timeout-minutes:" in l and cap in l for l in step), name)
         for name in ("Start test server (1 slot)", "Restart test server (2 slots)",
+                     "Cache Hugging Face models", "Install GLiNER",
                      "Restore production (worker.sh down)"):
             step = next(s for s in steps(self.text) if name in s[0])
             self.assertTrue(any("timeout-minutes:" in l for l in step), name)
+
+    def test_fixed_step_caps_fit_the_reserve(self):
+        """Every fixed `timeout-minutes` outside the two suite steps is
+        counted in run_suites.RESERVED_MINUTES, so the suite caps plus the
+        reserve always fit the job and the restore keeps its time."""
+        benchmark = self.text[:self.text.index("\n  publish:")]
+        job_cap = re.search(r"^    timeout-minutes: (\d+)$", benchmark, re.M)
+        self.assertEqual(int(job_cap.group(1)), run_suites.JOB_TIMEOUT_MINUTES)
+        fixed = []
+        for step in steps(benchmark):
+            for line in step:
+                m = re.match(r"^        timeout-minutes: (.+)$", line)
+                if m and "fromJSON" not in m.group(1):
+                    fixed.append((step[0].strip(), int(m.group(1))))
+        self.assertEqual(sum(cap for _, cap in fixed), run_suites.CAPPED_STEP_MINUTES, fixed)
+        self.assertEqual(run_suites.RESERVED_MINUTES,
+                         run_suites.CAPPED_STEP_MINUTES + run_suites.UNCAPPED_STEP_MINUTES)
+        self.assertGreaterEqual(run_suites.max_repetitions(
+            ["fixture", "long_context", "live_web", "decide"], ["concurrency"]), 1)
+
+    def test_every_decision_model_has_a_pinned_revision(self):
+        with open(PINS) as f:
+            pins = json.load(f)
+        for model in choice_options(self.text, "decision_model"):
+            if model == "none":
+                continue
+            with self.subTest(model=model):
+                self.assertRegex(pins.get(model, ""), r"^[0-9a-f]{40}$")
+
+    def test_pinned_snapshot_downloaded_before_production_stops(self):
+        install = "\n".join(step_named(self.text, "Install GLiNER"))
+        self.assertIn("snapshot_download", install)
+        self.assertIn('revision=os.environ["DECISION_MODEL_REVISION"]', install)
+        order = [s[0] for s in steps(self.text)]
+        at = lambda name: next(i for i, line in enumerate(order) if name in line)
+        self.assertLess(at("Install GLiNER"), at("Join tailnet (OAuth client)"))
+        self.assertLess(at("Install GLiNER"), at("Start test server (1 slot)"))
+        cache = "\n".join(step_named(self.text, "Cache Hugging Face models"))
+        self.assertIn("env.DECISION_MODEL_REVISION", cache)
+        run1 = "\n".join(step_named(self.text, "Run single-slot suites"))
+        self.assertIn('--decision-model-revision "$DECISION_MODEL_REVISION"', run1)
+
+    def test_ctx_is_always_read_back_and_never_recorded_as_zero(self):
+        up1 = "\n".join(step_named(self.text, "Start test server (1 slot)"))
+        self.assertIn("worker.sh ctx", up1)
+        # Read back even when ctx was given; a mismatch warns and the
+        # server's value wins.
+        self.assertNotRegex(up1, r'run_ctx="\$CTX"')
+        self.assertIn("::warning::ctx input was $CTX but the server reports $run_ctx", up1)
+        self.assertNotIn("run_ctx=0", up1)
+        run1 = "\n".join(step_named(self.text, "Run single-slot suites"))
+        self.assertIn('--ctx "${RUN_CTX:-}"', run1)
+        self.assertNotIn("RUN_CTX:-0", self.text)
+
+    def test_merge_never_takes_the_decision_model_from_phase_2(self):
+        merge = "\n".join(step_named(self.text, "Merge phase reports"))
+        self.assertNotRegex(merge, r'meta\["decision_model"\]\s*=')
 
     def test_phase_2_failure_does_not_fail_the_job(self):
         for name in ("Restart test server (2 slots)", "Run concurrency suite"):

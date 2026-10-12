@@ -180,7 +180,8 @@ class BuildMetaTest(unittest.TestCase):
                                 "suite_settings": {
                                     "fixture": {"ctx": 32768, "parallel": 1},
                                     "long_context": {"ctx": 32768, "parallel": 1}},
-                                "decision_model": "fastino/GLiNER2.5-Decide"})
+                                # No decide suite: no decision model.
+                                "decision_model": None})
 
     def test_merging_a_second_invocation_unions_suites_and_keeps_first_created_utc(self):
         existing = {"model": "m", "ctx": 32768, "parallel": 1, "gpu": "RTX 3070 Ti",
@@ -229,6 +230,68 @@ class DecidePlanTest(unittest.TestCase):
         meta = run_suites.build_meta({}, args, "abc1234", None, "1", "2026-10-12T00:00:00Z")
         self.assertEqual(meta["decision_model"], "none")
 
+    def test_meta_has_no_decision_model_without_decide(self):
+        args = make_args(suites=["fixture"], decision_model="fastino/GLiNER2.5-Decide")
+        meta = run_suites.build_meta({}, args, "abc1234", None, "1", "2026-10-12T00:00:00Z")
+        self.assertIsNone(meta["decision_model"])
+
+    def test_second_phase_keeps_the_first_phase_decision_model(self):
+        first = run_suites.build_meta(None, make_args(suites=["decide"], decision_model="fastino/x"),
+                                      "abc1234", None, "1", "2026-10-12T00:00:00Z")
+        # Phase 2 parses --decision-model too, with its default.
+        second = run_suites.build_meta(first, make_args(suites=["concurrency"], parallel=2,
+                                                        decision_model="fastino/GLiNER2.5-Decide"),
+                                       "abc1234", None, "1", "2026-10-12T01:00:00Z")
+        self.assertEqual(second["decision_model"], "fastino/x")
+
+    def test_decide_passes_the_pinned_revision(self):
+        args = make_args(suites=["decide"], decision_model_revision="abc123")
+        cmd = run_suites.build_plan(args, pathlib.Path("/tmp/out"))[0][0][0]["cmd"]
+        self.assertEqual(cmd[cmd.index("--decision-model-revision") + 1], "abc123")
+
+    def test_decide_without_revision_omits_the_flag(self):
+        cmd = run_suites.build_plan(make_args(suites=["decide"]), pathlib.Path("/tmp/out"))[0][0][0]["cmd"]
+        self.assertNotIn("--decision-model-revision", cmd)
+
+
+class UnknownCtxTest(unittest.TestCase):
+    """The workflow passes an empty --ctx when it cannot read the server's
+    context size back: store null, never 0, and skip long_context."""
+
+    def test_empty_ctx_parses_to_none(self):
+        self.assertIsNone(run_suites.ctx_value(""))
+        self.assertEqual(run_suites.ctx_value("8192"), 8192)
+        for bad in ("0", "-1", "abc"):
+            with self.assertRaises(Exception):
+                run_suites.ctx_value(bad)
+
+    def test_long_context_is_an_error_not_a_target_of_zero(self):
+        args = make_args(suites=["fixture", "long_context"], ctx=None)
+        batches, errors = run_suites.build_plan(args, pathlib.Path("/tmp/out"))
+        self.assertEqual([b[0]["suite"] for b in batches], ["fixture"])
+        self.assertIn("context size is unknown", errors["long_context"])
+        fixture_cmd = batches[0][0]["cmd"]
+        self.assertNotIn("--context", fixture_cmd)
+
+    def test_meta_stores_null_ctx(self):
+        args = make_args(suites=["fixture"], ctx=None)
+        meta = run_suites.build_meta(None, args, "abc1234", None, "1", "2026-10-12T00:00:00Z")
+        self.assertIsNone(meta["ctx"])
+        self.assertIsNone(meta["suite_settings"]["fixture"]["ctx"])
+
+    def test_cli_with_empty_ctx_records_the_long_context_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "tests" / "bench" / "run_suites.py"),
+                 "--base-url", "http://127.0.0.1:1", "--model", "m", "--ctx", "",
+                 "--suites", "long_context", "--out-dir", tmp, "--run-id", "1"],
+                capture_output=True, text=True, timeout=60)
+            errors = json.loads(pathlib.Path(tmp, "errors.json").read_text())
+            meta = json.loads(pathlib.Path(tmp, "meta.json").read_text())
+        self.assertEqual(result.returncode, 1, result.stderr)  # nothing ran
+        self.assertIn("long_context", errors)
+        self.assertIsNone(meta["ctx"])
+
 
 class TimeBudgetTest(unittest.TestCase):
     """The workflow sizes its step caps and refuses too many repetitions
@@ -265,6 +328,12 @@ class TimeBudgetTest(unittest.TestCase):
                 total = (run_suites.step_minutes(phase1, most) + run_suites.step_minutes(phase2, most)
                          + run_suites.RESERVED_MINUTES)
                 self.assertLessEqual(total, run_suites.JOB_TIMEOUT_MINUTES)
+
+    def test_reserve_is_the_sum_of_the_non_suite_step_caps(self):
+        # 10 set-up + 15 up1 + 10 up2 + 20 cache/install + 5 reports + 20 down.
+        self.assertEqual(run_suites.RESERVED_MINUTES, 80)
+        self.assertEqual(run_suites.RESERVED_MINUTES,
+                         run_suites.UNCAPPED_STEP_MINUTES + run_suites.CAPPED_STEP_MINUTES)
 
     def test_default_suites_cap_is_two_repetitions(self):
         # Documented in docs/benchmark-action.md; update both together.

@@ -61,14 +61,24 @@ CONCURRENCY_PAIRS = 2
 BATCH_KILL_GRACE = 30
 
 # Workflow time budget (.github/workflows/benchmark.yml). The job has
-# JOB_TIMEOUT_MINUTES in total. RESERVED_MINUTES covers everything that is
-# not a suite step: set-up and tailnet join (~10), both `worker.sh up` steps
-# (10 each, their own step caps), merge/summarize/uploads (~5), and the
-# `worker.sh down` restore step (20, its own step cap). A suite step's cap is
-# its worst case plus STEP_MARGIN_MINUTES, so the step cap only fires if
+# JOB_TIMEOUT_MINUTES in total. RESERVED_MINUTES covers every step that is
+# not a suite step, each at its own `timeout-minutes` cap where it has one:
+#   set-up, checkout, Chrome, tailnet join, SSH, tunnel (no caps)  ~10
+#   Start test server (1 slot)                                      15
+#   Restart test server (2 slots)                                   10
+#   Cache Hugging Face models 10 + Install GLiNER 10                20
+#   merge, summarize, uploads, close tunnel (no caps)               ~5
+#   Restore production (worker.sh down), both passes in one step    20
+#   10 + 15 + 10 + 20 + 5 + 20 = 80
+# The down step's retry runs inside that step, so its 20-minute cap covers
+# both passes (about 11 minutes at worst). A contract test sums the
+# workflow's own caps against these numbers. A suite step's cap is its worst
+# case plus STEP_MARGIN_MINUTES, so the step cap only fires if
 # run_suites.py itself hangs.
 JOB_TIMEOUT_MINUTES = 240
-RESERVED_MINUTES = 60
+UNCAPPED_STEP_MINUTES = 10 + 5  # set-up before the suites, reports after
+CAPPED_STEP_MINUTES = 15 + 10 + 10 + 10 + 20  # up1, up2, HF cache, GLiNER install, down
+RESERVED_MINUTES = UNCAPPED_STEP_MINUTES + CAPPED_STEP_MINUTES  # 80
 STEP_MARGIN_MINUTES = 5
 
 
@@ -162,10 +172,12 @@ def _kill_process_group(process):
 
 
 def fixture_command(args, output, root=ROOT):
+    # --context is a report label there; an unknown ctx keeps its default.
+    context = [] if args.ctx is None else ["--context", str(args.ctx)]
     return [sys.executable, str(root / "tests" / "playwright_agent_bench.py"),
             "--base-url", args.base_url, "--model", args.model, "--output", str(output),
             "--key-env", args.key_env, "--repetitions", str(args.repetitions),
-            "--context", str(args.ctx), "--reasoning", "off"]
+            *context, "--reasoning", "off"]
 
 
 def long_context_command(args, output, root=ROOT):
@@ -182,9 +194,11 @@ def live_web_command(args, output, image_dir, root=ROOT):
 
 
 def decide_command(args, output, root=ROOT):
+    revision = getattr(args, "decision_model_revision", None)
+    pin = ["--decision-model-revision", revision] if revision else []
     return [sys.executable, str(root / "tests" / "decide_bench.py"),
             "--base-url", args.base_url, "--model", args.model,
-            "--decision-model", args.decision_model, "--output", str(output),
+            "--decision-model", args.decision_model, *pin, "--output", str(output),
             "--key-env", args.key_env]
 
 
@@ -200,8 +214,9 @@ def build_plan(args, out_dir, root=ROOT):
     Returns (batches, errors). Each batch is a list of one or more job dicts
     ({"suite", "output", "cmd"}) meant to be launched together (more than
     one job in a batch means they run concurrently). `errors` maps a suite
-    name to why it could not even be planned (currently: concurrency without
-    --parallel 2).
+    name to why it could not even be planned: concurrency without
+    --parallel 2, or long_context when the context size is unknown (its
+    target is the ctx itself).
     """
     batches = []
     errors = {}
@@ -210,7 +225,10 @@ def build_plan(args, out_dir, root=ROOT):
         output = out_dir / "fixture.json"
         batches.append([{"suite": "fixture", "output": output,
                          "cmd": fixture_command(args, output, root)}])
-    if "long_context" in requested:
+    if "long_context" in requested and args.ctx is None:
+        errors["long_context"] = ("not run: the context size is unknown (the server's "
+                                  "ctx could not be read back), and it is long_context's target")
+    elif "long_context" in requested:
         output = out_dir / "long_context.json"
         batches.append([{"suite": "long_context", "output": output,
                          "cmd": long_context_command(args, output, root)}])
@@ -269,17 +287,23 @@ def build_meta(existing, args, commit, gpu, run_id, now):
     concurrency phases) merges in rather than starting over: the suites list
     is unioned and created_utc is kept from the first invocation.
     suite_settings records the server ctx/parallel each suite actually ran
-    with, since the two phases use different servers."""
+    with, since the two phases use different servers. ctx may be None (the
+    server's size could not be read back). decision_model belongs to the
+    decide suite: an invocation without it keeps the earlier value."""
     existing = existing or {}
     suites = list(dict.fromkeys((existing.get("suites") or []) + list(args.suites)))
     suite_settings = dict(existing.get("suite_settings") or {})
     for suite in args.suites:
         suite_settings[suite] = {"ctx": args.ctx, "parallel": args.parallel}
+    if "decide" in args.suites:
+        decision_model = getattr(args, "decision_model", None)
+    else:
+        decision_model = existing.get("decision_model")
     return {"model": args.model, "ctx": args.ctx, "parallel": args.parallel,
             "gpu": gpu, "commit": commit, "run_id": run_id,
             "created_utc": existing.get("created_utc") or now, "suites": suites,
             "suite_settings": suite_settings,
-            "decision_model": getattr(args, "decision_model", None)}
+            "decision_model": decision_model}
 
 
 class VramSampler:
@@ -471,16 +495,33 @@ def run(args):
     return 0 if ran else 1
 
 
+def ctx_value(text):
+    """--ctx: a positive integer, or empty for "unknown" (stored as null)."""
+    if text.strip() == "":
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be a positive integer or empty, got {text!r}")
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer or empty, got {text!r}")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--ctx", type=int, required=True)
+    parser.add_argument("--ctx", type=ctx_value, required=True,
+                        help="Server context size; empty when unknown (then long_context "
+                             "records an error instead of running)")
     parser.add_argument("--parallel", type=int, default=1)
     parser.add_argument("--suites", nargs="+", required=True,
                         choices=("fixture", "long_context", "live_web", "decide", "concurrency"))
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--decision-model", default="fastino/GLiNER2.5-Decide")
+    parser.add_argument("--decision-model-revision", default=None,
+                        help="Hugging Face commit for the decision model; passed to decide_bench.py")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--vram-cmd", default=None,
                         help="Shell command that prints used VRAM MiB; sampled every 2s")

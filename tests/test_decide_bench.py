@@ -1,5 +1,7 @@
 """decide_bench.py: dataset contract and the pure scoring/parsing parts."""
+import contextlib
 import importlib.util
+import io
 import json
 import re
 import unittest
@@ -100,6 +102,116 @@ class RunRunnerErrorTest(unittest.TestCase):
         self.assertEqual(result["tasks"], {})
         self.assertIn("HTTP 400", result["error"])
         self.assertEqual(result["host"], "rtx")
+
+
+class ServerTimingTest(unittest.TestCase):
+    def test_server_ms_is_prompt_plus_predicted(self):
+        self.assertEqual(db.server_ms_from({"timings": {"prompt_ms": 12.25, "predicted_ms": 30.5}}), 42.8)
+
+    def test_server_ms_is_none_without_timings(self):
+        self.assertIsNone(db.server_ms_from({"choices": []}))
+        self.assertIsNone(db.server_ms_from({"timings": {"prompt_ms": 1.0}}))
+
+    def test_score_keeps_server_ms_next_to_latencies(self):
+        items = [{"task": "apply", "answer": "apply"}, {"task": "apply", "answer": "skip"}]
+        stats = db.score(items, ["apply", "skip"], [50.0, 60.0], [20.0, 25.0])
+        self.assertEqual(stats["apply"]["server_ms"], [20.0, 25.0])
+        self.assertEqual(stats["apply"]["latencies_ms"], [50.0, 60.0])
+
+    def test_score_has_no_server_ms_when_none_known(self):
+        items = [{"task": "apply", "answer": "apply"}]
+        self.assertNotIn("server_ms", db.score(items, ["apply"], [50.0], [None])["apply"])
+        self.assertNotIn("server_ms", db.score(items, ["apply"], [50.0])["apply"])
+
+    def test_run_runner_splits_label_and_server_ms(self):
+        items = [{"task": "apply", "answer": "apply", "labels": ["apply", "skip"], "text": "t"}]
+        result = db.run_runner("qwen-free", items, lambda item: ("apply", 7.5))
+        self.assertEqual(result["tasks"]["apply"]["correct"], 1)
+        self.assertEqual(result["tasks"]["apply"]["server_ms"], [7.5])
+
+
+class QwenOverHttpTest(unittest.TestCase):
+    """main() against a fake llama-server: server_ms comes from "timings"."""
+
+    def test_qwen_runners_record_server_ms(self):
+        import http.server
+        import os
+        import tempfile
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                labels = body["messages"][0]["content"].split(": ", 1)[1].rstrip(".").split(", ")
+                content = (json.dumps({"answer": labels[0]}) if "response_format" in body else labels[0])
+                data = json.dumps({"choices": [{"message": {"content": content}}],
+                                   "timings": {"prompt_ms": 3.0, "predicted_ms": 4.0}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "decide.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = db.main(["--base-url", f"http://127.0.0.1:{server.server_port}", "--model", "m",
+                              "--runners", "qwen-free", "qwen-schema", "--output", out])
+            report = json.loads(Path(out).read_text())
+        self.assertEqual(rc, 0)
+        for runner in ("qwen-free", "qwen-schema"):
+            tasks = report["runners"][runner]["tasks"]
+            self.assertEqual(sum(t["total"] for t in tasks.values()), 60)
+            for t in tasks.values():
+                self.assertEqual(t["server_ms"], [7.0] * t["total"])
+                self.assertEqual(len(t["latencies_ms"]), t["total"])
+
+
+class RevisionPinTest(unittest.TestCase):
+    def test_default_model_has_a_pin(self):
+        self.assertRegex(db.pinned_revision("fastino/GLiNER2.5-Decide"), r"^[0-9a-f]{40}$")
+
+    def test_unknown_model_has_no_pin(self):
+        self.assertIsNone(db.pinned_revision("someone/else"))
+
+    def test_no_revision_loads_the_repo_id(self):
+        self.assertEqual(db.gliner_source("fastino/x", None), "fastino/x")
+
+    def test_revision_loads_the_pinned_snapshot_directory(self):
+        import sys
+        import types
+        calls = []
+        fake = types.ModuleType("huggingface_hub")
+        fake.snapshot_download = lambda **kw: calls.append(kw) or "/cache/snap/abc"
+        saved = sys.modules.get("huggingface_hub")
+        sys.modules["huggingface_hub"] = fake
+        try:
+            self.assertEqual(db.gliner_source("fastino/x", "abc"), "/cache/snap/abc")
+        finally:
+            if saved is None:
+                del sys.modules["huggingface_hub"]
+            else:
+                sys.modules["huggingface_hub"] = saved
+        self.assertEqual(calls, [{"repo_id": "fastino/x", "revision": "abc"}])
+
+    def test_report_records_the_revision(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "decide.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                db.main(["--base-url", "http://127.0.0.1:9", "--model", "m", "--runners", "gliner",
+                         "--decision-model", "fastino/GLiNER2.5-Decide", "--output", out,
+                         "--decision-model-revision", "deadbeef"])
+            report = json.loads(Path(out).read_text())
+        self.assertEqual(report["decision_model_revision"], "deadbeef")
 
 
 @unittest.skipUnless(importlib.util.find_spec("gliner2"), "gliner2 not installed")

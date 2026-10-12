@@ -182,6 +182,22 @@ jobs:
             [[ -n "$TEMPLATE_FILE" ]] || { echo "::error::TEMPLATE_FILE variable is required for concurrency"; exit 1; }
           fi
 
+          # The decision model's pinned Hugging Face commit. Every choice but
+          # none has one (a contract test checks); the install step downloads
+          # that snapshot before the live container stops.
+          decision_rev=""
+          if [[ " ${phase1[*]:-} " == *" decide "* && "$IN_DECISION_MODEL" != none ]]; then
+            decision_rev="$(python3 - "$IN_DECISION_MODEL" <<'EOF'
+          import json, re, sys
+          pins = json.load(open("tests/fixtures/decide/decision_models.json"))
+          sha = pins.get(sys.argv[1], "")
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              sys.exit(1)
+          print(sha)
+          EOF
+            )" || { echo "::error::no pinned revision for $IN_DECISION_MODEL in tests/fixtures/decide/decision_models.json"; exit 1; }
+          fi
+
           # A throwaway bearer key for the test router, new each run. Mask
           # it before anything else can see it.
           BENCH_API_KEY="$(openssl rand -hex 24)"
@@ -210,6 +226,7 @@ jobs:
             echo "WORKER_SSH=$IN_SSH_USER@$IN_WORKER_HOST"
             echo "MODEL_ALIAS=$model_alias"
             echo "CONC_MODEL_FILE=$conc_model_file"
+            echo "DECISION_MODEL_REVISION=$decision_rev"
             echo "BENCH_API_KEY=$BENCH_API_KEY"
             echo "PHASE1_SUITES=${phase1[*]}"
             echo "PHASE2_SUITES=$phase2"
@@ -217,25 +234,41 @@ jobs:
             echo "PHASE1_TIMEOUT_MIN=$(( phase1_min > 0 ? phase1_min : 1 ))"
             echo "PHASE2_TIMEOUT_MIN=$(( phase2_min > 0 ? phase2_min : 1 ))"
           } >> "$GITHUB_ENV"
-          echo "model: $model_alias  decision model: $IN_DECISION_MODEL  ctx: ${IN_CTX:-preset default}  repetitions: $IN_REPETITIONS (most: $max_reps)"
+          echo "model: $model_alias  decision model: $IN_DECISION_MODEL ${decision_rev:+@ $decision_rev}  ctx: ${IN_CTX:-preset default}  repetitions: $IN_REPETITIONS (most: $max_reps)"
           echo "phase 1: ${phase1[*]:-none} (cap ${phase1_min} min)  phase 2: ${phase2:-none} (cap ${phase2_min} min)"
 
       # The decide suite runs GLiNER on this runner's CPU. CPU-only torch:
       # the default wheel pulls several GB of CUDA libraries for nothing.
       # Plain `gliner2` is only the cloud client; [local] runs the model.
+      # Both steps run before the tailnet join, so this work never adds to
+      # the time production is down. Caps: a cache restore and a CPU torch
+      # wheel plus a model of at most a few GB take a few minutes on a
+      # GitHub runner; 10 each stops a stuck download, and
+      # run_suites.RESERVED_MINUTES counts both.
       - name: Cache Hugging Face models
         if: contains(env.PHASE1_SUITES, 'decide') && inputs.decision_model != 'none'
+        timeout-minutes: 10
         uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
-          key: hf-${{ env.IN_DECISION_MODEL }}
+          key: hf-${{ env.IN_DECISION_MODEL }}-${{ env.DECISION_MODEL_REVISION }}
 
       - name: Install GLiNER
         if: contains(env.PHASE1_SUITES, 'decide') && inputs.decision_model != 'none'
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.14.1"
           pip install "gliner2[local]==2.1.0"
+          # The pinned snapshot, now: decide_bench.py loads this same
+          # revision later, from the cache.
+          python3 - <<'EOF'
+          import os
+          from huggingface_hub import snapshot_download
+          path = snapshot_download(repo_id=os.environ["IN_DECISION_MODEL"],
+                                   revision=os.environ["DECISION_MODEL_REVISION"])
+          print("decision model snapshot:", path)
+          EOF
 
       # ubuntu-latest (24.04) ships Google Chrome (runner-images readme),
       # which is what the Playwright MCP uses (--browser chrome). Install it
@@ -297,7 +330,8 @@ jobs:
 
       # The image's own entrypoint (router over models.ini), so the preset
       # runs with its production settings. An empty ctx keeps the preset's
-      # context size; the step reads it back for the reports.
+      # context size. Either way the step reads the real size back and
+      # records that, not the input: the reports must show what ran.
       - name: Start test server (1 slot)
         if: env.PHASE1_SUITES != ''
         timeout-minutes: 15
@@ -307,16 +341,16 @@ jobs:
         run: |
           set -euo pipefail
           tests/bench/worker.sh up
-          if [[ -n "$CTX" ]]; then
-            run_ctx="$CTX"
-          elif run_ctx="$(tests/bench/worker.sh ctx)"; then
-            :
+          if run_ctx="$(tests/bench/worker.sh ctx)"; then
+            if [[ -n "$CTX" && "$run_ctx" != "$CTX" ]]; then
+              echo "::warning::ctx input was $CTX but the server reports $run_ctx; recording $run_ctx"
+            fi
           else
-            echo "::warning::could not read the preset context size; it is recorded as 0 and long_context cannot run"
-            run_ctx=0
+            echo "::warning::could not read the context size back; it is recorded as unknown, and long_context records an error instead of running"
+            run_ctx=""
           fi
           echo "RUN_CTX=$run_ctx" >> "$GITHUB_ENV"
-          echo "context size: $run_ctx"
+          echo "context size: ${run_ctx:-unknown}"
 
       - name: Open tunnel to the test server
         run: |
@@ -348,7 +382,8 @@ jobs:
             --base-url "http://127.0.0.1:${LOCAL_PORT}" \
             --model "$MODEL_ALIAS" \
             --decision-model "$IN_DECISION_MODEL" \
-            --ctx "${RUN_CTX:-0}" \
+            --decision-model-revision "$DECISION_MODEL_REVISION" \
+            --ctx "${RUN_CTX:-}" \
             --parallel 1 \
             --suites $PHASE1_SUITES \
             --repetitions "$IN_REPETITIONS" \
@@ -432,14 +467,15 @@ jobs:
           ctx, parallel = int(os.environ["PHASE2_CTX"]), int(os.environ["PHASE2_PARALLEL"])
           # No phase-1 meta (concurrency only): start from phase 2's, or a
           # minimal one when phase 2 never wrote any, so the failure still
-          # reaches the dashboard.
+          # reaches the dashboard. decision_model comes only from phase 1
+          # (run_suites.py writes it only for decide), so nothing here sets it.
           meta = load(dst / "meta.json") or src_meta or {
               "model": os.environ["MODEL_ALIAS"], "ctx": ctx, "parallel": parallel,
               "gpu": os.environ.get("BENCH_GPU_NAME") or None,
               "commit": os.environ.get("GITHUB_SHA", "")[:7] or None,
               "run_id": os.environ.get("GITHUB_RUN_ID"),
               "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              "suites": []}
+              "suites": [], "decision_model": None}
           meta["suites"] = list(dict.fromkeys(meta.get("suites", []) + src_meta.get("suites", []) + ["concurrency"]))
           settings = meta.setdefault("suite_settings", {})
           settings.update(src_meta.get("suite_settings", {}))
@@ -487,8 +523,9 @@ jobs:
       # covers a longer network drop.
       - name: Restore production (worker.sh down)
         if: always() && inputs.restore_production && env.WORKER_SSH != ''
-        # Two full worker.sh down passes take about 11 minutes at worst;
-        # run_suites.RESERVED_MINUTES keeps this cap free in the job.
+        # Two full worker.sh down passes (the retry runs inside this step)
+        # take about 11 minutes at worst; run_suites.RESERVED_MINUTES keeps
+        # this cap free in the job.
         timeout-minutes: 20
         run: |
           set -euo pipefail

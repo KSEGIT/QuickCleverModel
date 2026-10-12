@@ -220,6 +220,72 @@ class DecideSummaryTest(unittest.TestCase):
         self.assertIn("HTTP 400", s["suites"]["decide_qwen_schema"]["error"])
 
 
+class DecideServerTimeTest(unittest.TestCase):
+    """The Qwen runners carry llama-server's own time next to wall time."""
+
+    def setUp(self):
+        self.suites = collect.summarize(fixture_path("run-decide"))["suites"]
+
+    def test_server_time_median_in_seconds(self):
+        q = self.suites["decide_qwen_schema"]
+        self.assertEqual(q["median_server_seconds"], 0.284)  # median 283.75 ms
+        self.assertEqual(q["median_seconds"], 0.334)  # wall time, with the tunnel
+
+    def test_server_time_is_null_when_not_recorded(self):
+        self.assertIn("median_server_seconds", self.suites["decide_qwen_free"])
+        self.assertIsNone(self.suites["decide_qwen_free"]["median_server_seconds"])
+
+    def test_gliner_has_no_server_time(self):
+        self.assertNotIn("median_server_seconds", self.suites["decide_gliner"])
+
+
+class DecideCrashTest(unittest.TestCase):
+    """decide.json never written, errors.json explains: each runner the run
+    asked for still gets an entry, with zero counts and that error."""
+
+    def summarize(self, decision_model):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "meta.json"), "w") as f:
+                json.dump({"model": "m", "ctx": 8192, "parallel": 1, "suites": ["decide"],
+                           "decision_model": decision_model}, f)
+            with open(os.path.join(d, "errors.json"), "w") as f:
+                json.dump({"decide": "job timed out after 1218s"}, f)
+            return collect.summarize(d)["suites"]
+
+    def test_three_entries_with_the_error(self):
+        suites = self.summarize("fastino/GLiNER2.5-Decide")
+        self.assertEqual(sorted(suites), ["decide_gliner", "decide_qwen_free", "decide_qwen_schema"])
+        for key, suite in suites.items():
+            self.assertEqual((suite["passed"], suite["total"]), (0, 0), key)
+            self.assertEqual(suite["error"], "job timed out after 1218s", key)
+
+    def test_two_entries_when_decision_model_is_none(self):
+        suites = self.summarize("none")
+        self.assertEqual(sorted(suites), ["decide_qwen_free", "decide_qwen_schema"])
+        for suite in suites.values():
+            self.assertEqual(suite["error"], "job timed out after 1218s")
+
+
+class UnknownCtxSummaryTest(unittest.TestCase):
+    """meta.json ctx null (the server's size was not read back) stays null,
+    never 0, at run level and per suite."""
+
+    def test_null_ctx_stays_null(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "meta.json"), "w") as f:
+                json.dump({"model": "m", "ctx": None, "parallel": 1, "suites": ["fixture", "long_context"],
+                           "suite_settings": {"fixture": {"ctx": None, "parallel": 1},
+                                              "long_context": {"ctx": None, "parallel": 1}},
+                           "decision_model": None}, f)
+            with open(os.path.join(d, "errors.json"), "w") as f:
+                json.dump({"long_context": "not run: the context size is unknown"}, f)
+            summary = collect.summarize(d)
+        self.assertIsNone(summary["ctx"])
+        self.assertIsNone(summary["suites"]["fixture"]["ctx"])
+        self.assertIsNone(summary["suites"]["long_context"]["ctx"])
+        self.assertIn("unknown", summary["suites"]["long_context"]["error"])
+
+
 class SummarizeMissingFilesTest(unittest.TestCase):
     """collect.py is tolerant of missing files: no meta.json at all still
     produces a summary, with null top-level fields and suites inferred from

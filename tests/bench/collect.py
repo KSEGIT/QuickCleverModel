@@ -137,6 +137,13 @@ def _live_web_stats(reports):
 
 _DECIDE_KEYS = {"qwen-free": "decide_qwen_free", "qwen-schema": "decide_qwen_schema",
                 "gliner": "decide_gliner"}
+# The LLM runners also get llama-server's own time per decision, which
+# leaves out the tailnet and SSH tunnel that the wall time includes.
+_DECIDE_SERVER_TIMED = ("decide_qwen_free", "decide_qwen_schema")
+
+
+def _ms_to_seconds(median_ms):
+    return None if median_ms is None else round(median_ms / 1000, 3)
 
 
 def _decide_suites(report, peak_vram, settings):
@@ -151,11 +158,13 @@ def _decide_suites(report, peak_vram, settings):
             continue
         tasks = (data.get("tasks") or {}).values()
         latencies = [ms for t in tasks for ms in t.get("latencies_ms", [])]
-        median_ms = median_or_none(latencies)
         suite = _suite_dict(sum(t["correct"] for t in tasks), sum(t["total"] for t in tasks),
                             None, None, peak_vram if data.get("host") == "rtx" else None,
                             error=data.get("error"), settings=settings)
-        suite["median_seconds"] = None if median_ms is None else round(median_ms / 1000, 3)
+        suite["median_seconds"] = _ms_to_seconds(median_or_none(latencies))
+        if key in _DECIDE_SERVER_TIMED:
+            server = [ms for t in tasks for ms in t.get("server_ms", [])]
+            suite["median_server_seconds"] = _ms_to_seconds(median_or_none(server))
         suite["invalid"] = sum(t.get("invalid", 0) for t in tasks)
         suite["host"] = data.get("host")
         suites[key] = suite
@@ -259,6 +268,8 @@ def summarize(dir_path):
             for key in keys:
                 suites[key] = _suite_dict(0, 0, None, None, None, error=decide_error,
                                           settings=settings_for("decide"))
+                if key in _DECIDE_SERVER_TIMED:
+                    suites[key]["median_server_seconds"] = None
 
     # concurrency: serial and parallel phases, each its own suite key.
     # run_suites.py samples VRAM once for the whole concurrency suite (both
