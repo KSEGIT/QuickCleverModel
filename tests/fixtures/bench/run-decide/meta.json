@@ -1,0 +1,13 @@
+{
+  "model": "qwen3.5-9b-q4_k_m",
+  "ctx": 32768,
+  "parallel": 1,
+  "gpu": "RTX 3070 Ti",
+  "commit": "9f1c2ab",
+  "run_id": "2026101201",
+  "created_utc": "2026-10-12T00:00:00+00:00",
+  "suites": [
+    "decide"
+  ],
+  "decision_model": "fastino/GLiNER2.5-Decide"
+}

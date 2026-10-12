@@ -25,7 +25,8 @@ SPEC.loader.exec_module(run_suites)
 def make_args(**overrides):
     base = dict(base_url="http://127.0.0.1:1", model="m", key_env="QCM_UNUSED_KEY",
                 ctx=32768, parallel=1, suites=["fixture", "long_context", "live_web"],
-                repetitions=2, vram_cmd=None, gpu=None, run_id=None, job_timeout=None)
+                repetitions=2, vram_cmd=None, gpu=None, run_id=None, job_timeout=None,
+                decision_model="fastino/GLiNER2.5-Decide")
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -178,7 +179,8 @@ class BuildMetaTest(unittest.TestCase):
                                 "suites": ["fixture", "long_context"],
                                 "suite_settings": {
                                     "fixture": {"ctx": 32768, "parallel": 1},
-                                    "long_context": {"ctx": 32768, "parallel": 1}}})
+                                    "long_context": {"ctx": 32768, "parallel": 1}},
+                                "decision_model": "fastino/GLiNER2.5-Decide"})
 
     def test_merging_a_second_invocation_unions_suites_and_keeps_first_created_utc(self):
         existing = {"model": "m", "ctx": 32768, "parallel": 1, "gpu": "RTX 3070 Ti",
@@ -202,6 +204,30 @@ class BuildMetaTest(unittest.TestCase):
         self.assertEqual(second["suite_settings"], {
             "fixture": {"ctx": 32768, "parallel": 1},
             "concurrency": {"ctx": 49152, "parallel": 2}})
+
+
+class DecidePlanTest(unittest.TestCase):
+    def test_decide_is_one_batch_with_decision_model(self):
+        args = make_args(suites=["decide"], decision_model="fastino/GLiNER2.5-Decide")
+        plan, errors = run_suites.build_plan(args, pathlib.Path("/tmp/out"))
+        self.assertEqual(errors, {})
+        self.assertEqual(len(plan), 1)
+        cmd = plan[0][0]["cmd"]
+        self.assertEqual(plan[0][0]["suite"], "decide")
+        self.assertTrue(str(cmd[1]).endswith("tests/decide_bench.py"))
+        self.assertIn("--decision-model", cmd)
+        self.assertEqual(cmd[cmd.index("--decision-model") + 1], "fastino/GLiNER2.5-Decide")
+        self.assertEqual(cmd[cmd.index("--model") + 1], args.model)
+
+    def test_decide_timeout_and_batches_are_known(self):
+        args = make_args(suites=["decide"], repetitions=1)
+        self.assertEqual(run_suites.batch_count("decide", 3), 1)
+        self.assertGreater(run_suites.job_timeout_for("decide", args), 0)
+
+    def test_meta_records_decision_model(self):
+        args = make_args(suites=["decide"], decision_model="none")
+        meta = run_suites.build_meta({}, args, "abc1234", None, "1", "2026-10-12T00:00:00Z")
+        self.assertEqual(meta["decision_model"], "none")
 
 
 class TimeBudgetTest(unittest.TestCase):

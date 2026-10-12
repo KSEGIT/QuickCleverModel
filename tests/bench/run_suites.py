@@ -3,7 +3,7 @@
 
 Runs each requested suite as a subprocess of the existing test scripts
 (tests/playwright_agent_bench.py, tests/long_context_probe.py,
-tests/live_image_agent.py), samples VRAM every 2 seconds through an external
+tests/live_image_agent.py, tests/decide_bench.py), samples VRAM every 2 seconds through an external
 command (typically `tests/bench/worker.sh vram`, run over SSH by the
 caller), and writes the raw report files described in
 .superpowers/sdd/2026-09-26-benchmark-action/contracts.md to --out-dir.
@@ -24,7 +24,7 @@ import time
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
-SUITE_ORDER = ("fixture", "long_context", "live_web", "concurrency")
+SUITE_ORDER = ("fixture", "long_context", "live_web", "decide", "concurrency")
 # The exact flags recorded from the validated concurrency runs: one
 # job_application task, no repeats, a 24,576-token per-slot budget (half of
 # the 49,152-token, --parallel 2 context the worker is restarted with).
@@ -43,6 +43,9 @@ FIXTURE_CASES = 10  # playwright_agent_bench.py's default 9 tasks, +1 extra
 DEFAULT_TASK_TIMEOUT = 300  # playwright_agent_bench.py --task-timeout default
 LONG_CONTEXT_REQUEST_TIMEOUT = 120  # long_context_probe.py --request-timeout default
 LIVE_WEB_TASK_TIMEOUT = 300  # live_image_agent.py --task-timeout default
+DECIDE_ITEMS = 60          # tests/fixtures/decide, three tasks x 20
+DECIDE_REQUEST_TIMEOUT = 60  # decide_bench.py --request-timeout default
+DECIDE_RUNNERS = 3
 CONCURRENCY_TASK_TIMEOUT = 120  # matches --task-timeout in CONCURRENCY_FLAGS
 STARTUP_MARGIN = 120  # model/MCP/browser start-up overhead, multi-case suites
 JOB_STARTUP_MARGIN = 60  # same, for suites that are a single request/task
@@ -78,6 +81,12 @@ def job_timeout_for(suite, args):
         return LONG_CONTEXT_REQUEST_TIMEOUT + JOB_STARTUP_MARGIN
     if suite == "live_web":
         return LIVE_WEB_TASK_TIMEOUT + JOB_STARTUP_MARGIN
+    if suite == "decide":
+        # Ceiling, not an estimate: 3 runners x 61 items (60 + the excluded
+        # warm-up) x a 6s/item allowance (1/10 of decide_bench.py's own
+        # --request-timeout) = 1,098s, generous next to the measured ~0.3s
+        # per decision, plus the same single-request start-up margin.
+        return DECIDE_RUNNERS * (DECIDE_ITEMS + 1) * DECIDE_REQUEST_TIMEOUT // 10 + STARTUP_MARGIN
     if suite == "concurrency":
         return CONCURRENCY_TASK_TIMEOUT + JOB_STARTUP_MARGIN
     raise ValueError(f"unknown suite: {suite}")
@@ -85,7 +94,7 @@ def job_timeout_for(suite, args):
 
 def batch_count(suite, repetitions):
     """Pure: how many batches build_plan() schedules for `suite`."""
-    if suite in ("fixture", "long_context"):
+    if suite in ("fixture", "long_context", "decide"):
         return 1
     if suite == "live_web":
         return repetitions
@@ -172,6 +181,13 @@ def live_web_command(args, output, image_dir, root=ROOT):
             "--key-env", args.key_env, "--image-dir", str(image_dir), "--reasoning", "off"]
 
 
+def decide_command(args, output, root=ROOT):
+    return [sys.executable, str(root / "tests" / "decide_bench.py"),
+            "--base-url", args.base_url, "--model", args.model,
+            "--decision-model", args.decision_model, "--output", str(output),
+            "--key-env", args.key_env]
+
+
 def concurrency_command(args, output, root=ROOT):
     return [sys.executable, str(root / "tests" / "playwright_agent_bench.py"),
             "--base-url", args.base_url, "--model", args.model, "--output", str(output),
@@ -204,6 +220,10 @@ def build_plan(args, out_dir, root=ROOT):
             output = out_dir / f"live_web-{n}.json"
             batches.append([{"suite": "live_web", "output": output,
                              "cmd": live_web_command(args, output, image_dir, root)}])
+    if "decide" in requested:
+        output = out_dir / "decide.json"
+        batches.append([{"suite": "decide", "output": output,
+                         "cmd": decide_command(args, output, root)}])
     if "concurrency" in requested:
         if args.parallel != 2:
             errors["concurrency"] = f"concurrency requires --parallel 2 (got {args.parallel})"
@@ -258,7 +278,8 @@ def build_meta(existing, args, commit, gpu, run_id, now):
     return {"model": args.model, "ctx": args.ctx, "parallel": args.parallel,
             "gpu": gpu, "commit": commit, "run_id": run_id,
             "created_utc": existing.get("created_utc") or now, "suites": suites,
-            "suite_settings": suite_settings}
+            "suite_settings": suite_settings,
+            "decision_model": getattr(args, "decision_model", None)}
 
 
 class VramSampler:
@@ -457,8 +478,9 @@ def main():
     parser.add_argument("--ctx", type=int, required=True)
     parser.add_argument("--parallel", type=int, default=1)
     parser.add_argument("--suites", nargs="+", required=True,
-                        choices=("fixture", "long_context", "live_web", "concurrency"))
+                        choices=("fixture", "long_context", "live_web", "decide", "concurrency"))
     parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument("--decision-model", default="fastino/GLiNER2.5-Decide")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--vram-cmd", default=None,
                         help="Shell command that prints used VRAM MiB; sampled every 2s")

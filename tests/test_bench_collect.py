@@ -6,6 +6,7 @@ Covers: summarize() on the real-shaped fixture dirs under tests/fixtures/bench/
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -175,6 +176,48 @@ class SummarizeErrorsTest(unittest.TestCase):
     def test_never_requested_suite_is_absent(self):
         self.assertNotIn("live_web", self.summary["suites"])
         self.assertNotIn("concurrency_serial", self.summary["suites"])
+
+
+class DecideSummaryTest(unittest.TestCase):
+    """decide.json holds all three runners; each becomes its own suite key."""
+
+    def test_three_runners_become_three_suites(self):
+        s = collect.summarize(fixture_path("run-decide"))
+        q = s["suites"]["decide_qwen_schema"]
+        self.assertEqual((q["passed"], q["total"]), (57, 60))
+        self.assertEqual(q["pass_rate"], 95.0)
+        self.assertEqual(q["invalid"], 0)
+        self.assertEqual(q["host"], "rtx")
+        self.assertEqual(s["suites"]["decide_qwen_free"]["invalid"], 4)
+        self.assertEqual(s["suites"]["decide_gliner"]["host"], "cpu (CI runner)")
+        self.assertIsNone(s["suites"]["decide_gliner"]["peak_vram_mib"])
+
+    def test_decision_model_none_has_no_gliner_suite(self):
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copytree(fixture_path("run-decide"), d, dirs_exist_ok=True)
+            decide_path = os.path.join(d, "decide.json")
+            with open(decide_path) as f:
+                report = json.load(f)
+            report["decision_model"] = "none"
+            del report["runners"]["gliner"]
+            with open(decide_path, "w") as f:
+                f.write(json.dumps(report))
+            s = collect.summarize(d)
+        self.assertNotIn("decide_gliner", s["suites"])
+        self.assertIn("decide_qwen_schema", s["suites"])
+
+    def test_runner_error_reaches_summary(self):
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copytree(fixture_path("run-decide"), d, dirs_exist_ok=True)
+            decide_path = os.path.join(d, "decide.json")
+            with open(decide_path) as f:
+                report = json.load(f)
+            report["runners"]["qwen-schema"] = {"host": "rtx", "tasks": {}, "error": "OSError: HTTP 400"}
+            with open(decide_path, "w") as f:
+                f.write(json.dumps(report))
+            s = collect.summarize(d)
+        self.assertEqual(s["suites"]["decide_qwen_schema"]["total"], 0)
+        self.assertIn("HTTP 400", s["suites"]["decide_qwen_schema"]["error"])
 
 
 class SummarizeMissingFilesTest(unittest.TestCase):

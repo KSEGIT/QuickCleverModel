@@ -23,11 +23,14 @@ SCHEMA = 1
 
 # Suite keys as they appear in a run summary's "suites" map.
 SUITE_KEYS = ("fixture", "long_context", "live_web",
-              "concurrency_serial", "concurrency_parallel")
+              "concurrency_serial", "concurrency_parallel",
+              "decide_qwen_free", "decide_qwen_schema", "decide_gliner")
 
 # meta.json's "suites" (requested) and errors.json's keys name the suite as
-# run_suites.py sees it, where "concurrency" covers both concurrency phases.
-_ALIASES = {"concurrency": ("concurrency_serial", "concurrency_parallel")}
+# run_suites.py sees it, where "concurrency" covers both concurrency phases
+# and "decide" covers its three runners.
+_ALIASES = {"concurrency": ("concurrency_serial", "concurrency_parallel"),
+            "decide": ("decide_qwen_free", "decide_qwen_schema", "decide_gliner")}
 
 
 def _expand_aliases(names):
@@ -132,6 +135,33 @@ def _live_web_stats(reports):
     return passed, total, seconds, peak_tokens
 
 
+_DECIDE_KEYS = {"qwen-free": "decide_qwen_free", "qwen-schema": "decide_qwen_schema",
+                "gliner": "decide_gliner"}
+
+
+def _decide_suites(report, peak_vram, settings):
+    """decide.json has one report for all three runners; each runner becomes
+    its own suite key (decide_qwen_free / decide_qwen_schema / decide_gliner).
+    A runner missing from "runners" (decision_model == "none" skips gliner)
+    simply has no suite key — never a zeroed one."""
+    suites = {}
+    for runner, key in _DECIDE_KEYS.items():
+        data = (report.get("runners") or {}).get(runner)
+        if data is None:
+            continue
+        tasks = (data.get("tasks") or {}).values()
+        latencies = [ms for t in tasks for ms in t.get("latencies_ms", [])]
+        median_ms = median_or_none(latencies)
+        suite = _suite_dict(sum(t["correct"] for t in tasks), sum(t["total"] for t in tasks),
+                            None, None, peak_vram if data.get("host") == "rtx" else None,
+                            error=data.get("error"), settings=settings)
+        suite["median_seconds"] = None if median_ms is None else round(median_ms / 1000, 3)
+        suite["invalid"] = sum(t.get("invalid", 0) for t in tasks)
+        suite["host"] = data.get("host")
+        suites[key] = suite
+    return suites
+
+
 def _suite_dict(passed, total, seconds, peak_tokens, peak_vram, error=None,
                 settings=None):
     settings = settings or {}
@@ -213,6 +243,23 @@ def summarize(dir_path):
             passed, total, seconds, peak_tokens, peak_vram,
             error=error_for("live_web", "live_web"), settings=settings_for("live_web"))
 
+    # decide: one report, three runners, each its own suite key.
+    decide_report = load_json(os.path.join(dir_path, "decide.json"))
+    decide_present = decide_report is not None
+    decide_erroring = any(key in erroring for key in _DECIDE_KEYS.values())
+    if "decide" in requested or decide_present or decide_erroring:
+        if decide_present:
+            suites.update(_decide_suites(
+                decide_report, _vram_peak(dir_path, "vram-decide.json"), settings_for("decide")))
+        else:
+            decide_error = error_for("decide", "decide")
+            keys = list(_DECIDE_KEYS.values())
+            if meta.get("decision_model") == "none":
+                keys.remove("decide_gliner")
+            for key in keys:
+                suites[key] = _suite_dict(0, 0, None, None, None, error=decide_error,
+                                          settings=settings_for("decide"))
+
     # concurrency: serial and parallel phases, each its own suite key.
     # run_suites.py samples VRAM once for the whole concurrency suite (both
     # phases run back to back under one VramSampler) and writes a single
@@ -243,6 +290,7 @@ def summarize(dir_path):
         "created_utc": meta.get("created_utc"),
         "commit": meta.get("commit"),
         "model": meta.get("model"),
+        "decision_model": meta.get("decision_model"),
         "ctx": meta.get("ctx"),
         "gpu": meta.get("gpu"),
         "suites": suites,

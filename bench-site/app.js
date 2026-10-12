@@ -3,9 +3,11 @@
  *   - latest-run suite cards
  *   - pass-rate-over-runs line chart (one line per suite)
  *   - median-time-over-runs line chart (one line per suite)
+ *   - time-per-decision line chart (the three decide runners, milliseconds),
+ *     shown only once a run has a decide suite
  *   - peak-VRAM-vs-context scatter, one point per suite at the ctx of the
  *     server that suite ran on, with an 8,192 MiB reference line
- *   - a runs table (date, commit link, model, ctx, suites)
+ *   - a runs table (date, commit link, model, decision model, ctx, suites)
  * Charts are drawn as inline SVG built with the DOM API — no canvas
  * libraries, no chart frameworks. Colour is never the only signal: every
  * series has a legend entry with its name, every point has a native
@@ -23,9 +25,18 @@
     { key: "fixture", label: "Fixture", color: "--series-fixture" },
     { key: "long_context", label: "Long context", color: "--series-long-context" },
     { key: "live_web", label: "Live web", color: "--series-live-web" },
+    { key: "decide_qwen_free", label: "Decide: Qwen free text", color: "--series-decide-free" },
+    { key: "decide_qwen_schema", label: "Decide: Qwen + schema", color: "--series-decide-schema" },
+    { key: "decide_gliner", label: "Decide: GLiNER (CPU)", color: "--series-decide-gliner" },
     { key: "concurrency_serial", label: "Concurrency (serial)", color: "--series-concurrency-serial" },
     { key: "concurrency_parallel", label: "Concurrency (parallel)", color: "--series-concurrency-parallel" }
   ];
+
+  // The three decide suites share a dedicated "time per decision" chart
+  // (median seconds -> milliseconds), separate from the all-suite seconds
+  // chart below, since a decision takes a fraction of a second, not tens.
+  var DECIDE_KEYS = ["decide_qwen_free", "decide_qwen_schema", "decide_gliner"];
+  var DECIDE_SUITES = SUITES.filter(function (s) { return DECIDE_KEYS.indexOf(s.key) !== -1; });
 
   function suiteMeta(key) {
     for (var i = 0; i < SUITES.length; i++) {
@@ -126,12 +137,14 @@
   // ---------------------------------------------------------------------
 
   function drawLineChart(runs, opts) {
-    // opts: { valueFn(suite) -> number|null, yFormat(n) -> string, yMax? }
+    // opts: { valueFn(suite) -> number|null, yFormat(n) -> string, yMax?,
+    //         suites? (defaults to every known suite) }
     var W = 640, H = 260;
     var marginL = 46, marginR = 16, marginT = 16, marginB = 34;
     var plotW = W - marginL - marginR, plotH = H - marginT - marginB;
 
-    var seriesData = SUITES.map(function (meta) {
+    var suiteList = opts.suites || SUITES;
+    var seriesData = suiteList.map(function (meta) {
       var points = runs.map(function (run, i) {
         var suite = run.suites && run.suites[meta.key];
         var v = suite ? opts.valueFn(suite) : null;
@@ -297,6 +310,7 @@
     var table = el("table", { class: "runs-table" });
     var thead = el("thead", {}, [el("tr", {}, [
       el("th", { text: "Date" }), el("th", { text: "Commit" }), el("th", { text: "Model" }),
+      el("th", { text: "Decision model" }),
       el("th", { text: "Ctx" }), el("th", { text: "Suites" })
     ])]);
     var tbody = el("tbody");
@@ -320,6 +334,7 @@
         el("td", { text: dateText }),
         commitCell,
         el("td", { text: run.model || "–" }),
+        el("td", { text: run.decision_model || "–" }),
         el("td", { text: run.ctx != null ? fmtNum(run.ctx) : "–" }),
         el("td", {}, [tags])
       ]);
@@ -378,6 +393,19 @@
 
     app.appendChild(panel("Median time over runs", "Median wall-clock seconds per suite.",
       drawLineChart(runs, { valueFn: function (s) { return s.median_seconds; }, yFormat: function (v) { return fmtNum(v, 0) + "s"; }, ariaLabel: "Median seconds per suite across runs" })));
+
+    var hasDecide = runs.some(function (run) {
+      return DECIDE_KEYS.some(function (key) { return run.suites && run.suites[key]; });
+    });
+    if (hasDecide) {
+      app.appendChild(panel("Time per decision", "Median milliseconds per decision, for the three decide runners.",
+        drawLineChart(runs, {
+          suites: DECIDE_SUITES,
+          valueFn: function (s) { return s.median_seconds != null ? s.median_seconds * 1000 : null; },
+          yFormat: function (v) { return fmtNum(v, 0) + " ms"; },
+          ariaLabel: "Median milliseconds per decision, per runner, across runs"
+        })));
+    }
 
     app.appendChild(panel("Peak VRAM vs. context", "Each point is one suite in one run: the context size of the server that suite ran on, and its highest VRAM use.",
       drawVramScatter(runs)));
