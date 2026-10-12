@@ -98,7 +98,7 @@ public docs where they'd be specific to your worker):
 | `LIVE_ENV_FILE` | Worker path to the live container's env file, if it needs one | none — no key is sent if unset |
 | `TEST_IMAGE` | The pinned test image the benchmark runs | `qcm-rtx-validation:922be44` |
 | `MODELS_DIR` | Worker path to the model files | none — must be set |
-| `TEMPLATE_FILE` | Worker path to the chat template for the test server | none — must be set |
+| `TEMPLATE_FILE` | Worker path to the chat template. Needed only for the `concurrency` suite | none — required only for `concurrency` |
 
 A `workflow_dispatch` run also takes `worker_host` and `ssh_user` inputs that
 can override these values. Leave them blank when you start a run — the

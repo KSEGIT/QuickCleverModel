@@ -202,16 +202,35 @@ class RevisionPinTest(unittest.TestCase):
         self.assertEqual(calls, [{"repo_id": "fastino/x", "revision": "abc"}])
 
     def test_report_records_the_revision(self):
+        """The gliner runner must load the pinned revision, never the repo's
+        latest commit. This stands in for huggingface_hub and gliner2 so the
+        test makes no download and loads no real model, with or without
+        gliner2 installed (see "no network in tests" in the design doc)."""
         import os
+        import sys
         import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            out = os.path.join(tmp, "decide.json")
-            with contextlib.redirect_stdout(io.StringIO()):
-                db.main(["--base-url", "http://127.0.0.1:9", "--model", "m", "--runners", "gliner",
-                         "--decision-model", "fastino/GLiNER2.5-Decide", "--output", out,
-                         "--decision-model-revision", "deadbeef"])
-            report = json.loads(Path(out).read_text())
+        import types
+        from unittest import mock
+
+        fake_hub = types.ModuleType("huggingface_hub")
+        fake_hub.snapshot_download = mock.Mock(return_value="/cache/snap/deadbeef")
+        fake_gliner2 = types.ModuleType("gliner2")
+        fake_gliner2.AutoExtractor = mock.Mock()
+        fake_gliner2.AutoExtractor.from_pretrained = mock.Mock(return_value=mock.Mock())
+
+        with mock.patch.dict(sys.modules, {"huggingface_hub": fake_hub, "gliner2": fake_gliner2}):
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "decide.json")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    db.main(["--base-url", "http://127.0.0.1:9", "--model", "m", "--runners", "gliner",
+                             "--decision-model", "fastino/GLiNER2.5-Decide", "--output", out,
+                             "--decision-model-revision", "deadbeef"])
+                report = json.loads(Path(out).read_text())
+
         self.assertEqual(report["decision_model_revision"], "deadbeef")
+        fake_hub.snapshot_download.assert_called_once_with(
+            repo_id="fastino/GLiNER2.5-Decide", revision="deadbeef")
+        fake_gliner2.AutoExtractor.from_pretrained.assert_called_once_with("/cache/snap/deadbeef")
 
 
 @unittest.skipUnless(importlib.util.find_spec("gliner2"), "gliner2 not installed")
