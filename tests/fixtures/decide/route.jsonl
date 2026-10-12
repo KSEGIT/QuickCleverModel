@@ -6,10 +6,10 @@
 {"id": "route-06", "task": "route", "text": "Fix the bug in this script: the loop never terminates because the counter is never incremented.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "code"}
 {"id": "route-07", "task": "route", "text": "Refactor the calculate_total function so it handles an empty list without raising an error.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "code"}
 {"id": "route-08", "task": "route", "text": "Write a shell script that backs up the /var/log directory every night at midnight.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "code"}
-{"id": "route-09", "task": "route", "text": "Find out which year the Eiffel Tower was completed.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
-{"id": "route-10", "task": "route", "text": "Look up the current population of Iceland.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
-{"id": "route-11", "task": "route", "text": "What is the boiling point of nitrogen at sea level?", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
-{"id": "route-12", "task": "route", "text": "Find the release date of the next version of the Linux kernel.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
+{"id": "route-09", "task": "route", "text": "Find out today's exchange rate between the US dollar and the Japanese yen.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
+{"id": "route-10", "task": "route", "text": "Check today's weather forecast for Reykjavik.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
+{"id": "route-11", "task": "route", "text": "Look up today's closing price for the stock ticker ABC.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
+{"id": "route-12", "task": "route", "text": "Find the release notes for the latest version of the Linux kernel, published this week.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
 {"id": "route-13", "task": "route", "text": "Explain the difference between a stack and a queue in your own words.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "chat"}
 {"id": "route-14", "task": "route", "text": "What do you think makes a good leader?", "labels": ["browser", "code", "search", "chat", "none"], "answer": "chat"}
 {"id": "route-15", "task": "route", "text": "Tell me a short joke about computers.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "chat"}

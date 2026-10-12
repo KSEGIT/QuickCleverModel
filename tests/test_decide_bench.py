@@ -1,6 +1,7 @@
 """decide_bench.py: dataset contract and the pure scoring/parsing parts."""
 import importlib.util
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -25,6 +26,21 @@ class DatasetTest(unittest.TestCase):
             for label in labels:
                 n = sum(1 for i in items if i["task"] == task and i["answer"] == label)
                 self.assertGreaterEqual(n, 3, f"{task}/{label}")
+
+
+class LabelLeakageTest(unittest.TestCase):
+    def test_text_never_contains_its_own_task_label(self):
+        """A model could win by echoing a label straight out of the input
+        instead of classifying it (e.g. an item whose answer is "error"
+        containing the word "Error"). Same word-boundary rule as
+        parse_free_label, checked against every label of the item's task."""
+        items = db.load_dataset(ROOT / "tests" / "fixtures" / "decide")
+        for item in items:
+            text_lower = item["text"].lower()
+            leaked = [label for label in item["labels"]
+                      if re.search(rf"(?<![a-z]){re.escape(label)}(?![a-z])", text_lower)]
+            with self.subTest(item=item["id"]):
+                self.assertEqual(leaked, [], f"{item['id']}: text leaks label(s) {leaked}")
 
 
 class ParseFreeLabelTest(unittest.TestCase):
