@@ -16,7 +16,11 @@
 #                     BENCH_API_KEY (the test server's bearer key). CTX is
 #                     optional: empty keeps the preset's own default; a value
 #                     sets every preset ctx variable (QCM_AGENT_CTX,
-#                     BONSAI_CTX, BONSAI_CTX_TEXT).
+#                     BONSAI_CTX, BONSAI_CTX_TEXT). LIVE_ENV_FILE, when
+#                     set, goes in as --env-file, so the router gets the
+#                     live server's .env knobs; the -e values above win.
+#                     A preset that fails to load only warns: the router
+#                     is up, and each suite records the error.
 #   direct            one llama-server with --parallel, for the concurrency
 #                     suite (presets fix parallel = 1). Needs MODELS_DIR,
 #                     TEMPLATE_FILE, MODEL_FILE, MODEL_ALIAS; CTX defaults to
@@ -166,14 +170,21 @@ check_up_settings() {
 # The image's normal entrypoint: start-server.sh in router mode over the
 # image's models.ini. HOST/PORT come from BONSAI_HOST/BONSAI_PORT.
 router_run_cmd() {
-  local ctx_env=""
+  local ctx_env="" env_file=""
+  # Production settings: the live container gets LIVE_ENV_FILE through
+  # compose env_file, so the test router reads the same file. docker run
+  # applies -e after --env-file, so the -e values below (bench key, host,
+  # port, models max, ctx) win over the file's.
+  if [[ -n "$LIVE_ENV_FILE" ]]; then
+    env_file="--env-file $(q "$LIVE_ENV_FILE") "
+  fi
   if [[ -n "$CTX" ]]; then
     ctx_env="-e QCM_AGENT_CTX=$(q "$CTX") -e BONSAI_CTX=$(q "$CTX") -e BONSAI_CTX_TEXT=$(q "$CTX") "
   fi
   printf '%s' "docker run -d --rm --gpus all --name $(q "$TEST_CONTAINER") \
 -p 127.0.0.1:$(q "$TEST_PORT"):8080 \
 -v $(q "$MODELS_DIR"):/app/models:ro \
--e BONSAI_API_KEY=$(q "$BENCH_API_KEY") -e BONSAI_HOST=0.0.0.0 -e BONSAI_PORT=8080 \
+${env_file}-e BONSAI_API_KEY=$(q "$BENCH_API_KEY") -e BONSAI_HOST=0.0.0.0 -e BONSAI_PORT=8080 \
 -e BONSAI_MODELS_MAX=1 ${ctx_env}$(q "$TEST_IMAGE") >/dev/null"
 }
 
@@ -214,7 +225,12 @@ cmd_up() {
   wait_for "$UP_TIMEOUT" test_ready || die "test server did not become healthy"
   if [[ "$MODE" == router ]]; then
     echo "worker.sh: loading $MODEL_ALIAS" >&2
-    warm_model || die "model $MODEL_ALIAS did not load (missing from the image's models.ini?)"
+    # The router is healthy, so a failed load is the preset's problem
+    # (for example missing from the image's models.ini: router 404). Keep
+    # going: each suite records the error itself, as the spec asks.
+    if ! warm_model; then
+      echo "::warning::worker.sh: model $MODEL_ALIAS did not load (missing from the image's models.ini?); the suites will record the error" >&2
+    fi
   fi
   echo "worker.sh: test server healthy on worker 127.0.0.1:$TEST_PORT" >&2
 }

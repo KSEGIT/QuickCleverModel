@@ -319,12 +319,44 @@ class WorkerScriptTest(unittest.TestCase):
         with open(stdin_log) as f:
             self.assertIn("Authorization: Bearer warm-secret", f.read())
 
-    def test_router_up_fails_when_the_model_does_not_load(self):
+    def test_router_up_warns_but_succeeds_when_the_model_does_not_load(self):
+        # Spec: a preset missing from the image is a suite error, not a crash.
         out = self.run_worker_raw("up", MODE="router", MODEL_ALIAS="no-such-preset",
                                   MODELS_DIR="/srv/models", BENCH_API_KEY="k",
                                   FAKE_WARM_RC="22")
-        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("::warning::", out.stderr)
         self.assertIn("no-such-preset", out.stderr)
+
+    def test_router_up_still_dies_when_the_router_is_unhealthy(self):
+        out = self.run_worker_raw("up", MODE="router", MODEL_ALIAS="gemma4-e4b",
+                                  MODELS_DIR="/srv/models", BENCH_API_KEY="k",
+                                  FAKE_TEST_RC="22")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertFalse(any("chat/completions" in c for c in self.commands()))
+
+    def test_router_reads_live_env_file_before_its_own_env(self):
+        log = self.run_worker("up", MODE="router", MODEL_ALIAS="gemma4-e4b",
+                              MODELS_DIR="/srv/models", BENCH_API_KEY="k-123",
+                              LIVE_ENV_FILE="/srv/bonsai/.env", CTX="16384")
+        docker_run = next(l for l in log if "docker run" in l)
+        self.assertIn("--env-file /srv/bonsai/.env", docker_run)
+        self.assertLess(docker_run.index("--env-file"), docker_run.index(" -e "))
+        self.assertIn("-e BONSAI_API_KEY=k-123", docker_run)
+        self.assertIn("-e QCM_AGENT_CTX=16384", docker_run)
+        # The image name stays last.
+        self.assertTrue(docker_run.rstrip().endswith("qcm-rtx-validation:922be44 >/dev/null"))
+
+    def test_router_without_live_env_file_omits_the_flag(self):
+        log = self.run_worker("up", MODE="router", MODEL_ALIAS="gemma4-e4b",
+                              MODELS_DIR="/srv/models", BENCH_API_KEY="k", LIVE_ENV_FILE="")
+        docker_run = next(l for l in log if "docker run" in l)
+        self.assertNotIn("--env-file", docker_run)
+
+    def test_direct_mode_ignores_live_env_file(self):
+        log = self.run_worker("up", LIVE_ENV_FILE="/srv/bonsai/.env", **UP_ENV)
+        docker_run = next(l for l in log if "docker run" in l)
+        self.assertNotIn("--env-file", docker_run)
 
     def test_router_rejects_non_numeric_ctx(self):
         out = self.run_worker_raw("up", MODE="router", MODEL_ALIAS="x", MODELS_DIR="/m",
