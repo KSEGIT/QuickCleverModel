@@ -15,6 +15,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "benchmark.yml")
+MODELS_INI = os.path.join(ROOT, "models.ini.in")
 
 
 def load():
@@ -53,6 +54,34 @@ def input_names(text):
             elif line.strip() and not line.startswith("       "):
                 break
     return names
+
+
+def choice_options(text, name):
+    """`options:` items of input `name` under on.workflow_dispatch.inputs,
+    in order. Block-list style only (`- item` lines)."""
+    block = top_level_block(text, "on")
+    options, in_input, in_options = [], False, False
+    for line in block:
+        if re.match(r"^      [A-Za-z0-9_-]+:\s*$", line):
+            in_input = line.strip() == f"{name}:"
+            in_options = False
+            continue
+        if not in_input:
+            continue
+        if re.match(r"^        options:\s*$", line):
+            in_options = True
+            continue
+        if in_options:
+            m = re.match(r"^          - (\S+)\s*$", line)
+            if m:
+                options.append(m.group(1))
+            elif line.strip():
+                in_options = False
+    return options
+
+
+def step_named(text, name):
+    return next(s for s in steps(text) if name in s[0])
 
 
 def steps(text):
@@ -100,8 +129,8 @@ class BenchmarkWorkflowTest(unittest.TestCase):
 
     def test_inputs_are_the_documented_set(self):
         self.assertEqual(input_names(self.text), [
-            "worker_host", "ssh_user", "model_preset", "ctx", "suites",
-            "repetitions", "restore_production"])
+            "worker_host", "ssh_user", "model", "decision_model", "ctx",
+            "suites", "repetitions", "restore_production"])
 
     def test_no_input_looks_like_a_secret(self):
         for name in input_names(self.text):
@@ -171,6 +200,50 @@ class BenchmarkWorkflowTest(unittest.TestCase):
                     in_run = False
                 if in_run:
                     self.assertNotIn("${{", line)
+
+    def test_model_choices_equal_models_ini_sections(self):
+        with open(MODELS_INI) as f:
+            ini = f.read()
+        sections = [m.group(1) for m in re.finditer(r"^\[([^\]]+)\]", ini, re.M)
+                    if m.group(1) != "*"]
+        self.assertTrue(sections)
+        self.assertEqual(choice_options(self.text, "model"), sections)
+
+    def test_decision_model_choices(self):
+        self.assertEqual(choice_options(self.text, "decision_model"), [
+            "fastino/GLiNER2.5-Decide", "fastino/GLiNER2.5-multi-Decide", "fastino/GLiNER2.5-Decide-1B",
+            "fastino/gliner2.5-base-v1", "fastino/gliner2.5-small-v1", "none"])
+
+    def test_concurrency_refused_for_non_qwen_models(self):
+        self.assertIn("concurrency needs a Qwen3.5 model", self.text)
+
+    def test_bench_key_is_generated_and_masked(self):
+        self.assertRegex(self.text, r"BENCH_API_KEY=.*openssl rand|secrets\.token_hex")
+        self.assertIn("::add-mask::$BENCH_API_KEY", self.text)
+        # Masked before it is written anywhere a later step could print it.
+        self.assertLess(self.text.index('echo "::add-mask::$BENCH_API_KEY"'),
+                        self.text.index('echo "BENCH_API_KEY=$BENCH_API_KEY"'))
+
+    def test_gliner_installed_from_cpu_torch_only_for_decide(self):
+        self.assertIn("download.pytorch.org/whl/cpu", self.text)
+        self.assertIn('gliner2[local]==2.1.0', self.text)
+        step = step_named(self.text, "Install GLiNER")
+        cond = next(l for l in step if l.strip().startswith("if:"))
+        self.assertIn("decide", cond)
+        self.assertIn("inputs.decision_model != 'none'", cond)
+
+    def test_phase_1_runs_the_router_and_phase_2_the_direct_server(self):
+        up1 = "\n".join(step_named(self.text, "Start test server (1 slot)"))
+        up2 = "\n".join(step_named(self.text, "Restart test server (2 slots)"))
+        self.assertIn("MODE: router", up1)
+        self.assertIn("MODE: direct", up2)
+        self.assertIn("MODEL_FILE: ${{ env.CONC_MODEL_FILE }}", up2)
+
+    def test_suites_get_the_decision_model_and_key(self):
+        run1 = "\n".join(step_named(self.text, "Run single-slot suites"))
+        self.assertIn('--decision-model "$IN_DECISION_MODEL"', run1)
+        self.assertIn('--model "$MODEL_ALIAS"', run1)
+        self.assertIn("BONSAI_API_KEY: ${{ env.BENCH_API_KEY }}", run1)
 
     def test_model_presets(self):
         self.assertIn("/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf", self.text)
