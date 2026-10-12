@@ -149,6 +149,92 @@ JPEG/PNG/GIF/WebP bytes, and navigation stayed on duckduckgo.com.
 With the context fixes described below, 3 of 4 runs passed. The one failure
 was a model error (it did not call the save tool), not a context error.
 
+## Decide suite
+
+A fixed-answer classification benchmark, separate from the browser-agent
+suites above. It checks three ways to pick one label from a short list. It
+does not drive a browser.
+
+### What it measures
+
+Three runners answer the same items:
+
+| Runner | How it answers |
+| --- | --- |
+| `qwen-free` | The LLM, free text, told to answer with exactly one label |
+| `qwen-schema` | The same LLM, but the request also carries a JSON-schema `response_format` that limits the answer to the label list |
+| `gliner` | A GLiNER2.5-Decide model — no LLM call |
+
+Every reply counts as correct, wrong, or invalid (not one of the given
+labels — including a reply that names more than one label). Requests use
+temperature 0 and turn the LLM's own reasoning off, so repeat runs are
+comparable. For each runner and task, the suite reports:
+
+- **accuracy** — correct answers over total. The dashboard shows this as
+  the suite's pass rate.
+- **invalid answers** — how many replies matched no label. The dashboard
+  does not chart this; read it from the run's summary JSON (the
+  `bench-summary` workflow artifact, or the published `data/index.json`).
+- **time per decision** — median milliseconds for one answer, pooled across
+  all three tasks for that runner. The first item is a warm-up and does not
+  count.
+
+### The dataset
+
+`tests/fixtures/decide/*.jsonl`: 60 synthetic items, 20 per task.
+
+| Task | Labels | Based on |
+| --- | --- | --- |
+| `route` | `browser`, `code`, `search`, `chat`, `none` | Requests a browser agent could receive |
+| `apply` | `apply`, `skip` | The job/candidate facts from the `conditional_application` fixture |
+| `page_state` | `form`, `results`, `error`, `done` | Trimmed Playwright page-snapshot text |
+
+Each line is one JSON object: `id`, `task`, `text`, `labels`, `answer`.
+
+### On the dashboard
+
+A run that includes `decide` adds three suite cards — "Decide: Qwen free
+text", "Decide: Qwen + schema", and "Decide: GLiNER (CPU)" — plus a
+dedicated time-per-decision chart. GLiNER's results carry the host label
+"cpu (CI runner)". The GitHub Actions job runs GLiNER on the runner's own
+CPU, not the RTX worker's GPU. Accuracy does not depend on the hardware it
+runs on.
+
+This page gives no GLiNER numbers. Read them from the dashboard after a
+run. That way, this page never goes stale.
+
+### Run it locally
+
+Start a model on a local llama-server (see
+[docs/playwright-agent-benchmark.md](playwright-agent-benchmark.md)), then:
+
+```sh
+python3 tests/decide_bench.py \
+  --base-url http://127.0.0.1:18080 \
+  --model qwen3.5-9b-q4_k_m \
+  --output run/decide.json
+```
+
+This runs all three runners against the 60-item dataset. To check only the
+two LLM runners, add `--runners qwen-free qwen-schema`. The `gliner`
+runner needs its own install, in a virtual environment, before you add it
+to `--runners`:
+
+```sh
+python3 -m venv .venv-decide
+source .venv-decide/bin/activate
+pip install "gliner2[local]==2.1.0"
+```
+
+Pick the decision model with `--decision-model` (default
+`fastino/GLiNER2.5-Decide`). The GitHub Actions job installs the same
+package, but with CPU-only PyTorch first, to keep a large CUDA wheel off
+the runner; a local run can use whatever PyTorch is already on your
+machine.
+
+See [docs/benchmark-action.md](benchmark-action.md) for the `decide` and
+`decision_model` inputs on the GitHub Actions job.
+
 ## Known limits
 
 | Limit | What happens | Status |
