@@ -185,6 +185,8 @@ comparable. For each runner and task, the suite reports:
 
 If one request fails (an HTTP error or a time-out), that runner stops. Its
 results for the run are then only that error; the other runners still run.
+`decide_bench.py` saves `decide.json` after each runner. If the job hits its
+time cap, the runners that already finished keep their results.
 
 ### Comparing times fairly
 

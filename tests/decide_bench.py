@@ -177,6 +177,13 @@ def gliner_predictor(model_id, revision=None):
     return predict
 
 
+def save_report(report, output):
+    """Write atomically, so a kill mid-write never leaves a broken file."""
+    tmp = Path(output).with_name(Path(output).name + ".tmp")
+    tmp.write_text(json.dumps(report, indent=2) + "\n")
+    tmp.replace(output)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
@@ -207,12 +214,16 @@ def main(argv=None):
             except Exception as error:
                 report["runners"][name] = {"host": HOSTS[name], "tasks": {},
                                            "error": f"{type(error).__name__}: {error}"}
+                save_report(report, args.output)
                 continue
         else:
             predict = qwen_predictor(name, args, key)
         report["runners"][name] = run_runner(name, items, predict)
+        # Save after every runner: run_suites kills the job at its cap, and
+        # a single end-of-run write would lose runners that already finished.
+        save_report(report, args.output)
         print(f"{name}: {report['runners'][name]['error'] or 'ok'}", flush=True)
-    Path(args.output).write_text(json.dumps(report, indent=2) + "\n")
+    save_report(report, args.output)
     ran = any(r["tasks"] for r in report["runners"].values())
     return 0 if ran else 1
 

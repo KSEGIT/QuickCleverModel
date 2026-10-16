@@ -218,6 +218,26 @@ class RevisionPinTest(unittest.TestCase):
 
         self.assertEqual(report["decision_model_revision"], "deadbeef")
 
+    def test_finished_runners_survive_a_later_kill(self):
+        """run_suites kills the job at its cap; runners already done must stay on disk."""
+        import os
+        import tempfile
+        from unittest import mock
+
+        done = {"host": "rtx", "error": None,
+                "tasks": {"apply": {"correct": 1, "total": 1, "invalid": 0, "latencies_ms": [5.0]}}}
+        with mock.patch.object(db, "run_runner", side_effect=[done, KeyboardInterrupt()]):
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "decide.json")
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+                    db.main(["--base-url", "http://127.0.0.1:9", "--model", "m", "--output", out,
+                             "--runners", "qwen-free", "qwen-schema", "--decision-model", "none"])
+                report = json.loads(Path(out).read_text())
+                leftovers = [n for n in os.listdir(tmp) if n != "decide.json"]
+
+        self.assertEqual(report["runners"], {"qwen-free": done})
+        self.assertEqual(leftovers, [])
+
 
 @unittest.skipUnless(importlib.util.find_spec("gliner2"), "gliner2 not installed")
 class GlinerImportTest(unittest.TestCase):
