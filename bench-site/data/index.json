@@ -96,6 +96,57 @@
         }
       },
       "sample": true
+    },
+    {
+      "schema": 1,
+      "run_id": "2026101201",
+      "created_utc": "2026-10-12T00:00:00+00:00",
+      "commit": "9f1c2ab",
+      "model": "qwen3.5-9b-q4_k_m",
+      "decision_model": "fastino/GLiNER2.5-Decide",
+      "ctx": 32768,
+      "gpu": "RTX 3070 Ti",
+      "suites": {
+        "decide_qwen_free": {
+          "passed": 50,
+          "total": 60,
+          "pass_rate": 83.3,
+          "median_seconds": 0.278,
+          "peak_vram_mib": 6301,
+          "peak_prompt_tokens": null,
+          "ctx": 32768,
+          "parallel": 1,
+          "invalid": 4,
+          "host": "rtx",
+          "median_server_seconds": null
+        },
+        "decide_qwen_schema": {
+          "passed": 57,
+          "total": 60,
+          "pass_rate": 95.0,
+          "median_seconds": 0.334,
+          "peak_vram_mib": 6301,
+          "peak_prompt_tokens": null,
+          "ctx": 32768,
+          "parallel": 1,
+          "invalid": 0,
+          "host": "rtx",
+          "median_server_seconds": 0.284
+        },
+        "decide_gliner": {
+          "passed": 51,
+          "total": 60,
+          "pass_rate": 85.0,
+          "median_seconds": 0.074,
+          "peak_vram_mib": null,
+          "peak_prompt_tokens": null,
+          "ctx": 32768,
+          "parallel": 1,
+          "invalid": 0,
+          "host": "cpu (CI runner)"
+        }
+      },
+      "sample": true
     }
   ]
 }

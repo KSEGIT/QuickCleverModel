@@ -98,7 +98,7 @@ public docs where they'd be specific to your worker):
 | `LIVE_ENV_FILE` | Worker path to the live container's env file, if it needs one | none — no key is sent if unset |
 | `TEST_IMAGE` | The pinned test image the benchmark runs | `qcm-rtx-validation:922be44` |
 | `MODELS_DIR` | Worker path to the model files | none — must be set |
-| `TEMPLATE_FILE` | Worker path to the chat template for the test server | none — must be set |
+| `TEMPLATE_FILE` | Worker path to the chat template. Needed only for the `concurrency` suite | none — required only for `concurrency` |
 
 A `workflow_dispatch` run also takes `worker_host` and `ssh_user` inputs that
 can override these values. Leave them blank when you start a run — the
@@ -139,11 +139,22 @@ dedicated SSH account (from step 2) can read this file directly.
 | --- | --- | --- |
 | `worker_host` | Overrides `WORKER_HOST` for this run only | (environment variable) |
 | `ssh_user` | Overrides `WORKER_SSH_USER` for this run only | (environment variable) |
-| `model_preset` | Which model to benchmark: `qwen3.5-9b` or `qwen3.5-4b` | `qwen3.5-9b` |
-| `ctx` | Context size, in tokens | `32768` |
-| `suites` | Space-separated list of suites to run: `fixture`, `long_context`, `live_web`, `concurrency` | `fixture long_context live_web` |
-| `repetitions` | How many times to repeat the `fixture` tasks and the `live_web` run. `long_context` and `concurrency` ignore it. | `1` |
+| `model` | The LLM preset to benchmark. The choice list is every section name in `models.ini.in` (except `[*]`), in file order: `bonsai-27b-ternary`, `bonsai-27b-1bit`, `qwen3.5-9b-q4_k_m`, `granite-4.1-8b-q4_k_m`, `qwen3.5-4b-q4_k_m`, `qwen3.6-35b-a3b`, `gemma4-e4b`, `bonsai-27b-ternary-text` | `qwen3.5-9b-q4_k_m` |
+| `decision_model` | The decision model for the `decide` suite's GLiNER runner. Choices: `fastino/GLiNER2.5-Decide`, `fastino/GLiNER2.5-multi-Decide`, `fastino/GLiNER2.5-Decide-1B`, `fastino/gliner2.5-base-v1`, `fastino/gliner2.5-small-v1`, or `none` to skip GLiNER and run only the two Qwen runners | `fastino/GLiNER2.5-Decide` |
+| `ctx` | Context size, in tokens. Leave it empty to keep the chosen preset's own default. Either way, the job reads the real size back from the test server after start-up and records that | (preset default) |
+| `suites` | Space-separated list of suites to run: `fixture`, `long_context`, `live_web`, `decide`, `concurrency` | `fixture long_context live_web` |
+| `repetitions` | How many times to repeat the `fixture` tasks and the `live_web` run. `long_context`, `decide`, and `concurrency` ignore it. | `1` |
 | `restore_production` | Restart the live container when the run ends | `true` |
+
+The test image (`TEST_IMAGE`) must already contain the preset you pick for
+`model`. If its `models.ini.in` does not have that preset, the test server
+still starts, but loading the preset fails — see "What happens during a run"
+below.
+
+`concurrency` only works with `model` set to `qwen3.5-9b-q4_k_m` or
+`qwen3.5-4b-q4_k_m`. Every other preset fixes `parallel = 1`, so picking
+`concurrency` with another model fails the run at once, before it touches
+the worker.
 
 3. Anyone with write access to the repository can start a run, but only the
    repository owner should — see "Why a manual trigger only" above.
@@ -158,7 +169,13 @@ once, with an error that gives the highest `repetitions` that fits.
 
 - With the default suites, the most is 2, with or without `concurrency`.
   With `fixture` alone, the most is 3.
-- Without `fixture`, the limit is much higher (26 for `live_web` alone).
+- The default suites plus `decide` and `concurrency` allow only 1.
+- Without `fixture`, the limit is much higher (23 for `live_web` alone).
+
+The job keeps 80 minutes for every step that is not a suite step: about
+10 for set-up, 15 and 10 for the two test-server starts, 10 each for the
+GLiNER cache and install, about 5 for the reports, and 20 for the restore
+(both of its tries).
 
 `tests/bench/run_suites.py` holds the numbers (`step_minutes`,
 `max_repetitions`), so the workflow and the suites always agree.
@@ -177,26 +194,61 @@ hand right after the run.
 
 ## What happens during a run
 
-1. The job joins the tailnet, then connects to the worker over SSH.
-2. It stops the live container (`bonsai-llama-1` by default) and starts the
-   test server in its place, bound to the worker's loopback address only.
-3. It runs the suites you chose:
+1. The job makes a new random bearer key for the test server. It uses this
+   key only for the run, and masks it in the logs right away.
+2. If `decide` is one of the suites, and `decision_model` is not `none`, the
+   job installs GLiNER on the runner itself (`gliner2[local]`, with
+   CPU-only PyTorch). It also downloads the chosen decision model, at the
+   commit pinned in `tests/fixtures/decide/decision_models.json`, or
+   restores it from the cache. All of this happens before the job touches
+   the worker, so it never adds to the time production is down. GLiNER
+   then runs on this runner's own CPU, not on the worker's GPU. The
+   dashboard labels its results "cpu (CI runner)".
+3. The job joins the tailnet, then connects to the worker over SSH.
+4. It stops the live container (`bonsai-llama-1` by default), and starts
+   the test server in its place. The test server listens on the worker's
+   loopback address only.
+
+   The test server is the image's own `start-server.sh`, in **router**
+   mode. It serves every preset in the image's `models.ini.in`, so your
+   chosen `model` runs with its normal production settings. The router
+   also reads the live container's own settings file (the `LIVE_ENV_FILE`
+   variable). So it starts with the same knobs as production, plus this
+   run's own bearer key, host, port, and — when you set `ctx` — context
+   size.
+
+   If the image's `models.ini.in` lacks your chosen preset, the test server
+   still starts, but loading the preset fails. The job logs a warning.
+   Every suite that needs the preset then records an error, instead of
+   crashing.
+
+   After start-up, the job always reads the real context size back from
+   the running server (its `/props` endpoint). It uses that value in the
+   reports, and as `long_context`'s target. If you set `ctx` and the server
+   reports another size, the job logs a warning and records the server's
+   size. If the job cannot read the size, it records it as unknown (shown
+   as "–" on the dashboard), and `long_context` records an error instead
+   of running.
+5. It runs the suites you chose:
 
    | Suite | Server needs | What it runs | Pass means |
    | --- | --- | --- | --- |
    | `fixture` | 1 slot | Core browser tasks, repeated | Each task's own check passes |
    | `long_context` | 1 slot | A prompt near the context limit, asking the model to quote one exact line | The line quoted is exactly right |
    | `live_web` | 1 slot | A real DuckDuckGo image search that must save one real image file | An image file is actually saved |
+   | `decide` | 1 slot, plus the runner's own CPU for GLiNER | The same 60 fixed-choice items answered three ways: free-text Qwen, schema-constrained Qwen, and GLiNER | Each runner's own accuracy, not a single pass/fail — see [docs/benchmarks.md](benchmarks.md#decide-suite) |
    | `concurrency` | 2 slots | Four job-application runs: one at a time, then two at a time in pairs | Each run's own check passes |
 
-   For `concurrency`, the job restarts the test server first, with 2 slots
-   and a 49,152-token context, because that suite needs two agents running
-   at once. If this restart or the `concurrency` suite fails, the job goes
-   on: it records the error under `concurrency`, and still publishes the
-   other suites' results.
-4. It saves raw results, with any saved images, as one workflow artifact,
+   `concurrency` always runs on its own direct, two-slot server, because
+   every preset in `models.ini.in` fixes `parallel = 1`. This is why it only
+   works with `model` set to `qwen3.5-9b-q4_k_m` or `qwen3.5-4b-q4_k_m`; see
+   the note above. The job restarts the test server with 2 slots and a
+   49,152-token context before this suite runs. If that restart or the
+   `concurrency` suite itself fails, the job goes on: it records the error
+   under `concurrency`, and still publishes the other suites' results.
+6. It saves raw results, with any saved images, as one workflow artifact,
    so you can look at them even without the dashboard.
-5. At the end, whether or not a suite failed, it stops the test server and
+7. At the end, whether or not a suite failed, it stops the test server and
    starts the live container again (unless you set `restore_production` to
    `false`). It checks the live container's health endpoint. If that check
    does not return HTTP 200, the job fails — that tells you production is
@@ -205,7 +257,7 @@ hand right after the run.
    whole step still fails, the workflow waits 20 seconds and runs it a
    second time. This covers a short network drop between the runner and the
    worker.
-6. On success, a separate publish job downloads the run summary that this
+8. On success, a separate publish job downloads the run summary that this
    job uploaded as an artifact, then writes it to the `gh-pages` branch
    (`data/runs/<run_id>.json`), rebuilds the run index (`data/index.json`),
    and updates the Pages site from `bench-site/`. If the benchmark job never
@@ -221,14 +273,19 @@ Open the repository's Pages URL — **Settings → Pages** shows it once a run
 has published. The dashboard shows:
 
 - The latest run's pass rate, median time, and peak VRAM, for each suite.
+  The three `decide` runners each get their own card.
 - A pass-rate history chart, per suite, across all runs.
 - A median-time history chart.
+- A time-per-decision chart, in milliseconds, with one line per `decide`
+  runner (free-text Qwen, schema-constrained Qwen, GLiNER). It only appears
+  once a published run has a `decide` suite.
 - A peak-VRAM-versus-context chart, with a line at 8,192 MiB (the worker's
   total VRAM). It has one point for each suite in each run. A point uses
   the context size of the server that suite ran on. So the `concurrency`
   points show 49,152 tokens, even when the other suites in that run used a
   different `ctx`.
-- A table of every run, with its date, commit, model, context, and suites.
+- A table of every run, with its date, commit, model, decision model,
+  context, and suites.
 
 ## Stopping production, on purpose
 

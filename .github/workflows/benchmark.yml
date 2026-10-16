@@ -23,21 +23,42 @@ on:
         required: false
         type: string
         default: ''
-      model_preset:
-        description: 'Model preset'
+      model:
+        # Keep in the order of the [sections] in models.ini.in; a contract
+        # test fails when the two lists differ. TEST_IMAGE must be built
+        # from a commit whose models.ini.in holds the chosen preset.
+        description: 'LLM preset (models.ini.in section)'
         required: false
         type: choice
         options:
-          - qwen3.5-9b
-          - qwen3.5-4b
-        default: qwen3.5-9b
+          - bonsai-27b-ternary
+          - bonsai-27b-1bit
+          - qwen3.5-9b-q4_k_m
+          - granite-4.1-8b-q4_k_m
+          - qwen3.5-4b-q4_k_m
+          - qwen3.6-35b-a3b
+          - gemma4-e4b
+          - bonsai-27b-ternary-text
+        default: qwen3.5-9b-q4_k_m
+      decision_model:
+        description: 'Decision model for the decide suite (none = skip GLiNER)'
+        required: false
+        type: choice
+        options:
+          - fastino/GLiNER2.5-Decide
+          - fastino/GLiNER2.5-multi-Decide
+          - fastino/GLiNER2.5-Decide-1B
+          - fastino/gliner2.5-base-v1
+          - fastino/gliner2.5-small-v1
+          - none
+        default: fastino/GLiNER2.5-Decide
       ctx:
-        description: 'Context size for the single-slot phase'
+        description: 'Context size for the single-slot phase; empty = the preset default'
         required: false
         type: string
-        default: '32768'
+        default: ''
       suites:
-        description: 'Space-separated: fixture long_context live_web concurrency'
+        description: 'Space-separated: fixture long_context live_web decide concurrency'
         required: false
         type: string
         default: 'fixture long_context live_web'
@@ -70,8 +91,10 @@ jobs:
       # script, so an input value cannot inject shell code. The worker host
       # and SSH user are not here: only "Resolve settings" sees them, and it
       # masks them before any other step can print them.
-      IN_MODEL_PRESET: ${{ inputs.model_preset || 'qwen3.5-9b' }}
-      IN_CTX: ${{ inputs.ctx || '32768' }}
+      IN_MODEL: ${{ inputs.model || 'qwen3.5-9b-q4_k_m' }}
+      IN_DECISION_MODEL: ${{ inputs.decision_model || 'fastino/GLiNER2.5-Decide' }}
+      # Empty: the preset's own context size (read back after start-up).
+      IN_CTX: ${{ inputs.ctx }}
       IN_SUITES: ${{ inputs.suites || 'fixture long_context live_web' }}
       IN_REPETITIONS: ${{ inputs.repetitions || '1' }}
       LIVE_CONTAINER: ${{ vars.LIVE_CONTAINER || 'bonsai-llama-1' }}
@@ -121,23 +144,16 @@ jobs:
           [[ -n "$IN_WORKER_HOST" ]] || { echo "::error::worker_host input or WORKER_HOST variable is required"; exit 1; }
           [[ -n "$IN_SSH_USER" ]] || { echo "::error::ssh_user input or WORKER_SSH_USER variable is required"; exit 1; }
           [[ -n "$MODELS_DIR" ]] || { echo "::error::MODELS_DIR variable is required"; exit 1; }
-          [[ -n "$TEMPLATE_FILE" ]] || { echo "::error::TEMPLATE_FILE variable is required"; exit 1; }
           [[ "$IN_WORKER_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || { echo "::error::bad worker_host"; exit 1; }
           [[ "$IN_SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "::error::bad ssh_user"; exit 1; }
-          [[ "$IN_CTX" =~ ^[0-9]+$ ]] || { echo "::error::ctx must be an integer"; exit 1; }
+          [[ -z "$IN_CTX" || "$IN_CTX" =~ ^[0-9]+$ ]] || { echo "::error::ctx must be empty or an integer"; exit 1; }
+          [[ "$IN_MODEL" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad model"; exit 1; }
+          [[ "$IN_DECISION_MODEL" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad decision_model"; exit 1; }
           [[ "$IN_REPETITIONS" =~ ^[0-9]+$ ]] || { echo "::error::repetitions must be an integer"; exit 1; }
 
-          # The one place a preset maps to a model. Both use the Qwen3.5
-          # template at TEMPLATE_FILE on the worker.
-          case "$IN_MODEL_PRESET" in
-            qwen3.5-9b)
-              model_file=/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf
-              model_alias=qwen3.5-9b-q4_k_m ;;
-            qwen3.5-4b)
-              model_file=/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf
-              model_alias=qwen3.5-4b-q4_k_m ;;
-            *) echo "::error::unknown model_preset: $IN_MODEL_PRESET"; exit 1 ;;
-          esac
+          # The 1-slot phase runs the image's router, so the model is the
+          # preset name itself.
+          model_alias="$IN_MODEL"
 
           # Split the suites: concurrency needs a 2-slot server, the rest 1.
           # set -f: split the list on spaces without expanding globs.
@@ -145,13 +161,47 @@ jobs:
           phase1=() ; phase2=""
           for s in $IN_SUITES; do
             case "$s" in
-              fixture|long_context|live_web) phase1+=("$s") ;;
+              fixture|long_context|live_web|decide) phase1+=("$s") ;;
               concurrency) phase2=concurrency ;;
               *) echo "::error::unknown suite: $s"; exit 1 ;;
             esac
           done
           set +f
           [[ ${#phase1[@]} -gt 0 || -n "$phase2" ]] || { echo "::error::no suites selected"; exit 1; }
+
+          # Presets fix parallel = 1, so concurrency keeps its own direct
+          # 2-slot llama-server. This is the one place a preset maps to a
+          # model file; both use the Qwen3.5 template at TEMPLATE_FILE.
+          conc_model_file=""
+          if [[ -n "$phase2" ]]; then
+            case "$IN_MODEL" in
+              qwen3.5-9b-q4_k_m) conc_model_file=/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf ;;
+              qwen3.5-4b-q4_k_m) conc_model_file=/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf ;;
+              *) echo "::error::concurrency needs a Qwen3.5 model (got $IN_MODEL)"; exit 1 ;;
+            esac
+            [[ -n "$TEMPLATE_FILE" ]] || { echo "::error::TEMPLATE_FILE variable is required for concurrency"; exit 1; }
+          fi
+
+          # The decision model's pinned Hugging Face commit. Every choice but
+          # none has one (a contract test checks); the install step downloads
+          # that snapshot before the live container stops.
+          decision_rev=""
+          if [[ " ${phase1[*]:-} " == *" decide "* && "$IN_DECISION_MODEL" != none ]]; then
+            decision_rev="$(python3 - "$IN_DECISION_MODEL" <<'EOF'
+          import json, re, sys
+          pins = json.load(open("tests/fixtures/decide/decision_models.json"))
+          sha = pins.get(sys.argv[1], "")
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              sys.exit(1)
+          print(sha)
+          EOF
+            )" || { echo "::error::no pinned revision for $IN_DECISION_MODEL in tests/fixtures/decide/decision_models.json"; exit 1; }
+          fi
+
+          # A throwaway bearer key for the test router, new each run. Mask
+          # it before anything else can see it.
+          BENCH_API_KEY="$(openssl rand -hex 24)"
+          echo "::add-mask::$BENCH_API_KEY"
 
           # Step caps from run_suites.py's own job timeouts, so the restore
           # always fits in the job's 240 minutes. Too many repetitions would
@@ -174,16 +224,51 @@ jobs:
           {
             echo "WORKER_HOST=$IN_WORKER_HOST"
             echo "WORKER_SSH=$IN_SSH_USER@$IN_WORKER_HOST"
-            echo "MODEL_FILE=$model_file"
             echo "MODEL_ALIAS=$model_alias"
+            echo "CONC_MODEL_FILE=$conc_model_file"
+            echo "DECISION_MODEL_REVISION=$decision_rev"
+            echo "BENCH_API_KEY=$BENCH_API_KEY"
             echo "PHASE1_SUITES=${phase1[*]}"
             echo "PHASE2_SUITES=$phase2"
             # Never 0: a skipped step's cap must still be a valid number.
             echo "PHASE1_TIMEOUT_MIN=$(( phase1_min > 0 ? phase1_min : 1 ))"
             echo "PHASE2_TIMEOUT_MIN=$(( phase2_min > 0 ? phase2_min : 1 ))"
           } >> "$GITHUB_ENV"
-          echo "model: $model_alias  ctx: $IN_CTX  repetitions: $IN_REPETITIONS (most: $max_reps)"
+          echo "model: $model_alias  decision model: $IN_DECISION_MODEL ${decision_rev:+@ $decision_rev}  ctx: ${IN_CTX:-preset default}  repetitions: $IN_REPETITIONS (most: $max_reps)"
           echo "phase 1: ${phase1[*]:-none} (cap ${phase1_min} min)  phase 2: ${phase2:-none} (cap ${phase2_min} min)"
+
+      # The decide suite runs GLiNER on this runner's CPU. CPU-only torch:
+      # the default wheel pulls several GB of CUDA libraries for nothing.
+      # Plain `gliner2` is only the cloud client; [local] runs the model.
+      # Both steps run before the tailnet join, so this work never adds to
+      # the time production is down. Caps: a cache restore and a CPU torch
+      # wheel plus a model of at most a few GB take a few minutes on a
+      # GitHub runner; 10 each stops a stuck download, and
+      # run_suites.RESERVED_MINUTES counts both.
+      - name: Cache Hugging Face models
+        if: contains(env.PHASE1_SUITES, 'decide') && inputs.decision_model != 'none'
+        timeout-minutes: 10
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ env.IN_DECISION_MODEL }}-${{ env.DECISION_MODEL_REVISION }}
+
+      - name: Install GLiNER
+        if: contains(env.PHASE1_SUITES, 'decide') && inputs.decision_model != 'none'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.14.1"
+          pip install "gliner2[local]==2.1.0"
+          # The pinned snapshot, now: decide_bench.py loads this same
+          # revision later, from the cache.
+          python3 - <<'EOF'
+          import os
+          from huggingface_hub import snapshot_download
+          path = snapshot_download(repo_id=os.environ["IN_DECISION_MODEL"],
+                                   revision=os.environ["DECISION_MODEL_REVISION"])
+          print("decision model snapshot:", path)
+          EOF
 
       # ubuntu-latest (24.04) ships Google Chrome (runner-images readme),
       # which is what the Playwright MCP uses (--browser chrome). Install it
@@ -243,13 +328,29 @@ jobs:
           ssh "$WORKER_SSH" true
           echo "SSH to the worker works"
 
+      # The image's own entrypoint (router over models.ini), so the preset
+      # runs with its production settings. An empty ctx keeps the preset's
+      # context size. Either way the step reads the real size back and
+      # records that, not the input: the reports must show what ran.
       - name: Start test server (1 slot)
         if: env.PHASE1_SUITES != ''
-        timeout-minutes: 10
+        timeout-minutes: 15
         env:
+          MODE: router
           CTX: ${{ env.IN_CTX }}
-          PARALLEL: '1'
-        run: tests/bench/worker.sh up
+        run: |
+          set -euo pipefail
+          tests/bench/worker.sh up
+          if run_ctx="$(tests/bench/worker.sh ctx)"; then
+            if [[ -n "$CTX" && "$run_ctx" != "$CTX" ]]; then
+              echo "::warning::ctx input was $CTX but the server reports $run_ctx; recording $run_ctx"
+            fi
+          else
+            echo "::warning::could not read the context size back; it is recorded as unknown, and long_context records an error instead of running"
+            run_ctx=""
+          fi
+          echo "RUN_CTX=$run_ctx" >> "$GITHUB_ENV"
+          echo "context size: ${run_ctx:-unknown}"
 
       - name: Open tunnel to the test server
         run: |
@@ -271,13 +372,18 @@ jobs:
       - name: Run single-slot suites
         if: env.PHASE1_SUITES != ''
         timeout-minutes: ${{ fromJSON(env.PHASE1_TIMEOUT_MIN) }}
+        env:
+          # The suites read the router's key from here (--key-env default).
+          BONSAI_API_KEY: ${{ env.BENCH_API_KEY }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2086 # PHASE1_SUITES is a word list on purpose
           python3 tests/bench/run_suites.py \
             --base-url "http://127.0.0.1:${LOCAL_PORT}" \
             --model "$MODEL_ALIAS" \
-            --ctx "$IN_CTX" \
+            --decision-model "$IN_DECISION_MODEL" \
+            --decision-model-revision "$DECISION_MODEL_REVISION" \
+            --ctx "${RUN_CTX:-}" \
             --parallel 1 \
             --suites $PHASE1_SUITES \
             --repetitions "$IN_REPETITIONS" \
@@ -295,6 +401,8 @@ jobs:
         continue-on-error: true
         timeout-minutes: 10
         env:
+          MODE: direct
+          MODEL_FILE: ${{ env.CONC_MODEL_FILE }}
           CTX: ${{ env.PHASE2_CTX }}
           PARALLEL: ${{ env.PHASE2_PARALLEL }}
         run: tests/bench/worker.sh up
@@ -359,14 +467,15 @@ jobs:
           ctx, parallel = int(os.environ["PHASE2_CTX"]), int(os.environ["PHASE2_PARALLEL"])
           # No phase-1 meta (concurrency only): start from phase 2's, or a
           # minimal one when phase 2 never wrote any, so the failure still
-          # reaches the dashboard.
+          # reaches the dashboard. decision_model comes only from phase 1
+          # (run_suites.py writes it only for decide), so nothing here sets it.
           meta = load(dst / "meta.json") or src_meta or {
               "model": os.environ["MODEL_ALIAS"], "ctx": ctx, "parallel": parallel,
               "gpu": os.environ.get("BENCH_GPU_NAME") or None,
               "commit": os.environ.get("GITHUB_SHA", "")[:7] or None,
               "run_id": os.environ.get("GITHUB_RUN_ID"),
               "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              "suites": []}
+              "suites": [], "decision_model": None}
           meta["suites"] = list(dict.fromkeys(meta.get("suites", []) + src_meta.get("suites", []) + ["concurrency"]))
           settings = meta.setdefault("suite_settings", {})
           settings.update(src_meta.get("suite_settings", {}))
@@ -414,8 +523,9 @@ jobs:
       # covers a longer network drop.
       - name: Restore production (worker.sh down)
         if: always() && inputs.restore_production && env.WORKER_SSH != ''
-        # Two full worker.sh down passes take about 11 minutes at worst;
-        # run_suites.RESERVED_MINUTES keeps this cap free in the job.
+        # Two full worker.sh down passes (the retry runs inside this step)
+        # take about 11 minutes at worst; run_suites.RESERVED_MINUTES keeps
+        # this cap free in the job.
         timeout-minutes: 20
         run: |
           set -euo pipefail

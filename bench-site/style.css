@@ -23,6 +23,9 @@
   --series-live-web: #1baf7a;            /* aqua   */
   --series-concurrency-serial: #eda100;  /* yellow */
   --series-concurrency-parallel: #e87ba4;/* magenta*/
+  --series-decide-free: #008300;         /* green  */
+  --series-decide-schema: #4a3aa7;       /* violet */
+  --series-decide-gliner: #e34948;       /* red    */
 
   --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
@@ -48,6 +51,9 @@
     --series-live-web: #199e70;
     --series-concurrency-serial: #c98500;
     --series-concurrency-parallel: #d55181;
+    --series-decide-free: #008300;
+    --series-decide-schema: #9085e9;
+    --series-decide-gliner: #e66767;
   }
 }
 

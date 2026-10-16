@@ -1,0 +1,20 @@
+{"id": "route-01", "task": "route", "text": "Open the careers page at example.org and fill in the application form.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "browser"}
+{"id": "route-02", "task": "route", "text": "Navigate to example.org/dashboard, click the 'Export' button, and download the CSV.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "browser"}
+{"id": "route-03", "task": "route", "text": "Go to the example.org login page, type the username 'ada' into the username field, and press submit.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "browser"}
+{"id": "route-04", "task": "route", "text": "Visit example.org/settings and toggle the dark mode switch on.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "browser"}
+{"id": "route-05", "task": "route", "text": "Write a Python function that reverses a singly linked list.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "code"}
+{"id": "route-06", "task": "route", "text": "Fix the bug in this script: the loop never terminates because the counter is never incremented.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "code"}
+{"id": "route-07", "task": "route", "text": "Refactor the calculate_total function so it handles an empty list without raising an error.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "code"}
+{"id": "route-08", "task": "route", "text": "Write a shell script that backs up the /var/log directory every night at midnight.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "code"}
+{"id": "route-09", "task": "route", "text": "Find out today's exchange rate between the US dollar and the Japanese yen.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
+{"id": "route-10", "task": "route", "text": "Check today's weather forecast for Reykjavik.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
+{"id": "route-11", "task": "route", "text": "Look up today's closing price for the stock ticker ABC.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
+{"id": "route-12", "task": "route", "text": "Find the release notes for the latest version of the Linux kernel, published this week.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "search"}
+{"id": "route-13", "task": "route", "text": "Explain the difference between a stack and a queue in your own words.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "chat"}
+{"id": "route-14", "task": "route", "text": "What do you think makes a good leader?", "labels": ["browser", "code", "search", "chat", "none"], "answer": "chat"}
+{"id": "route-15", "task": "route", "text": "Tell me a short joke about computers.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "chat"}
+{"id": "route-16", "task": "route", "text": "Summarize the plot of a typical detective novel.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "chat"}
+{"id": "route-17", "task": "route", "text": "Never mind, I don't need that anymore.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "none"}
+{"id": "route-18", "task": "route", "text": "Thanks, that answers my question. No further action needed.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "none"}
+{"id": "route-19", "task": "route", "text": "Please cancel the previous request; do nothing.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "none"}
+{"id": "route-20", "task": "route", "text": "Just acknowledging I received your message. No response required.", "labels": ["browser", "code", "search", "chat", "none"], "answer": "none"}

@@ -9,12 +9,20 @@ machine. A push or pull_request trigger would run fork code on it; an input
 named like a secret would print that secret on the run page; a `down` step
 without always() would leave production stopped after any failure.
 """
+import importlib.util
+import json
 import os
 import re
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "benchmark.yml")
+MODELS_INI = os.path.join(ROOT, "models.ini.in")
+PINS = os.path.join(ROOT, "tests", "fixtures", "decide", "decision_models.json")
+_spec = importlib.util.spec_from_file_location(
+    "run_suites", os.path.join(ROOT, "tests", "bench", "run_suites.py"))
+run_suites = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(run_suites)
 
 
 def load():
@@ -53,6 +61,34 @@ def input_names(text):
             elif line.strip() and not line.startswith("       "):
                 break
     return names
+
+
+def choice_options(text, name):
+    """`options:` items of input `name` under on.workflow_dispatch.inputs,
+    in order. Block-list style only (`- item` lines)."""
+    block = top_level_block(text, "on")
+    options, in_input, in_options = [], False, False
+    for line in block:
+        if re.match(r"^      [A-Za-z0-9_-]+:\s*$", line):
+            in_input = line.strip() == f"{name}:"
+            in_options = False
+            continue
+        if not in_input:
+            continue
+        if re.match(r"^        options:\s*$", line):
+            in_options = True
+            continue
+        if in_options:
+            m = re.match(r"^          - (\S+)\s*$", line)
+            if m:
+                options.append(m.group(1))
+            elif line.strip():
+                in_options = False
+    return options
+
+
+def step_named(text, name):
+    return next(s for s in steps(text) if name in s[0])
 
 
 def steps(text):
@@ -100,8 +136,8 @@ class BenchmarkWorkflowTest(unittest.TestCase):
 
     def test_inputs_are_the_documented_set(self):
         self.assertEqual(input_names(self.text), [
-            "worker_host", "ssh_user", "model_preset", "ctx", "suites",
-            "repetitions", "restore_production"])
+            "worker_host", "ssh_user", "model", "decision_model", "ctx",
+            "suites", "repetitions", "restore_production"])
 
     def test_no_input_looks_like_a_secret(self):
         for name in input_names(self.text):
@@ -172,6 +208,50 @@ class BenchmarkWorkflowTest(unittest.TestCase):
                 if in_run:
                     self.assertNotIn("${{", line)
 
+    def test_model_choices_equal_models_ini_sections(self):
+        with open(MODELS_INI) as f:
+            ini = f.read()
+        sections = [m.group(1) for m in re.finditer(r"^\[([^\]]+)\]", ini, re.M)
+                    if m.group(1) != "*"]
+        self.assertTrue(sections)
+        self.assertEqual(choice_options(self.text, "model"), sections)
+
+    def test_decision_model_choices(self):
+        self.assertEqual(choice_options(self.text, "decision_model"), [
+            "fastino/GLiNER2.5-Decide", "fastino/GLiNER2.5-multi-Decide", "fastino/GLiNER2.5-Decide-1B",
+            "fastino/gliner2.5-base-v1", "fastino/gliner2.5-small-v1", "none"])
+
+    def test_concurrency_refused_for_non_qwen_models(self):
+        self.assertIn("concurrency needs a Qwen3.5 model", self.text)
+
+    def test_bench_key_is_generated_and_masked(self):
+        self.assertRegex(self.text, r"BENCH_API_KEY=.*openssl rand|secrets\.token_hex")
+        self.assertIn("::add-mask::$BENCH_API_KEY", self.text)
+        # Masked before it is written anywhere a later step could print it.
+        self.assertLess(self.text.index('echo "::add-mask::$BENCH_API_KEY"'),
+                        self.text.index('echo "BENCH_API_KEY=$BENCH_API_KEY"'))
+
+    def test_gliner_installed_from_cpu_torch_only_for_decide(self):
+        self.assertIn("download.pytorch.org/whl/cpu", self.text)
+        self.assertIn('gliner2[local]==2.1.0', self.text)
+        step = step_named(self.text, "Install GLiNER")
+        cond = next(l for l in step if l.strip().startswith("if:"))
+        self.assertIn("decide", cond)
+        self.assertIn("inputs.decision_model != 'none'", cond)
+
+    def test_phase_1_runs_the_router_and_phase_2_the_direct_server(self):
+        up1 = "\n".join(step_named(self.text, "Start test server (1 slot)"))
+        up2 = "\n".join(step_named(self.text, "Restart test server (2 slots)"))
+        self.assertIn("MODE: router", up1)
+        self.assertIn("MODE: direct", up2)
+        self.assertIn("MODEL_FILE: ${{ env.CONC_MODEL_FILE }}", up2)
+
+    def test_suites_get_the_decision_model_and_key(self):
+        run1 = "\n".join(step_named(self.text, "Run single-slot suites"))
+        self.assertIn('--decision-model "$IN_DECISION_MODEL"', run1)
+        self.assertIn('--model "$MODEL_ALIAS"', run1)
+        self.assertIn("BONSAI_API_KEY: ${{ env.BENCH_API_KEY }}", run1)
+
     def test_model_presets(self):
         self.assertIn("/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf", self.text)
         self.assertIn("qwen3.5-9b-q4_k_m", self.text)
@@ -207,9 +287,67 @@ class BenchmarkWorkflowTest(unittest.TestCase):
             step = next(s for s in steps(self.text) if name in s[0])
             self.assertTrue(any("timeout-minutes:" in l and cap in l for l in step), name)
         for name in ("Start test server (1 slot)", "Restart test server (2 slots)",
+                     "Cache Hugging Face models", "Install GLiNER",
                      "Restore production (worker.sh down)"):
             step = next(s for s in steps(self.text) if name in s[0])
             self.assertTrue(any("timeout-minutes:" in l for l in step), name)
+
+    def test_fixed_step_caps_fit_the_reserve(self):
+        """Every fixed `timeout-minutes` outside the two suite steps is
+        counted in run_suites.RESERVED_MINUTES, so the suite caps plus the
+        reserve always fit the job and the restore keeps its time."""
+        benchmark = self.text[:self.text.index("\n  publish:")]
+        job_cap = re.search(r"^    timeout-minutes: (\d+)$", benchmark, re.M)
+        self.assertEqual(int(job_cap.group(1)), run_suites.JOB_TIMEOUT_MINUTES)
+        fixed = []
+        for step in steps(benchmark):
+            for line in step:
+                m = re.match(r"^        timeout-minutes: (.+)$", line)
+                if m and "fromJSON" not in m.group(1):
+                    fixed.append((step[0].strip(), int(m.group(1))))
+        self.assertEqual(sum(cap for _, cap in fixed), run_suites.CAPPED_STEP_MINUTES, fixed)
+        self.assertEqual(run_suites.RESERVED_MINUTES,
+                         run_suites.CAPPED_STEP_MINUTES + run_suites.UNCAPPED_STEP_MINUTES)
+        self.assertGreaterEqual(run_suites.max_repetitions(
+            ["fixture", "long_context", "live_web", "decide"], ["concurrency"]), 1)
+
+    def test_every_decision_model_has_a_pinned_revision(self):
+        with open(PINS) as f:
+            pins = json.load(f)
+        for model in choice_options(self.text, "decision_model"):
+            if model == "none":
+                continue
+            with self.subTest(model=model):
+                self.assertRegex(pins.get(model, ""), r"^[0-9a-f]{40}$")
+
+    def test_pinned_snapshot_downloaded_before_production_stops(self):
+        install = "\n".join(step_named(self.text, "Install GLiNER"))
+        self.assertIn("snapshot_download", install)
+        self.assertIn('revision=os.environ["DECISION_MODEL_REVISION"]', install)
+        order = [s[0] for s in steps(self.text)]
+        at = lambda name: next(i for i, line in enumerate(order) if name in line)
+        self.assertLess(at("Install GLiNER"), at("Join tailnet (OAuth client)"))
+        self.assertLess(at("Install GLiNER"), at("Start test server (1 slot)"))
+        cache = "\n".join(step_named(self.text, "Cache Hugging Face models"))
+        self.assertIn("env.DECISION_MODEL_REVISION", cache)
+        run1 = "\n".join(step_named(self.text, "Run single-slot suites"))
+        self.assertIn('--decision-model-revision "$DECISION_MODEL_REVISION"', run1)
+
+    def test_ctx_is_always_read_back_and_never_recorded_as_zero(self):
+        up1 = "\n".join(step_named(self.text, "Start test server (1 slot)"))
+        self.assertIn("worker.sh ctx", up1)
+        # Read back even when ctx was given; a mismatch warns and the
+        # server's value wins.
+        self.assertNotRegex(up1, r'run_ctx="\$CTX"')
+        self.assertIn("::warning::ctx input was $CTX but the server reports $run_ctx", up1)
+        self.assertNotIn("run_ctx=0", up1)
+        run1 = "\n".join(step_named(self.text, "Run single-slot suites"))
+        self.assertIn('--ctx "${RUN_CTX:-}"', run1)
+        self.assertNotIn("RUN_CTX:-0", self.text)
+
+    def test_merge_never_takes_the_decision_model_from_phase_2(self):
+        merge = "\n".join(step_named(self.text, "Merge phase reports"))
+        self.assertNotRegex(merge, r'meta\["decision_model"\]\s*=')
 
     def test_phase_2_failure_does_not_fail_the_job(self):
         for name in ("Restart test server (2 slots)", "Run concurrency suite"):

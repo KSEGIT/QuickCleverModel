@@ -1,0 +1,8 @@
+{
+  "_comment": "Hugging Face commit sha per decision_model choice, from https://huggingface.co/api/models/<id> on 2026-10-12. The workflow downloads this snapshot before it stops production, and decide_bench.py loads it.",
+  "fastino/GLiNER2.5-Decide": "9d1bfb848cd16d93ee56ccbc59cd92bf0f284d90",
+  "fastino/GLiNER2.5-multi-Decide": "e173bca1f0c4217d7a55b3b0c705d5ece8a0218d",
+  "fastino/GLiNER2.5-Decide-1B": "67af949e17bebd20f05fe020a971079889e7a462",
+  "fastino/gliner2.5-base-v1": "54785d51df8d86a0d8f2eb212fec15871aad2c4d",
+  "fastino/gliner2.5-small-v1": "df5910e44bc4ffdb0d95399a83b0ca4516349aa5"
+}
