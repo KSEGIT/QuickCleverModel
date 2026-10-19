@@ -5,6 +5,26 @@
 #   WORKER_SSH=user@host tests/bench/worker.sh down    # stop test server, restore live
 #   WORKER_SSH=user@host tests/bench/worker.sh vram    # used GPU memory, MiB
 #   WORKER_SSH=user@host tests/bench/worker.sh health  # test server /health JSON
+#   WORKER_SSH=user@host tests/bench/worker.sh ctx     # router mode: the context
+#                                                      # size MODEL_ALIAS really got
+#
+# Two ways to start the test server (MODE):
+#   router (default)  the image's own entrypoint (start-server.sh) in router
+#                     mode, so every models.ini preset runs with its production
+#                     settings. Needs MODELS_DIR (mounted at /app/models),
+#                     MODEL_ALIAS (the preset name, warmed up after start) and
+#                     BENCH_API_KEY (the test server's bearer key). CTX is
+#                     optional: empty keeps the preset's own default; a value
+#                     sets every ctx variable start-server.sh reads
+#                     (CTX_VARS below). LIVE_ENV_FILE, when
+#                     set, goes in as --env-file, so the router gets the
+#                     live server's .env knobs; the -e values above win.
+#                     A preset that fails to load only warns: the router
+#                     is up, and each suite records the error.
+#   direct            one llama-server with --parallel, for the concurrency
+#                     suite (presets fix parallel = 1). Needs MODELS_DIR,
+#                     TEMPLATE_FILE, MODEL_FILE, MODEL_ALIAS; CTX defaults to
+#                     32768, PARALLEL to 1.
 #
 # The GPU has room for one model, so `up` stops the live container first and
 # `down` must always run afterwards: it brings the live container back and
@@ -20,6 +40,11 @@
 # BONSAI_API_KEY= line of LIVE_ENV_FILE on the worker and passed to curl on
 # stdin (-H @-), so it never crosses the SSH link, never appears in argv on
 # either side, and is never printed.
+#
+# BENCH_API_KEY (router mode) is a throwaway key made per run. It goes to
+# curl on stdin too; `docker run` needs it as -e, so it does appear in that
+# one remote argv. It guards a server that listens on the worker's loopback
+# only, and it is never printed.
 set -euo pipefail
 
 LIVE_CONTAINER="${LIVE_CONTAINER:-bonsai-llama-1}"
@@ -28,10 +53,14 @@ LIVE_ENV_FILE="${LIVE_ENV_FILE:-}"
 TEST_CONTAINER="${TEST_CONTAINER:-qcm-bench}"
 TEST_IMAGE="${TEST_IMAGE:-qcm-rtx-validation:922be44}"
 TEST_PORT="${TEST_PORT:-18080}"
-CTX="${CTX:-32768}"
+MODE="${MODE:-router}"
+# Empty CTX means: router mode keeps the preset default; direct mode, 32768.
+CTX="${CTX:-}"
 PARALLEL="${PARALLEL:-1}"
 # Tunables, mainly so tests do not wait for real timeouts.
 UP_TIMEOUT="${UP_TIMEOUT:-180}"
+# Loading a model from disk on the first request can take minutes.
+WARM_TIMEOUT="${WARM_TIMEOUT:-600}"
 DOWN_TIMEOUT="${DOWN_TIMEOUT:-120}"
 POLL_INTERVAL="${POLL_INTERVAL:-2}"
 START_ATTEMPTS="${START_ATTEMPTS:-5}"
@@ -40,7 +69,7 @@ RETRY_SLEEP="${RETRY_SLEEP:-3}"
 die() { echo "worker.sh: $*" >&2; exit 1; }
 
 usage() {
-  echo "usage: WORKER_SSH=user@host $0 up|down|vram|health" >&2
+  echo "usage: WORKER_SSH=user@host $0 up|down|vram|health|ctx" >&2
   exit 2
 }
 
@@ -52,6 +81,12 @@ need() {
 }
 
 is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+# Every context-size variable start-server.sh reads. The per-model QCM_*_CTX
+# values win over QCM_AGENT_CTX there, and LIVE_ENV_FILE may set them, so a
+# CTX override must set all of them or a preset keeps the file's value.
+CTX_VARS=(BONSAI_CTX BONSAI_CTX_TEXT QCM_AGENT_CTX QCM_QWEN9_CTX QCM_QWEN4_CTX
+  QCM_GRANITE_CTX QCM_QWEN36_CTX QCM_GEMMA4_CTX)
 
 # Run one shell command string on the worker. BatchMode: never prompt for a
 # password. StrictHostKeyChecking=yes: the host key must already be in
@@ -104,20 +139,67 @@ if [ -n "\$key" ]; then printf 'Authorization: Bearer %s\\n' "\$key" | curl -s -
 EOF
 }
 
-cmd_up() {
-  need MODELS_DIR TEMPLATE_FILE MODEL_FILE MODEL_ALIAS
-  is_int "$CTX" || die "CTX must be an integer, got '$CTX'"
-  is_int "$PARALLEL" || die "PARALLEL must be an integer, got '$PARALLEL'"
+# Print "Authorization: Bearer <key>" for curl -H @- on the worker. Through
+# a pipe into ssh, so the key is never in an argv.
+bench_auth() { printf 'Authorization: Bearer %s\n' "$BENCH_API_KEY"; }
+
+# Router mode: ask MODEL_ALIAS for one token, so the router loads it now.
+# An unknown preset fails here (the router answers 4xx), not mid-suite.
+warm_model() {
+  local body
+  body="$(printf '{"model":"%s","messages":[{"role":"user","content":"ok"}],"max_tokens":1}' "$MODEL_ALIAS")"
+  bench_auth | remote "curl -sf -o /dev/null -m $(q "$WARM_TIMEOUT") -H @- \
+-H 'Content-Type: application/json' -d $(q "$body") \
+http://127.0.0.1:$(q "$TEST_PORT")/v1/chat/completions"
+}
+
+# Validate everything before the first SSH call: a bad setting must not
+# stop the live container.
+check_up_settings() {
   is_int "$TEST_PORT" || die "TEST_PORT must be an integer, got '$TEST_PORT'"
+  case "$MODE" in
+    router)
+      need MODELS_DIR MODEL_ALIAS BENCH_API_KEY
+      [[ "$MODEL_ALIAS" =~ ^[A-Za-z0-9._-]+$ ]] || die "MODEL_ALIAS must be a preset name, got '$MODEL_ALIAS'"
+      [[ -z "$CTX" ]] || is_int "$CTX" || die "CTX must be an integer, got '$CTX'"
+      ;;
+    direct)
+      need MODELS_DIR TEMPLATE_FILE MODEL_FILE MODEL_ALIAS
+      CTX="${CTX:-32768}"
+      is_int "$CTX" || die "CTX must be an integer, got '$CTX'"
+      is_int "$PARALLEL" || die "PARALLEL must be an integer, got '$PARALLEL'"
+      ;;
+    *) die "MODE must be router or direct, got '$MODE'" ;;
+  esac
+}
 
-  echo "worker.sh: stopping live container $LIVE_CONTAINER" >&2
-  remote "docker stop $(q "$LIVE_CONTAINER") >/dev/null 2>&1 || true"
+# The image's normal entrypoint: start-server.sh in router mode over the
+# image's models.ini. HOST/PORT come from BONSAI_HOST/BONSAI_PORT.
+router_run_cmd() {
+  local ctx_env="" env_file=""
+  # Production settings: the live container gets LIVE_ENV_FILE through
+  # compose env_file, so the test router reads the same file. docker run
+  # applies -e after --env-file, so the -e values below (bench key, host,
+  # port, models max, ctx) win over the file's.
+  if [[ -n "$LIVE_ENV_FILE" ]]; then
+    env_file="--env-file $(q "$LIVE_ENV_FILE") "
+  fi
+  if [[ -n "$CTX" ]]; then
+    local var
+    for var in "${CTX_VARS[@]}"; do
+      ctx_env+="-e $var=$(q "$CTX") "
+    done
+  fi
+  printf '%s' "docker run -d --rm --gpus all --name $(q "$TEST_CONTAINER") \
+-p 127.0.0.1:$(q "$TEST_PORT"):8080 \
+-v $(q "$MODELS_DIR"):/app/models:ro \
+${env_file}-e BONSAI_API_KEY=$(q "$BENCH_API_KEY") -e BONSAI_HOST=0.0.0.0 -e BONSAI_PORT=8080 \
+-e BONSAI_MODELS_MAX=1 ${ctx_env}$(q "$TEST_IMAGE") >/dev/null"
+}
 
-  # A second `up` (phase 2, other slot count) replaces the running test
-  # container instead of failing on the name clash.
-  echo "worker.sh: starting $TEST_CONTAINER (ctx $CTX, parallel $PARALLEL, $MODEL_ALIAS)" >&2
-  remote "docker rm -f $(q "$TEST_CONTAINER") >/dev/null 2>&1 || true; \
-docker run -d --rm --gpus all --name $(q "$TEST_CONTAINER") \
+# One llama-server with its own slot count: the recorded server command.
+direct_run_cmd() {
+  printf '%s' "docker run -d --rm --gpus all --name $(q "$TEST_CONTAINER") \
 -p 127.0.0.1:$(q "$TEST_PORT"):8080 \
 -v $(q "$MODELS_DIR"):/models:ro \
 -v $(q "$TEMPLATE_FILE"):/template.jinja:ro \
@@ -129,9 +211,55 @@ $(q "$TEST_IMAGE") \
 --ctx-size $(q "$CTX") --n-gpu-layers 99 --flash-attn auto \
 --cache-type-k f16 --cache-type-v f16 --reasoning off \
 --parallel $(q "$PARALLEL") >/dev/null"
+}
+
+cmd_up() {
+  check_up_settings
+
+  echo "worker.sh: stopping live container $LIVE_CONTAINER" >&2
+  remote "docker stop $(q "$LIVE_CONTAINER") >/dev/null 2>&1 || true"
+
+  # A second `up` (phase 2, other slot count) replaces the running test
+  # container instead of failing on the name clash.
+  local run_cmd
+  if [[ "$MODE" == router ]]; then
+    echo "worker.sh: starting $TEST_CONTAINER (router, ctx ${CTX:-preset default}, $MODEL_ALIAS)" >&2
+    run_cmd="$(router_run_cmd)"
+  else
+    echo "worker.sh: starting $TEST_CONTAINER (ctx $CTX, parallel $PARALLEL, $MODEL_ALIAS)" >&2
+    run_cmd="$(direct_run_cmd)"
+  fi
+  remote "docker rm -f $(q "$TEST_CONTAINER") >/dev/null 2>&1 || true; $run_cmd"
 
   wait_for "$UP_TIMEOUT" test_ready || die "test server did not become healthy"
+  if [[ "$MODE" == router ]]; then
+    echo "worker.sh: loading $MODEL_ALIAS" >&2
+    # The router is healthy, so a failed load is the preset's problem
+    # (for example missing from the image's models.ini: router 404). Keep
+    # going: each suite records the error itself, as the spec asks.
+    if ! warm_model; then
+      echo "::warning::worker.sh: model $MODEL_ALIAS did not load (missing from the image's models.ini?); the suites will record the error" >&2
+    fi
+  fi
   echo "worker.sh: test server healthy on worker 127.0.0.1:$TEST_PORT" >&2
+}
+
+# Router mode: the context size the router gave MODEL_ALIAS, from the
+# child's /props (default_generation_settings.n_ctx). Parsed here, on the
+# caller, so the worker needs nothing beyond curl.
+cmd_ctx() {
+  need MODEL_ALIAS BENCH_API_KEY
+  is_int "$TEST_PORT" || die "TEST_PORT must be an integer, got '$TEST_PORT'"
+  [[ "$MODEL_ALIAS" =~ ^[A-Za-z0-9._-]+$ ]] || die "MODEL_ALIAS must be a preset name, got '$MODEL_ALIAS'"
+  local props n_ctx
+  props="$(bench_auth | remote "curl -sf --max-time 10 -H @- \
+'http://127.0.0.1:$TEST_PORT/props?model=$MODEL_ALIAS'")" || die "could not read /props for $MODEL_ALIAS"
+  n_ctx="$(printf '%s' "$props" | python3 -c 'import json, sys; print(json.load(sys.stdin)["default_generation_settings"]["n_ctx"])' 2>/dev/null)" \
+    || die "no default_generation_settings.n_ctx in /props for $MODEL_ALIAS"
+  if ! is_int "$n_ctx" || (( n_ctx == 0 )); then
+    die "unexpected n_ctx for $MODEL_ALIAS: $n_ctx"
+  fi
+  echo "$n_ctx"
 }
 
 # The path that must not give up: production depends on it. Each attempt
@@ -177,6 +305,7 @@ main() {
     down) cmd_down ;;
     vram) cmd_vram ;;
     health) cmd_health ;;
+    ctx) cmd_ctx ;;
     *) usage ;;
   esac
 }

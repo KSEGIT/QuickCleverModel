@@ -37,6 +37,7 @@ EXECUTABLE = [
     "tests/live_image_agent.py",
     "tests/long_context_probe.py",
     "tests/bench/run_suites.py",
+    "tests/decide_bench.py",
 ]
 
 

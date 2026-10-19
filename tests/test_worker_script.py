@@ -8,6 +8,7 @@ answers are steered with FAKE_* environment variables.
 """
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -24,6 +25,10 @@ FAKE_SSH = textwrap.dedent("""\
         log.write(json.dumps(sys.argv[1:]) + "\\n")
     with open(os.environ["FAKE_SSH_LOG"]) as log:
         n_calls = sum(1 for _ in log)
+    # Keys travel on stdin (curl -H @-); record what the worker would read.
+    if os.environ.get("FAKE_SSH_STDIN_LOG") and "-H @-" in sys.argv[-1]:
+        with open(os.environ["FAKE_SSH_STDIN_LOG"], "a") as f:
+            f.write(sys.stdin.read())
     # FAKE_SSH_FAIL_FIRST=N: the first N connections fail like a dropped link.
     if n_calls <= int(os.environ.get("FAKE_SSH_FAIL_FIRST", "0")):
         print("ssh: connect to host rtx-worker port 22: Connection timed out",
@@ -41,13 +46,21 @@ FAKE_SSH = textwrap.dedent("""\
     if "nvidia-smi" in cmd:
         print(os.environ.get("FAKE_VRAM", "6269"))
         sys.exit(0)
+    if "/props" in cmd:
+        print(os.environ.get("FAKE_PROPS",
+              '{"default_generation_settings":{"id":0,"n_ctx":8192}}'), end="")
+        sys.exit(int(os.environ.get("FAKE_PROPS_RC", "0")))
+    if "chat/completions" in cmd:
+        sys.exit(int(os.environ.get("FAKE_WARM_RC", "0")))
     if "/health" in cmd:
         print('{"status":"ok"}', end="")
         sys.exit(0)
     sys.exit(0)
     """)
 
+# Direct mode: one llama-server with --parallel (the concurrency suite).
 UP_ENV = {
+    "MODE": "direct",
     "MODELS_DIR": "/srv/models",
     "TEMPLATE_FILE": "/srv/templates/qwen3.5.jinja",
     "MODEL_FILE": "/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf",
@@ -81,7 +94,8 @@ class WorkerScriptTest(unittest.TestCase):
         full = dict(self.env)
         full.update(env)
         return subprocess.run(["bash", SCRIPT, *args], capture_output=True,
-                              text=True, env=full, timeout=60)
+                              stdin=subprocess.DEVNULL, text=True, env=full,
+                              timeout=60)
 
     def calls(self):
         if not os.path.exists(self.log):
@@ -98,8 +112,17 @@ class WorkerScriptTest(unittest.TestCase):
                 return i
         self.fail(f"no remote command contains {needle!r}: {self.commands()}")
 
+    def run_worker_raw(self, *args, **env):
+        return self.run_script(*args, **env)
+
+    def run_worker(self, *args, **env):
+        """Run, require success, return the remote commands sent."""
+        out = self.run_script(*args, **env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return self.commands()
+
     def test_missing_worker_ssh_fails_without_calling_ssh(self):
-        for sub in ("up", "down", "vram", "health"):
+        for sub in ("up", "down", "vram", "health", "ctx"):
             with self.subTest(sub=sub):
                 out = self.run_script(sub, WORKER_SSH="", **UP_ENV)
                 self.assertNotEqual(out.returncode, 0)
@@ -230,6 +253,170 @@ class WorkerScriptTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(json.loads(out.stdout), {"status": "ok"})
         self.assertIn("127.0.0.1:18080/health", self.commands()[0])
+
+    # --- router mode: the image's own entrypoint (start-server.sh) ---
+
+    def test_router_up_runs_image_entrypoint_with_key_and_models(self):
+        log = self.run_worker("up", MODE="router", MODEL_ALIAS="gemma4-e4b",
+                              MODELS_DIR="/srv/models", BENCH_API_KEY="k-123", CTX="")
+        docker_run = next(l for l in log if "docker run" in l)
+        self.assertNotIn("--entrypoint", docker_run)
+        self.assertIn("/srv/models:/app/models:ro", docker_run)
+        self.assertIn("BONSAI_API_KEY=k-123", docker_run)
+        self.assertIn("BONSAI_PORT=8080", docker_run)
+        self.assertNotIn("QCM_AGENT_CTX", docker_run)
+        self.assertNotIn("BONSAI_CTX", docker_run)
+
+    def test_router_ctx_sets_every_preset_ctx_variable(self):
+        log = self.run_worker("up", MODE="router", MODEL_ALIAS="qwen3.5-9b-q4_k_m",
+                              MODELS_DIR="/srv/models", BENCH_API_KEY="k", CTX="32768")
+        docker_run = next(l for l in log if "docker run" in l)
+        for var in ("QCM_AGENT_CTX=32768", "BONSAI_CTX=32768", "BONSAI_CTX_TEXT=32768"):
+            self.assertIn(var, docker_run)
+
+    def test_router_ctx_covers_every_ctx_variable_start_server_reads(self):
+        """start-server.sh reads QCM_QWEN9_CTX and friends before
+        QCM_AGENT_CTX, and LIVE_ENV_FILE may set them: each one needs an -e
+        override, or the preset keeps the file's context size."""
+        with open(os.path.join(ROOT, "start-server.sh")) as f:
+            source = f.read()
+        names = set(re.findall(r"\$\{((?:BONSAI|QCM)_[A-Z0-9_]*CTX(?:_TEXT)?)[:}-]", source))
+        self.assertTrue({"QCM_QWEN9_CTX", "QCM_GEMMA4_CTX", "BONSAI_CTX"} <= names, names)
+        log = self.run_worker("up", MODE="router", MODEL_ALIAS="qwen3.5-9b-q4_k_m",
+                              MODELS_DIR="/srv/models", BENCH_API_KEY="k",
+                              LIVE_ENV_FILE="/srv/bonsai/.env", CTX="32768")
+        docker_run = next(l for l in log if "docker run" in l)
+        for name in sorted(names):
+            self.assertIn(f"-e {name}=32768 ", docker_run)
+        # -e after --env-file, so these win over the file.
+        self.assertLess(docker_run.index("--env-file"), docker_run.index("-e QCM_QWEN9_CTX="))
+
+    def test_router_without_ctx_sets_no_per_model_ctx(self):
+        log = self.run_worker("up", MODE="router", MODEL_ALIAS="qwen3.5-9b-q4_k_m",
+                              MODELS_DIR="/srv/models", BENCH_API_KEY="k", CTX="")
+        docker_run = next(l for l in log if "docker run" in l)
+        self.assertNotRegex(docker_run, r"QCM_[A-Z0-9]+_CTX")
+
+    def test_router_up_warms_the_chosen_model(self):
+        log = self.run_worker("up", MODE="router", MODEL_ALIAS="granite-4.1-8b-q4_k_m",
+                              MODELS_DIR="/srv/models", BENCH_API_KEY="k", CTX="")
+        self.assertTrue(any("chat/completions" in l and "granite-4.1-8b-q4_k_m" in l for l in log))
+
+    def test_router_mode_needs_a_key(self):
+        result = self.run_worker_raw("up", MODE="router", MODEL_ALIAS="x", MODELS_DIR="/m", BENCH_API_KEY="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("BENCH_API_KEY", result.stderr)
+
+    def test_direct_mode_is_unchanged(self):
+        log = self.run_worker("up", MODE="direct", MODEL_ALIAS="qwen3.5-9b-q4_k_m",
+                              MODEL_FILE="/models/q.gguf", TEMPLATE_FILE="/t.jinja",
+                              MODELS_DIR="/srv/models", CTX="49152", PARALLEL="2")
+        docker_run = next(l for l in log if "docker run" in l)
+        self.assertIn("--entrypoint", docker_run)
+        self.assertIn("--parallel 2", docker_run)
+
+    def test_router_is_the_default_mode(self):
+        log = self.run_worker("up", MODEL_ALIAS="gemma4-e4b", MODELS_DIR="/srv/models",
+                              BENCH_API_KEY="k")
+        docker_run = next(l for l in log if "docker run" in l)
+        self.assertNotIn("--entrypoint", docker_run)
+
+    def test_router_up_stops_live_then_runs_then_warms(self):
+        self.run_worker("up", MODE="router", MODEL_ALIAS="gemma4-e4b",
+                        MODELS_DIR="/srv/models", BENCH_API_KEY="k")
+        stop_live = self.index_of("docker stop bonsai-llama-1")
+        run_test = self.index_of("docker run")
+        ready = self.index_of("docker inspect")
+        warm = self.index_of("chat/completions")
+        self.assertLess(stop_live, run_test)
+        self.assertLess(run_test, ready)
+        self.assertLess(ready, warm)
+
+    def test_router_warm_up_sends_key_on_stdin_not_argv(self):
+        stdin_log = os.path.join(self.tmp.name, "stdin.log")
+        self.run_worker("up", MODE="router", MODEL_ALIAS="gemma4-e4b",
+                        MODELS_DIR="/srv/models", BENCH_API_KEY="warm-secret",
+                        FAKE_SSH_STDIN_LOG=stdin_log)
+        warm = self.commands()[self.index_of("chat/completions")]
+        self.assertNotIn("warm-secret", warm)
+        self.assertIn("-H @-", warm)
+        with open(stdin_log) as f:
+            self.assertIn("Authorization: Bearer warm-secret", f.read())
+
+    def test_router_up_warns_but_succeeds_when_the_model_does_not_load(self):
+        # Spec: a preset missing from the image is a suite error, not a crash.
+        out = self.run_worker_raw("up", MODE="router", MODEL_ALIAS="no-such-preset",
+                                  MODELS_DIR="/srv/models", BENCH_API_KEY="k",
+                                  FAKE_WARM_RC="22")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("::warning::", out.stderr)
+        self.assertIn("no-such-preset", out.stderr)
+
+    def test_router_up_still_dies_when_the_router_is_unhealthy(self):
+        out = self.run_worker_raw("up", MODE="router", MODEL_ALIAS="gemma4-e4b",
+                                  MODELS_DIR="/srv/models", BENCH_API_KEY="k",
+                                  FAKE_TEST_RC="22")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertFalse(any("chat/completions" in c for c in self.commands()))
+
+    def test_router_reads_live_env_file_before_its_own_env(self):
+        log = self.run_worker("up", MODE="router", MODEL_ALIAS="gemma4-e4b",
+                              MODELS_DIR="/srv/models", BENCH_API_KEY="k-123",
+                              LIVE_ENV_FILE="/srv/bonsai/.env", CTX="16384")
+        docker_run = next(l for l in log if "docker run" in l)
+        self.assertIn("--env-file /srv/bonsai/.env", docker_run)
+        self.assertLess(docker_run.index("--env-file"), docker_run.index(" -e "))
+        self.assertIn("-e BONSAI_API_KEY=k-123", docker_run)
+        self.assertIn("-e QCM_AGENT_CTX=16384", docker_run)
+        # The image name stays last.
+        self.assertTrue(docker_run.rstrip().endswith("qcm-rtx-validation:922be44 >/dev/null"))
+
+    def test_router_without_live_env_file_omits_the_flag(self):
+        log = self.run_worker("up", MODE="router", MODEL_ALIAS="gemma4-e4b",
+                              MODELS_DIR="/srv/models", BENCH_API_KEY="k", LIVE_ENV_FILE="")
+        docker_run = next(l for l in log if "docker run" in l)
+        self.assertNotIn("--env-file", docker_run)
+
+    def test_direct_mode_ignores_live_env_file(self):
+        log = self.run_worker("up", LIVE_ENV_FILE="/srv/bonsai/.env", **UP_ENV)
+        docker_run = next(l for l in log if "docker run" in l)
+        self.assertNotIn("--env-file", docker_run)
+
+    def test_router_rejects_non_numeric_ctx(self):
+        out = self.run_worker_raw("up", MODE="router", MODEL_ALIAS="x", MODELS_DIR="/m",
+                                  BENCH_API_KEY="k", CTX="1; rm -rf /")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(self.calls(), [])
+
+    def test_unknown_mode_is_rejected(self):
+        out = self.run_worker_raw("up", MODE="hybrid", MODEL_ALIAS="x", MODELS_DIR="/m",
+                                  BENCH_API_KEY="k")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("MODE", out.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_router_key_never_printed(self):
+        out = self.run_worker_raw("up", MODE="router", MODEL_ALIAS="gemma4-e4b",
+                                  MODELS_DIR="/srv/models", BENCH_API_KEY="print-secret")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("print-secret", out.stdout + out.stderr)
+
+    # --- ctx: the context size the router really gave the preset ---
+
+    def test_ctx_prints_the_preset_context(self):
+        out = self.run_worker_raw("ctx", MODEL_ALIAS="gemma4-e4b", BENCH_API_KEY="k",
+                                  FAKE_PROPS='{"build_info":"b1","default_generation_settings":{"n_ctx":16384}}')
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), "16384")
+        cmd = self.commands()[self.index_of("/props")]
+        self.assertIn("model=gemma4-e4b", cmd)
+        self.assertNotIn("Bearer", cmd)
+
+    def test_ctx_rejects_a_missing_value(self):
+        out = self.run_worker_raw("ctx", MODEL_ALIAS="gemma4-e4b", BENCH_API_KEY="k",
+                                  FAKE_PROPS='{"error":"unauthorized"}')
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(out.stdout.strip(), "")
 
 
 if __name__ == "__main__":
