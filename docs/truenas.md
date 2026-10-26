@@ -87,8 +87,16 @@ Record that image tag and ID. If the build host is separate, export it with
 `docker save --output qcm-image.tar "$qcm_image"`, transfer the archive to
 private NAS storage, then run `docker load --input /absolute/path/to/qcm-image.tar`
 on the NAS. Alternatively, push it to your private registry and use that
-immutable reference. For a registry image, run `docker pull "$QCM_IMAGE"` on
-the NAS after setting `QCM_IMAGE` to that reference. The YAML uses
+immutable reference. For a registry image, set `QCM_IMAGE` in the NAS shell
+before pulling it. Replace this example with your image reference:
+
+```sh
+QCM_IMAGE='registry.example.com/namespace/quickclevermodel:<revision>'
+docker pull "$QCM_IMAGE"
+```
+
+Use the same reference in `truenas.env` below. Editing that environment file
+does not set variables in your current shell. The YAML uses
 `pull_policy: never`, so the image must be cached in the NAS Docker engine
 before installing the app.
 
@@ -116,7 +124,14 @@ the WebUI secret stable across restarts. The API key is shared only between
 the inference service, WebUI and your authorised clients. WebUI login is
 required.
 
-Bindings default to loopback. For remote access, set `LLAMA_BIND2` and
+Bindings default to loopback. For a new WebUI data directory, keep those
+defaults through the first installation and create the administrator account
+through the SSH tunnel described below. Open WebUI
+[makes the first registered user an administrator](https://github.com/open-webui/open-webui/blob/v0.11.3/backend/open_webui/routers/auths.py).
+Create and verify that account before exposing a UI listener on LAN or
+Tailscale, so another network client cannot claim the initial account.
+
+After the administrator account exists, for remote access set `LLAMA_BIND2` and
 `WEBUI_BIND` to a NAS LAN IPv4 address, and optionally `LLAMA_BIND3` and
 `WEBUI_BIND2` to its Tailscale IPv4 address. Each address must exist before app
 start; keep unused bindings at their distinct loopback defaults. API port is
@@ -158,8 +173,21 @@ then save. For an existing custom app, edit its YAML instead. See the official
 The GPU reservation is in the YAML; this app does not need privileged mode.
 
 Wait for both services to run. Check their logs for the expected Prism revision,
-model context and successful model load. Open the UI on your selected address,
-create or use the administrator account, and confirm that login is required.
+model context and successful model load. For a new data directory, keep the UI
+on loopback and open an SSH tunnel from your own computer. Replace `USER` and
+`NAS_HOST` with your configured NAS SSH account and host:
+
+```sh
+ssh -N -L 127.0.0.1:9090:127.0.0.1:9090 USER@NAS_HOST
+```
+
+Open `http://127.0.0.1:9090`, create the administrator account and verify that
+you can sign in and open Admin Settings. Keep `WEBUI_AUTH` enabled. For an
+existing WebUI data directory, verify the existing administrator login instead.
+
+Only then enable any remote listeners: update the private environment file,
+render the YAML again, and save it through the app's custom-YAML editor. Check
+the resulting UI URL and allowed origins before using the remote address.
 Before sharing access, test that unauthenticated `/v1/models` returns 401 and
 authenticated discovery returns exactly the four IDs above.
 
