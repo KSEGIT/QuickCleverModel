@@ -4,6 +4,7 @@
 #
 #   ./install.sh           full install — safe to re-run, every step is idempotent
 #   ./install.sh --check   report what would happen — no changes, no downloads
+#   ./install.sh --codex-client ...  configure this client's Codex, without server setup
 #
 # Orchestrates, in order:
 #   setup-nvidia.sh        NVIDIA driver >= 525, Docker CE, nvidia-container-toolkit
@@ -18,6 +19,12 @@
 # download in fetch-models.sh. This script only sequences them and fills the
 # gaps in between. Re-running after any failure picks up where things left off.
 set -euo pipefail
+
+# Client setup also runs on macOS and must precede all GPU, Linux and sudo checks.
+if [[ "${1:-}" == "--codex-client" ]]; then
+  shift
+  exec "$(cd "$(dirname "$0")" && pwd)/setup-codex.sh" "$@"
+fi
 
 CHECK=0
 [[ "${1:-}" == "--check" ]] && CHECK=1
@@ -235,6 +242,11 @@ cat <<'EOF'
       bonsai-27b-ternary   higher quality, tight on 8 GB at the default ctx
 
     Both ports are loopback-only — see docs/architecture.md "Ports & security".
+
+    Optional Codex client setup (run on the computer using Codex):
+      ./install.sh --codex-client --help
+    It creates local-model profiles and an on-request inference skill.
+    See docs/codex.md for remote clients. Your main GPT default stays unchanged.
 EOF
 
 # Open the UI when there is a desktop session. Backgrounded and detached so
