@@ -1,19 +1,77 @@
 # Runtime validation record
 
-This branch uses Prism `922be44aa6ac81b46f092716351cddff1c1733a7`.
-Live inference below ran on an Apple M5 Metal host with 24 GB unified memory.
-Metal buffer sizes are **not RTX 3070 VRAM measurements**. The x86 CUDA Docker
-image built under emulation (1,550,294,857 bytes), but CUDA inference, old/new image-size
-comparison, 8K/12K/16K fit, flash attention and KV quantisation comparisons on
-the target 8 GB GPU remain **SKIPPED — no SSH access to the NVIDIA host**.
-Do not deploy this branch as an RTX validated runtime yet.
+This branch pins Prism `922be44aa6ac81b46f092716351cddff1c1733a7`.
+The newest deployment checks below cover one installed TrueNAS RTX 3070 app.
+Earlier Metal checks follow as history; their buffer sizes are not RTX VRAM
+measurements. The separate [browser-agent record](browser-agent-validation.md)
+covers partial RTX 3070 Ti trials on a different host.
 
-All test requests used a local server on `127.0.0.1` and synthetic fixture data.
-Raw reports and startup logs are in the gitignored `run/` directory of the
-test worktree. The probe records exact request and response bodies, usage and
+The initial Metal inference requests used a local server on `127.0.0.1` and
+synthetic fixture data. TrueNAS network checks also covered the configured
+LAN and Tailscale listeners. The initial Metal reports and startup logs are in
+the gitignored `run/` directory of the test worktree. The probe records request
+and response bodies, usage and
 timings, but never authentication headers. `PASS` below means the named test
 actually ran and met its assertions; it does not imply agent reliability on a
-different GPU or prompt distribution.
+different GPU or prompt distribution. Private deployment reports are summarised
+here without host addresses, credentials or raw transcripts.
+
+## TrueNAS RTX 3070, 2026-10-25
+
+Hardware: TrueNAS 25.10.7, Ryzen 5 5600X, about 15.55 GiB system memory,
+RTX 3070 with 8,192 MiB VRAM, NVIDIA driver 580.173.02. The installed image was
+`quickclevermodel:de2ee56-truenas`, repository revision `de2ee56`, and reported
+Prism `922be44`. The [version record](runtime-versions.md#truenas-deployment-identity)
+contains the image ID. Historical image build provenance is not confirmed;
+these results do not certify a new build from this release branch.
+
+The [opt-in TrueNAS preset](truenas.md) records the installed settings: one
+resident model, one slot per model, four context checkpoints, 256 MiB host
+prompt cache per model, and ubatch 256. The inference container has an 8 GiB
+memory limit and no extra swap; WebUI has a 2 GiB limit. Qwen uses f16 GPU K/V
+and 99 requested GPU layers. Bonsai uses q4_0 K/V and 99 requested layers;
+Granite uses q4_0 K/V and 32 requested layers. All four use flash attention on.
+
+| Stable model ID | Configured context | Final API checks | Whole-line recall evidence |
+| --- | ---: | ---: | --- |
+| `qwen3.5-9b-q4_k_m` | 65,536, startup default | 20/20 PASS | PASS at 64K with 55,518 prompt tokens |
+| `qwen3.5-4b-q4_k_m` | 32,768 | 20/20 PASS | PASS at 32K; 64K and 128K failed |
+| `bonsai-27b-1bit` | 32,768 | 20/20 PASS | FAIL at 32K and 64K |
+| `granite-4.1-8b-q4_k_m` | 32,768 | 19/20; FAIL | FAIL at 64K; no 32K recall pass recorded |
+
+The aggregate API result is **FAIL, 79/80 passed**. Granite's Messages
+conversation with two distinct tools did not use the second tool's result.
+This is a model/API failure even though the containers stayed healthy. The
+Qwen results include the tracked Qwen template fix; earlier native-template
+Responses failures below do not describe this final configuration.
+
+Qwen9's 64K recall trial read back an actual context of 65,536 and retained at
+least 601 MiB free GPU memory. The final API run sampled a minimum of 599 MiB
+free while testing Qwen9. Those margins apply to these trials, without a
+second resident model or other GPU workload. All four final API runs recorded
+zero cgroup OOM events. No tested 128K configuration passed all trial criteria:
+trials failed exact recall, the memory-margin check, or worker startup.
+Configured context size alone does not prove reliable recall.
+
+Authenticated discovery returned the four stable IDs. Unauthenticated API
+discovery returned 401 on the tested listeners. WebUI required login, reached
+the local API, accepted the configured exact origins, and rejected an unknown
+origin. Both containers were healthy after the checks, and the TrueNAS app
+remained running. These observations do not replace model tests.
+
+On 2026-10-26 the WebUI display names gained `(64K)` or `(32K)` suffixes while
+all IDs stayed unchanged. A simple API chat smoke passed for all four IDs
+after that edit. This 4/4 smoke result does not resolve Granite's tool failure
+or Bonsai's recall failure.
+
+## Scope of the earlier checks
+
+The remaining sections record the initial Apple M5 Metal tests with 24 GB
+unified memory. At that time, the x86 CUDA image built under emulation
+(1,550,294,857 bytes), but target inference was skipped because SSH access was
+unavailable. Later RTX evidence above and in the browser-agent record replaces
+that blanket access limitation. A full CUDA fit/FA/KV/context matrix, a complete
+Qwen 9B 48-case tool matrix, and all-client certification are still absent.
 
 ## Native model and API checks
 
@@ -146,12 +204,13 @@ agent tasks. One deterministic trial per setting cannot establish reliability.
 These results support keeping Qwen reasoning off as the initial repetitive-tool
 preset, pending task-level tests on the RTX target.
 
-## Current release decision
+## Release limits
 
-Keep the existing Bonsai preset as the default local agent until the official
-PQ2_0 aliases, client workflows and RTX 3070 CUDA matrix pass. The new model
-presets are available for explicit testing; native API results do not justify
-making one the universal default. Qwen native Responses has a multi-system
-template failure relevant to Codex. Claude Code's full prompt does not fit the
-tested 8K setup. Codex MCP namespaces, multimodal Qwen, target VRAM and model
-switch latency have not been verified.
+Standard desktop/Linux defaults remain unchanged. The separate TrueNAS preset
+selects Qwen9 64K from the dated installed-deployment evidence above; it does
+not make Qwen a universal default. The tracked Qwen template fixes the earlier
+Responses multi-system case, but it does not establish every client's
+reliability. The initial Claude 8K prompt failure is still a result for that
+8K setup. Full client acceptance, Codex MCP namespaces, multimodal Qwen and
+the wider CUDA configuration matrix need separate evidence. Keep the old
+image and legacy Q2_0 weights for rollback when migrating ternary Bonsai.

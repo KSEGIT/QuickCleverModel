@@ -1,0 +1,100 @@
+# Opt-in TrueNAS Custom App. Render with --env-file before pasting into
+# Install via YAML; see docs/truenas.md. No repository .env is mounted.
+# All QCM_*_PATH values must be absolute paths on the TrueNAS host.
+services:
+  llama:
+    image: "${QCM_IMAGE:?set QCM_IMAGE to your CUDA image tag}"
+    pull_policy: never
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Equal RAM and RAM+swap limits disable swap (Compose service semantics).
+    mem_limit: 8g
+    memswap_limit: 8g
+    ports:
+      # Replace the second and third loopback addresses with LAN/Tailscale
+      # IPv4 addresses, if needed. Each address must exist before app start.
+      - "${LLAMA_BIND:-127.0.0.1}:8080:8080"
+      - "${LLAMA_BIND2:-127.0.0.2}:8080:8080"
+      - "${LLAMA_BIND3:-127.0.0.3}:8080:8080"
+    volumes:
+      - type: bind
+        source: "${QCM_MODELS_PATH:?set QCM_MODELS_PATH to the absolute models directory}"
+        target: /app/models
+        read_only: true
+        bind:
+          create_host_path: false
+      # The existing entrypoint renders this file to /app/run/models.ini.
+      - type: bind
+        source: "${QCM_PRESET_PATH:?set QCM_PRESET_PATH to the absolute models.truenas.ini.in file}"
+        target: /app/models.ini.in
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      BONSAI_API_KEY: "${BONSAI_API_KEY:?set a private BONSAI_API_KEY}"
+      BONSAI_HOST: "0.0.0.0"
+      BONSAI_PORT: "8080"
+      BONSAI_MODELS_MAX: "1"
+      BONSAI_UBATCH: "256"
+      QCM_AGENT_UBATCH: "256"
+      BONSAI_CACHE_REUSE: "256"
+      QCM_AGENT_CACHE_REUSE: "256"
+      BONSAI_CACHE_RAM: "256"
+      QCM_AGENT_CACHE_RAM: "256"
+      LLAMA_ARG_CTX_CHECKPOINTS: "4"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error
+          --header "Authorization: Bearer $$BONSAI_API_KEY"
+          http://127.0.0.1:8080/health >/dev/null
+      interval: 30s
+      retries: 5
+      start_period: 5m
+      timeout: 10s
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.11.3
+    mem_limit: 2g
+    memswap_limit: 2g
+    ports:
+      - "${WEBUI_BIND:-127.0.0.1}:9090:8080"
+      - "${WEBUI_BIND2:-127.0.0.2}:9090:8080"
+    environment:
+      # Singular and plural forms stay local, even if the host has cloud keys.
+      OPENAI_API_BASE_URL: "http://llama:8080/v1"
+      OPENAI_API_BASE_URLS: "http://llama:8080/v1"
+      OPENAI_API_KEY: "${BONSAI_API_KEY:?set a private BONSAI_API_KEY}"
+      OPENAI_API_KEYS: "${BONSAI_API_KEY:?set a private BONSAI_API_KEY}"
+      ENABLE_PERSISTENT_CONFIG: "false"
+      WEBUI_AUTH: "true"
+      WEBUI_SECRET_KEY: "${WEBUI_SECRET_KEY:?set a private persistent WEBUI_SECRET_KEY}"
+      DEFAULT_MODELS: "qwen3.5-9b-q4_k_m"
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_DIRECT_CONNECTIONS: "false"
+      # Exact HTTP origins follow the two UI bindings. Override for a DNS
+      # name or HTTPS proxy; use semicolon-separated origins, never '*'.
+      WEBUI_URL: "${WEBUI_URL:-http://${WEBUI_BIND:-127.0.0.1}:9090}"
+      CORS_ALLOW_ORIGIN: "${CORS_ALLOW_ORIGIN:-http://${WEBUI_BIND:-127.0.0.1}:9090;http://${WEBUI_BIND2:-127.0.0.2}:9090}"
+      ENABLE_TITLE_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+      ENABLE_AUTOCOMPLETE_GENERATION: "false"
+      ENABLE_RETRIEVAL_QUERY_GENERATION: "false"
+      ENABLE_SEARCH_QUERY_GENERATION: "false"
+    depends_on:
+      - llama
+    volumes:
+      - type: bind
+        source: "${QCM_WEBUI_DATA_PATH:?set QCM_WEBUI_DATA_PATH to the absolute WebUI data directory}"
+        target: /app/backend/data
+        bind:
+          create_host_path: false
+    restart: unless-stopped

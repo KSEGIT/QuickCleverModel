@@ -1,0 +1,94 @@
+; Four-model deployment candidate. Only Qwen9 loads at startup.
+[*]
+metrics = true
+jinja = true
+
+[qwen3.5-9b-q4_k_m]
+model = @ROOT@/models/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf
+chat-template-file = @ROOT@/qwen3.5-chat-template.jinja
+temp = 0.5
+top-p = 0.85
+top-k = 20
+min-p = 0
+c = 65536
+ngl = 99
+fa = on
+ctk = f16
+ctv = f16
+no-kv-offload = false
+parallel = 1
+ubatch-size = @AGENT_UBATCH@
+spec-type = none
+cache-reuse = @AGENT_CACHE_REUSE@
+cache-ram = 256
+reasoning = off
+reasoning-budget = -1
+load-on-startup = true
+
+[qwen3.5-4b-q4_k_m]
+model = @ROOT@/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf
+chat-template-file = @ROOT@/qwen3.5-chat-template.jinja
+temp = 0.5
+top-p = 0.85
+top-k = 20
+min-p = 0
+c = 32768
+ngl = 99
+fa = on
+ctk = f16
+ctv = f16
+no-kv-offload = false
+parallel = 1
+ubatch-size = @AGENT_UBATCH@
+spec-type = none
+cache-reuse = @AGENT_CACHE_REUSE@
+cache-ram = 256
+reasoning = off
+reasoning-budget = -1
+load-on-startup = false
+
+[bonsai-27b-1bit]
+model = @ROOT@/models/Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf
+ngl = 99
+c = 32768
+no-kv-offload = false
+parallel = 1
+fa = on
+ctk = q4_0
+ctv = q4_0
+ubatch-size = @UBATCH@
+reasoning-budget = 4096
+spec-type = @SPEC@
+spec-ngram-mod-n-match = @NGRAM_MOD_N_MATCH@
+spec-ngram-mod-n-min = @NGRAM_MOD_N_MIN@
+spec-ngram-mod-n-max = @NGRAM_MOD_N_MAX@
+cache-reuse = @CACHE_REUSE@
+cache-ram = 256
+temp = 0.5
+top-p = 0.85
+top-k = 20
+min-p = 0
+mmproj = @ROOT@/models/Bonsai-27B-gguf/Bonsai-27B-mmproj-Q8_0.gguf
+chat-template-file = @ROOT@/bonsai-chat-template.jinja
+load-on-startup = false
+
+[granite-4.1-8b-q4_k_m]
+model = @ROOT@/models/granite-4.1-8b-GGUF/granite-4.1-8b-Q4_K_M.gguf
+temp = 0.5
+top-p = 0.85
+top-k = 20
+min-p = 0
+c = 32768
+ngl = 32
+fa = on
+ctk = q4_0
+ctv = q4_0
+no-kv-offload = false
+parallel = 1
+ubatch-size = @AGENT_UBATCH@
+spec-type = none
+cache-reuse = @AGENT_CACHE_REUSE@
+cache-ram = 256
+reasoning = auto
+reasoning-budget = -1
+load-on-startup = false
