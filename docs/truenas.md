@@ -91,7 +91,7 @@ immutable reference. For a registry image, set `QCM_IMAGE` in the NAS shell
 before pulling it. Replace this example with your image reference:
 
 ```sh
-QCM_IMAGE='registry.example.com/namespace/quickclevermodel:<revision>'
+QCM_IMAGE='registry.example.com/namespace/quickclevermodel@sha256:<digest>'
 docker pull "$QCM_IMAGE"
 ```
 
