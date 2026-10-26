@@ -55,6 +55,42 @@ class ServerStartup(unittest.TestCase):
         self.assertEqual(preset["reasoning"], "off")
         self.assertNotIn("@", (self.root / "run/models.ini").read_text())
 
+    def test_truenas_preset_uses_existing_renderer_and_download_filter(self):
+        shutil.copyfile(ROOT / "docker/models.truenas.ini.in", self.root / "models.ini.in")
+        model_files = {
+            "qwen3.5-9b-q4_k_m": "Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf",
+            "qwen3.5-4b-q4_k_m": "Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf",
+            "bonsai-27b-1bit": "Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf",
+            "granite-4.1-8b-q4_k_m": "granite-4.1-8b-GGUF/granite-4.1-8b-Q4_K_M.gguf",
+        }
+        for relative_path in model_files.values():
+            model = self.root / "models" / relative_path
+            model.parent.mkdir(parents=True, exist_ok=True)
+            model.touch()
+        projector = self.root / "models/Bonsai-27B-gguf/Bonsai-27B-mmproj-Q8_0.gguf"
+        projector.touch()
+        result = self.run_launcher(BONSAI_UBATCH="256", QCM_AGENT_UBATCH="256")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        presets = self.presets()
+        self.assertEqual(set(presets.sections()), {"*", *model_files})
+        self.assertEqual([name for name in model_files
+                          if presets.getboolean(name, "load-on-startup")],
+                         ["qwen3.5-9b-q4_k_m"])
+        for name, relative_path in model_files.items():
+            with self.subTest(model=name):
+                self.assertEqual(presets[name]["model"],
+                                 str(self.root / "models" / relative_path))
+                self.assertEqual(presets[name]["ubatch-size"], "256")
+        self.assertEqual(presets["bonsai-27b-1bit"]["mmproj"], str(projector))
+        self.assertNotIn("@", (self.root / "run/models.ini").read_text())
+
+        # A stale mounted preset must not advertise an absent optional weight.
+        (self.root / "models" / model_files["granite-4.1-8b-q4_k_m"]).unlink()
+        result = self.run_launcher(BONSAI_UBATCH="256", QCM_AGENT_UBATCH="256")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(self.presets().sections()),
+                         {"*", *model_files} - {"granite-4.1-8b-q4_k_m"})
+
     def test_bad_context_fails_before_start(self):
         result = self.run_launcher(QCM_AGENT_CTX="huge")
         self.assertNotEqual(result.returncode, 0)

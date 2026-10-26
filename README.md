@@ -18,15 +18,21 @@ browser.
 
 ## Quick setup
 
-This branch upgrades Prism and adds Qwen3.5 9B/4B and Granite 4.1 8B Q4_K_M.
+The proposed [v1.2.0 release](docs/releases/v1.2.0.md) upgrades Prism and adds
+Qwen3.5 9B/4B and Granite 4.1 8B Q4_K_M.
 Read the [runtime migration and version record](docs/runtime-versions.md)
 before updating an existing installation. The legacy ternary Q2_0 file must
 remain for rollback; `./fetch-models.sh bonsai` downloads its official PQ2_0
-replacement separately. Target RTX validation is still pending.
+replacement separately. The [TrueNAS guide](docs/truenas.md) provides an opt-in
+four-model custom app: Qwen 9B at 64K by default, with Qwen 4B, Bonsai 1-bit
+and Granite at 32K. Its installed RTX 3070 deployment has dated test evidence;
+Granite still fails one API tool case. This does not validate every CUDA
+setting or a newly built release image.
 
 Download new text models with `./fetch-models.sh agents` (about 13.8 GB), then
-restart to expose them in model discovery. They use native templates and 8K
-starting contexts. `./version.sh` prints pins and installed build information
+restart to expose them in model discovery. The standard desktop/Linux presets
+start these models at 8K; the TrueNAS preset is separate. `./version.sh` prints
+pins and installed build information
 without network access. See [API and client tests](docs/runtime-testing.md).
 Current PASS, FAIL and SKIPPED results are in the
 [runtime validation record](docs/runtime-validation.md).
@@ -44,7 +50,7 @@ file. `--all` still downloads every catalogue artifact, including alternatives
 (about 92 GiB of weights); check disk space first. See [browser-agent models](docs/browser-agent-models.md)
 and [the opt-in Playwright benchmark](docs/playwright-agent-benchmark.md).
 See [validation status](docs/browser-agent-validation.md) before choosing a
-production browser-agent model; RTX 3070 Ti comparisons are still pending.
+production browser-agent model; the recorded RTX comparisons are partial.
 OpenCode's generated model list is static; it may show either new alias before
 its selected GGUF exists. The router advertises an alias only after that file
 is installed. Keep `QCM_QWEN36_QUANT` or `QCM_GEMMA4_QUANT` aligned with the
@@ -176,6 +182,8 @@ On macOS, update by hand: `git pull` then `make restart`.
 - [docs/decisions.md](docs/decisions.md) — why we built it this way, with measured evidence.
 - [docs/tuning.md](docs/tuning.md) — speed numbers measured on this machine.
 - [docs/macos.md](docs/macos.md) — setup and day-to-day use on a Mac.
+- [docs/truenas.md](docs/truenas.md) — the opt-in TrueNAS 25.10 custom app, tested settings, and rollback.
+- [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) — proposed release notes and migration limits.
 - [docs/updating.md](docs/updating.md) — how updates and the weekly timer work.
 - [docs/codex.md](docs/codex.md) — using Codex CLI with this server as the model.
 - [docs/claude-code.md](docs/claude-code.md) — same for Claude Code, which also gets MCP.

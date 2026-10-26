@@ -1,7 +1,12 @@
 # Runtime upgrade status
 
-This is an **unreleased, RTX-unvalidated upgrade**. The branch's production
-`docker/Dockerfile` pins the maintained Prism revision. Before deploying it,
+This is the runtime record for the **proposed v1.2.0 release**, not a published
+release. The tracked `docker/Dockerfile` pins the maintained Prism revision.
+The installed TrueNAS RTX 3070 deployment was checked on 2026-10-25 and its
+display labels on 2026-10-26. That evidence has limits: 79/80 API checks passed,
+and it does not certify a fresh build of this branch. See the
+[dated validation record](runtime-validation.md#truenas-rtx-3070-2026-10-25).
+Before deploying the ternary aliases,
 download the official PQ2_0 ternary artifact; the historical Q2_0 file cannot
 load in this revision. Keep the old image and Q2_0 file for rollback.
 Run `./version.sh` offline to distinguish configured pins from an installed
@@ -99,8 +104,10 @@ runtime image is 1,550,294,857 bytes (`docker image inspect`) and its labels
 contain the pinned Prism SHA, upstream baseline and CUDA version. Its server
 binary cannot start without `libcuda.so.1` on this GPU-less Docker host; the
 NVIDIA container runtime must supply the driver on the target. CUDA inference
-on the RTX target remains **SKIPPED**: SSH to the configured
-remote host was rejected for the available key. The old CUDA image is not
+was **SKIPPED in that initial build check** because SSH access was unavailable.
+Later RTX checks are recorded in [browser-agent-validation.md](browser-agent-validation.md)
+and the [TrueNAS validation section](runtime-validation.md#truenas-rtx-3070-2026-10-25).
+The old CUDA image was not
 available in this Docker daemon for a size comparison. Base digests and source
 are pinned; apt repository contents are not a bit-for-bit package lock.
 
@@ -111,14 +118,14 @@ Checked against the pinned revision's `common/arg.cpp`, `common/preset.cpp` and
 
 | Area | Decision |
 | --- | --- |
-| Jinja/templates | Keep `jinja=true`. Custom template only for three Bonsai aliases; native GGUF templates for Qwen/Granite. |
+| Jinja/templates | Keep `jinja=true`. Bonsai uses its custom template; Qwen3.5 uses the tracked template with the Responses multi-system fix; Granite uses its native GGUF template. |
 | Offload | Keep layer count configurable per model; 99 requests full layer offload. Fit is not proof that the full model fits an 8 GB GPU. |
 | Flash attention | Keep prior Bonsai `on`; new families start at `auto`, separately configurable. No CUDA performance claim. |
-| Context | 8192 common floor; separate Qwen9/Qwen4/Granite settings. 12K/16K target-GPU validation remains required. |
+| Context | Standard presets retain their 8192 floor and per-family settings. The separate TrueNAS preset uses Qwen9 65536 and the other three models 32768; see its dated results. This is not a pass for every context size. |
 | KV cache | Keep previous Bonsai Q4 setting; new agents begin with f16. Expose symmetric q8_0 for comparison. Quantised V needs FA. |
 | Batch/ubatch | Retain runtime batch default; new agents use ubatch 256. No blanket increase. |
 | Parallel/residency | One slot per new agent; one resident model by default. Actual switch latency remains unmeasured. |
-| Prompt cache | Retain supported cache controls, cap new agents' host cache at 1024 MiB. Cache allocation is distinct from GPU KV memory. |
+| Prompt cache | Standard agent presets use a 1024 MiB host cache cap; the TrueNAS preset uses 256 MiB and four checkpoints. Host cache allocation is distinct from GPU KV memory. |
 | Reasoning | Qwen starts `reasoning=off`, separate optional budget. Granite uses native `auto` and unrestricted budget rather than Bonsai's 4096. |
 | Template arguments | Use supported `reasoning` CLI option; `enable_thinking` CLI kwargs are deprecated. Per-request kwargs remain supported. |
 | Speculation | New agents use `none`; retain existing Bonsai ngram configuration. No unmeasured drafter added. |
@@ -128,6 +135,25 @@ Checked against the pinned revision's `common/arg.cpp`, `common/preset.cpp` and
 Do not treat older Metal tuning notes as measurements for the new CUDA build.
 CUDA graphs, batching, cache changes and optional drafters have not been tuned.
 Reliability tests and target-GPU measurements must precede default changes.
+
+## TrueNAS deployment identity
+
+The tested installation used repository revision
+`de2ee5648fe3921e69cfa6f19f11dd9f38952663`, image tag
+`quickclevermodel:de2ee56-truenas`, and image ID
+`sha256:63fa0905dac3252381e6b9289c0360e52493889a2de78489250597624081e20d`.
+Its server reported Prism `922be44`; the tag and recorded revision do not
+establish which Dockerfile built that image. The [TrueNAS guide](truenas.md)
+now documents a build from the tracked Dockerfile. That procedure is new and
+must be checked on the target before replacing a working image.
+
+The packaged TrueNAS configuration uses an 8 GiB inference-container memory
+limit with no extra swap, a 2 GiB WebUI limit, and one resident model. It mounts
+the exact four-model preset without changing the standard presets. Its Qwen9
+64K setting passed one 55,518-token whole-line recall probe; Bonsai failed the
+32K recall probe and Granite failed one Messages tool-result check. See
+[runtime-validation.md](runtime-validation.md#truenas-rtx-3070-2026-10-25) for
+the remaining limits. No tested 128K configuration passed all trial criteria.
 
 ## Dependency changes
 
