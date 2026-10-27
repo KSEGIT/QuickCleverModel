@@ -1,4 +1,6 @@
 """Offline HTTP contract tests for the installed inference helper."""
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -10,9 +12,13 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / '.agents/skills/quickclevermodel-inference'
+SPEC = importlib.util.spec_from_file_location('qcm_inference', SKILL / 'scripts/inference.py')
+INFERENCE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(INFERENCE)
 
 
 class InferenceTests(unittest.TestCase):
@@ -169,6 +175,31 @@ class InferenceTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('test-secret-token', result.stderr)
         self.assertEqual(self.calls, [])
+
+    def test_http_transport_warning_allows_remote_endpoints(self):
+        config = json.loads(self.config.read_text())
+        for base, warn in (
+                ('http://127.0.0.1/v1', False),
+                ('http://127.0.0.2/v1', False),
+                ('http://[::1]/v1', False),
+                ('http://localhost/v1', False),
+                ('http://192.168.1.10/v1', True),
+                ('http://100.64.0.1/v1', True),
+                ('http://inference.internal/v1', True),
+                ('https://inference.internal/v1', False)):
+            with self.subTest(base=base), \
+                    mock.patch.object(INFERENCE.urllib.request.OpenerDirector, 'open', return_value=io.BytesIO(b'{}')) as opened, \
+                    mock.patch('sys.stderr', new_callable=io.StringIO) as stderr:
+                self.assertEqual(INFERENCE.request({**config, 'base_url': base}, '/models', 1), {})
+                self.assertEqual(opened.call_count, 1)
+                self.assertEqual(opened.call_args.args[0].full_url, base + '/models')
+                if warn:
+                    self.assertIn('Warning: non-loopback HTTP', stderr.getvalue())
+                    self.assertIn('HTTPS or a protected tunnel/network', stderr.getvalue())
+                    self.assertNotIn('test-secret-token', stderr.getvalue())
+                    self.assertNotIn(base, stderr.getvalue())
+                else:
+                    self.assertEqual(stderr.getvalue(), '')
 
     def test_missing_text_and_malformed_responses_fail_safely(self):
         for payload in ({'output': []}, {'output': None}, {'error': 'test-secret-token'}):

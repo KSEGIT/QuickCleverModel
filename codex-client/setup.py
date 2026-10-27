@@ -32,7 +32,7 @@ def dotenv(path):
     """Read assignments as data, never as shell code."""
     result = {}
     if path.is_file():
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding='utf-8').splitlines():
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
@@ -234,7 +234,7 @@ def run():
         fail('Use a connect address, not a wildcard bind address.')
     if not url.endswith('/v1'):
         url += '/v1'
-    key = args.key_file.read_text().strip() if args.key_file else settings.get('BONSAI_SERVER_KEY') or settings.get('BONSAI_API_KEY', '')
+    key = args.key_file.read_text(encoding='utf-8').strip() if args.key_file else settings.get('BONSAI_SERVER_KEY') or settings.get('BONSAI_API_KEY', '')
     if not key or '\n' in key or '\r' in key:
         fail('Provide a key file or BONSAI_SERVER_KEY/BONSAI_API_KEY.')
     discovered = request(url + '/models', key)
@@ -270,10 +270,10 @@ def run():
     for path in (home / 'quickclevermodel', managed, config_path):
         if path.is_symlink():
             fail('Refusing symlink at managed configuration path.')
-    text = config_path.read_text() if config_path.exists() else ''
+    text = config_path.read_text(encoding='utf-8') if config_path.exists() else ''
     cfg = tomllib.loads(text)
     manifest_path = managed / 'manifest.json'
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else None
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else None
     begin = '# BEGIN quickclevermodel ' + args.name
     end = '# END quickclevermodel ' + args.name
     old_block = ''
@@ -336,7 +336,7 @@ def run():
     if skill.exists():
         if not skill_manifest.is_file():
             fail('Global skill path exists without setup ownership.')
-        owned = json.loads(skill_manifest.read_text())
+        owned = json.loads(skill_manifest.read_text(encoding='utf-8'))
         actual = {str(p.relative_to(skill)): digest(p) for p in skill.rglob('*') if p.is_file() and p != skill_manifest and '__pycache__' not in p.parts}
         if owned != actual:
             fail('Global skill was changed; restore it before updating.')
@@ -357,8 +357,8 @@ def run():
         write(managed / name, content)
     for rel, content in sources.items():
         private_dir((skill / rel).parent)
-        write(skill / rel, content)
-    # Retain backups, but exclude them from the skill ownership snapshot.
+        write(skill / rel, content, backup=False)
+    # Skill files are replaced without backups; snapshot the installed package.
     checksums = {str(p.relative_to(skill)): digest(p) for p in skill.rglob('*') if p.is_file() and p != skill_manifest and '__pycache__' not in p.parts}
     write(skill_manifest, (json.dumps(checksums, sort_keys=True) + '\n').encode(), backup=False)
     write(config_path, new_text.encode())

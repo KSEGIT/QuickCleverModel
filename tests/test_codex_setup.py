@@ -144,6 +144,19 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(cfg['profiles']['qcm']['model'], 'new')
         self.assertNotIn('qcm-small', cfg['profiles'])
 
+    def test_utf8_files_under_ascii_locale(self):
+        self.original += '# Configuration café\n'
+        self.config.write_text(self.original, encoding='utf-8')
+        self.key.write_text('\u2003' + TOKEN + '\u2003', encoding='utf-8')
+        dotenv = self.root / 'env'
+        dotenv.write_text('# Réglages\n', encoding='utf-8')
+        env = {'LC_ALL': 'C', 'PYTHONUTF8': '0', 'PYTHONCOERCECLOCALE': '0',
+               'BONSAI_ENV_FILE': str(dotenv)}
+        for _ in range(2):
+            result = self.run_setup(extra_env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(self.config.read_text(encoding='utf-8').startswith(self.original))
+
     def test_check_does_not_write(self):
         result = self.run_setup('--check')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -309,11 +322,13 @@ class SetupTest(unittest.TestCase):
     def test_literal_dotenv_and_no_bind_address_fallback(self):
         env = self.root / 'env'
         env.write_text('BONSAI_SERVER_URL=' + self.url + '\nBONSAI_API_KEY=' + TOKEN + '\nBONSAI_HOST=0.0.0.0\nUNUSED=$(touch should-not-exist)\n')
+        child_env = {k: v for k, v in os.environ.items() if not k.startswith(('BONSAI_', 'QCM_'))}
+        child_env.update(CODEX_HOME=str(self.home), BONSAI_ENV_FILE=str(env),
+                         PATH=str(self.bin) + os.pathsep + child_env['PATH'])
         result = subprocess.run(['bash', str(SCRIPT), '--check', '--skills-dir', str(self.root / 'skills')],
-                                capture_output=True, text=True, env={**os.environ, 'CODEX_HOME': str(self.home),
-                                'BONSAI_ENV_FILE': str(env), 'PATH': str(self.bin) + os.pathsep + os.environ['PATH']})
+                                capture_output=True, text=True, env=child_env, cwd=self.root)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((ROOT / 'should-not-exist').exists())
+        self.assertFalse((self.root / 'should-not-exist').exists())
 
     def test_skill_update_and_multiple_clients_keep_latest_default(self):
         self.installed()
@@ -322,6 +337,7 @@ class SetupTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         marker = self.root / 'skills/quickclevermodel-inference/client-path'
         self.assertIn('/other/client.json', marker.read_text())
+        self.assertFalse(list(marker.parent.rglob('*.bak-*')))
 
     def test_redirect_never_receives_credentials(self):
         # Redirects are errors, including when a gateway points at another host.

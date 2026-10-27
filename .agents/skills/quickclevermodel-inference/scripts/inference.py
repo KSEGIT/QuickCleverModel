@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Send one chosen task to a configured Responses-compatible local endpoint."""
 import argparse
+import ipaddress
 import json
 import math
 import os
@@ -41,6 +42,13 @@ def request(config, endpoint, timeout, body=None):
     url = urlsplit(base)
     if url.scheme not in ('http', 'https') or not url.hostname or url.username is not None or url.password is not None or url.query or url.fragment:
         raise SafeError('Invalid endpoint configuration.')
+    if url.scheme == 'http':
+        try:
+            loopback = ipaddress.ip_address(url.hostname).is_loopback
+        except ValueError:
+            loopback = url.hostname == 'localhost'
+        if not loopback:
+            print('Warning: non-loopback HTTP sends credentials and task content without transport encryption; use HTTPS or a protected tunnel/network.', file=sys.stderr)
     key = Path(config['key_file']).expanduser().read_text().strip()
     if not key or '\n' in key or '\r' in key:
         raise SafeError('Invalid credential file.')
