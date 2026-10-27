@@ -1,186 +1,122 @@
-# Codex CLI against Bonsai
+# Codex with your inference server
 
-Use your own server as the model behind [Codex CLI](https://developers.openai.com/codex/cli).
-No proxy in the middle: Codex talks to llama-server directly.
+Keep GPT as your main Codex model and ask it to use local inference for a selected
+task, or run a whole Codex session with a local model. Client setup installs both
+options. Run it on the computer where you use Codex; installing the TrueNAS server
+does not configure another computer automatically.
 
-Written against codex-cli 0.154. Codex moves fast — if a key here is rejected,
-check `codex --help` and the current docs before assuming this page is right.
+## Set up the client
 
-## Before you start
+You need Python 3.11 or later, an installed Codex CLI, a reachable inference API,
+and that server's API key. Setup uses the installed CLI's catalog format. It
+does not install or upgrade Codex.
 
-Three things must be true.
-
-1. The stack is up. `docker compose --env-file .env -f docker/compose.linux.yaml ps`
-   shows the `llama` service running.
-2. You can reach it. The API binds a Tailscale address, not loopback, so
-   Tailscale must be up on both machines. `curl localhost:8080` from the server
-   returns nothing — that is expected, see
-   [architecture.md](architecture.md#ports--security).
-3. You have `BONSAI_API_KEY` from the server's `.env`.
-
-Check all three at once:
+On the inference machine, with the key already in the repository's `.env`:
 
 ```bash
-# Missing key: 401
-curl -sS -o /dev/null -w '%{http_code}\n' \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"bonsai-27b-ternary-text","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
-  http://100.x.y.z:8080/v1/responses
-
-# Invalid key: 401
-curl -sS -o /dev/null -w '%{http_code}\n' \
-  -H 'Authorization: Bearer not-the-bonsai-key' \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"bonsai-27b-ternary-text","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
-  http://100.x.y.z:8080/v1/responses
-
-# Valid key: 200
-curl -sS -o /dev/null -w '%{http_code}\n' \
-  -H "Authorization: Bearer $BONSAI_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"bonsai-27b-ternary-text","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
-  http://100.x.y.z:8080/v1/responses
+./setup-codex.sh
 ```
 
-The three calls should return `401`, `401`, and `200`, respectively. `200` and
-you are ready.
-
-**Do not test with `/v1/models`.** That route answers without a key, so it
-returns `200` even when your key is wrong, and it will tell you the setup works
-when it does not. Use `/v1/responses` to check the key for this Codex setup.
-
-## Configure it
-
-Two files. The provider goes in `~/.codex/config.toml`:
-
-```toml
-[model_providers.bonsai]
-name = "Bonsai"
-base_url = "http://100.x.y.z:8080/v1"
-env_key = "BONSAI_API_KEY"
-wire_api = "responses"
-request_max_retries = 2
-stream_max_retries = 3
-# A slow local model streams for a long time. The default gives up too early.
-stream_idle_timeout_ms = 600000
-```
-
-The profile goes in its own file, `~/.codex/bonsai.config.toml`:
-
-```toml
-model = "bonsai-27b-ternary-text"
-model_provider = "bonsai"
-model_context_window = 65536
-```
-
-Two traps here:
-
-- **`wire_api` must be `responses`.** Codex removed `wire_api = "chat"`; it is
-  now a hard error that tells you to use `responses`. This works only because
-  llama-server serves `/v1/responses` as well as `/v1/chat/completions`.
-- **The profile does not go in `config.toml`.** A `[profiles.bonsai]` table
-  there is refused, with an error telling you to move it to
-  `~/.codex/bonsai.config.toml`. Put it in its own file from the start.
-
-## Run it
-
-Codex reads the key from the environment. On the client, keep only this key in
-a client-side environment file, then export it:
+On a separate client, keep the server key in a private text file containing only
+the key, then run:
 
 ```bash
-BONSAI_ENV_FILE="$HOME/.config/bonsai.env" # contains only BONSAI_API_KEY=...
-set -a && . "$BONSAI_ENV_FILE" && set +a
-codex -p bonsai                    # interactive
-codex exec -p bonsai 'your prompt' # one-shot
+chmod 600 "$HOME/.config/qcm-api-key"
+./setup-codex.sh --base-url http://SERVER_ADDRESS:8080/v1 --key-file "$HOME/.config/qcm-api-key" --name qcm
 ```
 
-Without the key you get `Missing environment variable: BONSAI_API_KEY`. To
-avoid exporting it every session, put `export BONSAI_API_KEY=...` in your
-`~/.zshrc`, or wrap it:
+The installer provides the same client-only entrypoint:
 
 ```bash
-BONSAI_REPO=/path/to/QuickCleverModel
-BONSAI_ENV_FILE="$HOME/.config/bonsai.env"
-bonsai() { (cd "$BONSAI_REPO" && set -a && . "$BONSAI_ENV_FILE" && set +a && codex -p bonsai "$@"); }
+./install.sh --codex-client --base-url http://SERVER_ADDRESS:8080/v1 --key-file "$HOME/.config/qcm-api-key" --name qcm
 ```
 
-## Which model
+It runs on macOS or Linux and skips server installation. Normal `./install.sh`
+still installs the Linux inference stack and prints client setup instructions.
+Use an address reachable through the LAN, Tailscale, or an SSH tunnel. Port 8080
+is the inference API; port 9090 is the chat UI.
 
-`bonsai-27b-ternary-text` is the default in the profile above, and it is the
-right one for agent work. It is the same weights as `bonsai-27b-ternary` with
-no `mmproj`, so it cannot see images — but loading vision disables the prompt
-cache for **every** turn, and an agent re-sends a long conversation on each
-step. Text-only keeps multi-turn caching, which matters far more here than
-image input. See the comment on that section in `models.ini.in`.
+Setup authenticates model discovery and makes a bounded Responses API request
+before writing settings. It creates a profile for every advertised model and a
+main `qcm` profile. Use `--model EXACT_MODEL_ID` to choose the main profile's model.
+Context limits come from server presets or metadata. If the server does not
+report its configured context, supply `--context-window TOKENS`. A model's
+training limit does not prove the context available on your GPU.
 
-Switch per run with `-m`:
+Setup reads `.env` as data, without executing shell commands. `BONSAI_SERVER_URL`
+selects a remote connect URL. `BONSAI_SERVER_KEY` takes precedence over
+`BONSAI_API_KEY`. `BONSAI_ENV_FILE` selects another dotenv file. Bind settings such
+as `BONSAI_HOST=0.0.0.0` do not select the client's address.
 
-| model | when |
-|---|---|
-| `bonsai-27b-ternary-text` | agent and coding work — the default |
-| `bonsai-27b-ternary` | you need to send an image |
-| `bonsai-27b-1bit` | smaller and faster, lower quality |
+## Ask GPT to use local inference
 
-Only one model is resident at a time (`--models-max 1`). Switching unloads the
-other, which takes seconds and can briefly return
-`model name=... failed to load` while it swaps. Retry.
+Keep your usual GPT session and ask:
 
-## What to expect
+> Use my TrueNAS inference to review this function, then check its findings yourself.
 
-Around 15 tokens per second on an RTX 3070 Ti. A short turn with one tool call
-takes 15 to 40 seconds. That is usable for small, well-scoped tasks and painful
-for a long refactor. Numbers: [tuning.md](tuning.md).
+For explicit skill selection:
 
-Tool calling works — the model returns proper `tool_calls` with valid JSON
-arguments, and Codex completes the full round trip.
+> Use $quickclevermodel-inference to draft tests for this function, then review the result.
 
-Codex prints `Model metadata for bonsai-27b-ternary-text not found` on every
-run. It is harmless: Codex keeps a catalogue of its own models and yours is not
-in it, so it falls back to defaults. `model_context_window` in the profile is
-what supplies the number that matters.
+The skill calls the server for the requested task. GPT keeps control and checks
+the returned text. It sends the selected prompt and context, rather than the
+whole conversation. The helper does not execute model-proposed commands. Setup
+does not enable automatic routing.
 
-## The chat template
+The global skill lives in `~/.agents/skills/quickclevermodel-inference`. Start a
+new Codex session if it does not appear. With many installed skills, Codex can
+omit descriptions from the initial context; explicitly select the skill when
+needed. See the [official skills guide](https://learn.chatgpt.com/docs/build-skills).
 
-The template baked into the Bonsai GGUFs only renders the first system message
-and raises `System message must be at the beginning.` for any after it. Codex
-sends two — one from the Responses API `instructions` field, one from a
-`developer` item it includes in every request — so **every** Codex call
-returned `400 Unable to generate parser for this template`.
+## Run a fully local session
 
-`bonsai-chat-template.jinja` in the repo root fixes this, and each model
-section in `models.ini.in` points at it with `chat-template-file`. If you see
-that 400 again, the server is running without it: check that
-`chat-template-file` reached `run/models.ini`, and rebuild so the template is
-in the image.
+From the project you want to edit:
 
-Other clients were never affected. OpenCode and plain `curl` send one system
-message, so they never hit the raise.
+```bash
+codex --profile qcm
+```
 
-## Other tools
+Use `/model` to select another discovered model, or a per-model profile command
+printed by setup. The catalog supplies each model's context limit when you switch.
+Setup preserves your GPT default, unrelated providers, and other settings. See
+the [official configuration guide](https://learn.chatgpt.com/docs/config-file/config-advanced).
 
-Anything that speaks the OpenAI API works the same way — point it at
-`http://100.x.y.z:8080/v1` with your key. `setup-opencode.sh` does this for
-OpenCode, including a drift check against `.env`.
+## Saved files and refresh
 
-Claude Code speaks the Anthropic Messages API rather than the OpenAI one, and
-needs no proxy: this server answers `/v1/messages` as well. See
-[claude-code.md](claude-code.md).
+Codex config uses `$CODEX_HOME`, or `~/.codex` when unset. For `--name qcm`, setup
+saves the private key, `client.json`, and `models.json` under
+`quickclevermodel/qcm/`, and creates `qcm.config.toml` plus per-model profiles.
+It adds a provider to `config.toml`, with a backup before changes. The key file
+has mode 600. Profiles and the catalog contain its path, not the key value.
+Keep key files outside Git.
 
-## MCP does not work here
+The installed skill and helper work after the source checkout is removed. Run
+the same setup command again after changing the key, models, or context settings.
+Setup updates its managed files and refuses unrelated collisions. A different
+`--name` creates another connection. The most recent setup is the skill's default;
+the helper's `--config PATH` selects another saved connection.
 
-Codex sends each MCP server as a single tool of `type: "namespace"`, with the
-real tools nested inside it. llama.cpp does not implement that type, so the
-model never sees them. Measured against this server with one identical tool
-sent both ways:
+Add `--check` to validate the connection and prospective setup without writing
+client files. Include the same URL and key-file options for a remote server:
 
-| tool shape | model calls it |
-|---|---|
-| namespace-wrapped, as Codex sends MCP | no |
-| the same tool, flat | yes |
+```bash
+./setup-codex.sh --check
+```
 
-So Playwright, context7 and the rest are unreachable from Codex here, however
-you prompt. The model is not at fault and a bigger model would not help.
+Discovery alone does not prove Responses compatibility. See the
+[official catalog guide](https://learn.chatgpt.com/docs/model-catalogs).
 
-Use Claude Code ([claude-code.md](claude-code.md)) or OpenCode for MCP work:
-both send tool definitions flat, and both drive Playwright against this server.
-Codex remains fine for everything that does not need MCP.
+## Compatibility and limits
+
+Codex requires the Responses API; this stack exposes `/v1/responses`.
+Bonsai needs this repository's `bonsai-chat-template.jinja` for Codex's system
+and developer messages. For `System message must be at the beginning` or a
+template parser error, check the deployed template and rebuild the server image.
+Other model families use their own templates.
+
+Only one model is resident by default. Switching unloads the previous model and
+can delay the first answer. Earlier repository tests found that Codex's
+namespace-wrapped MCP tools were incompatible with llama.cpp. The on-request
+helper sends text without tool definitions and does not depend on local MCP
+support. A text response does not prove that Playwright, Context7, images, or all
+coding tools work. See [runtime tests](runtime-testing.md) for separate checks.

@@ -111,6 +111,22 @@ For Codex CLI specifically, see [docs/codex.md](docs/codex.md); for Claude
 Code, [docs/claude-code.md](docs/claude-code.md) — it is the one that can also
 use MCP servers such as Playwright.
 
+### Codex client setup
+
+On the computer where you use Codex, run:
+
+```bash
+./install.sh --codex-client --base-url http://SERVER_ADDRESS:8080/v1 --key-file "$HOME/.config/qcm-api-key"
+```
+
+The key file must contain your inference server's existing API key. Setup
+discovers its models, creates global Codex profiles and a model catalog, and
+installs the `quickclevermodel-inference` skill. Your main GPT default stays
+unchanged. You can then ask GPT, "Use my TrueNAS inference to review this
+function, then check its findings," or run `codex --profile qcm` for a fully
+local session. See [the client guide](docs/codex.md) for setup on the same
+machine, refresh, and limits.
+
 ## Using it
 
 Two versions of the same model. Pick one in the dropdown:
