@@ -313,7 +313,7 @@ full command line and absolute weight paths**. No credentials leak, but if that
 bothers you, put the box behind a firewall rule rather than relying on the key.
 
 On the Linux/NVIDIA path, **both ports are loopback-only by default**
-(`127.0.0.1:8080` / `:9090`) — the webui runs with `WEBUI_AUTH=false`, so
+(`127.0.0.1:8080` / `:9090`) — the webui runs with `WEBUI_AUTH=false` by default, so
 publishing it would give your whole LAN an unauthenticated chat UI. The API key
 on :8080 is enforced either way.
 
@@ -330,7 +330,7 @@ another machine): two options.
 - Or bind to the Tailscale interface: add `WEBUI_BIND=100.x.y.z` (the box's
   Tailscale IP) to `.env`, then `docker compose --env-file .env -f docker/compose.linux.yaml up -d`
   to recreate. This exposes the **unauthenticated** UI to your whole tailnet —
-  fine on a personal tailnet, otherwise flip `WEBUI_AUTH` to `true` first.
+  fine on a personal tailnet, otherwise set `WEBUI_AUTH=true` in `.env` first.
   `LLAMA_BIND` does the same for :8080 (the API key is enforced there).
 
 On macOS, `make menubar-install` adds `stack.sh` execution as a persistent,
