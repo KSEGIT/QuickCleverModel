@@ -62,13 +62,13 @@ services:
     image: ghcr.io/open-webui/open-webui:v0.11.3
     container_name: bonsai-webui
     ports:
-      # WEBUI_AUTH is false below — loopback by default, or the whole LAN gets
+      # WEBUI_AUTH is false by default — loopback by default, or the whole LAN gets
       # an unauthenticated chat UI. Remote access: set WEBUI_BIND to the
       # machine's Tailscale IP in .env (tailnet-only exposure), or prefer an
       # ssh -L tunnel and leave this alone.
       - "${WEBUI_BIND:-127.0.0.1}:9090:8080"
       # Second listener, same idea as LLAMA_BIND2 above. Set WEBUI_BIND2 to
-      # the second tailscaled's IP in .env. Flip WEBUI_AUTH to true before
+      # the second tailscaled's IP in .env. Set WEBUI_AUTH=true in .env before
       # exposing this beyond your own machines.
       - "${WEBUI_BIND2:-127.0.0.2}:9090:8080"
     environment:
@@ -85,7 +85,9 @@ services:
       # NOTE this sends prompts off the machine — see .env.example.
       OPENAI_API_BASE_URLS: "http://llama:8080/v1${HETZNER_API_KEY:+;${HETZNER_API_BASE:-https://inference.hetzner.com/api/v1}}"
       OPENAI_API_KEYS: "${BONSAI_API_KEY}${HETZNER_API_KEY:+;${HETZNER_API_KEY}}"
-      WEBUI_AUTH: "false"          # single-user local box; flip to true to require login
+      # Login. Set WEBUI_AUTH=true in .env to require it (see .env.example: an
+      # install that already ran without login needs a fresh open-webui-data volume).
+      WEBUI_AUTH: "${WEBUI_AUTH:-false}"
       ENABLE_OLLAMA_API: "false"   # we are not running Ollama
       # Background generations (title, tags, follow-ups...) decode concurrently
       # with your reply and steal bandwidth on a single-GPU box — same reasoning
