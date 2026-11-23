@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # Chat UI safety check for the Docker paths (docker/compose.linux.yaml and
-# docker/compose.yaml). update.sh runs it after every update; run it by hand
-# after you start the stack with WEBUI_AUTH=true.
+# docker/compose.yaml). update.sh runs it after every start or recreate of the
+# chat UI; run it by hand after you start the stack with WEBUI_AUTH=true.
 #
-#   ./webui-guard.sh
+#   ./webui-guard.sh [--wait SECONDS]
+#
+# --wait: with login on, wait up to SECONDS for the chat UI to answer before
+# checking it (default 0: check once). A UI that is still starting is not a
+# UI that is safe.
 #
 # Exit codes:
 #   0  nothing wrong found (or nothing to check)
-#   1  the default no-login admin account works: the UI container was stopped
+#   1  the default no-login admin account works: the UI container was STOPPED
 #   2  .env holds a WEBUI_MODEL that is not a plain model id
-#   3  the default admin works, but the UI container could NOT be stopped
+#   3  the default admin works and the UI container could NOT be stopped:
+#      it is STILL RUNNING and must be stopped by hand
 #
 # Why: Open WebUI with WEBUI_AUTH=false creates one admin account,
 # admin@localhost with password "admin" (backend/open_webui/routers/auths.py,
@@ -29,14 +34,17 @@ ENV_FILE="${QCM_ENV_FILE:-$ROOT/.env}"
 log()  { printf 'webui-guard: %s\n' "$*"; }
 warn() { printf 'webui-guard: WARN %s\n' "$*" >&2; }
 
-# Model ids go into OPENAI_API_CONFIGS as JSON. A quote, comma or bracket
-# would break that JSON or add entries, so allow only plain id characters.
-# update.sh uses the same pattern; tests/test_webui_guard.py keeps them equal.
-MODEL_ID_RE='^[A-Za-z0-9._:/-]+$'
+# shellcheck source=lib/webui.sh
+. "$ROOT/lib/webui.sh" || { warn "cannot read $ROOT/lib/webui.sh"; exit 2; }
 
-webui_model_ok() {
-  [[ -z "${1:-}" || "$1" =~ $MODEL_ID_RE ]]
-}
+WAIT=0
+case "${1:-}" in
+  --wait)
+    WAIT="${2:-0}"
+    [[ "$WAIT" =~ ^[0-9]+$ ]] || { warn "--wait needs a number of seconds"; exit 2; };;
+  "") ;;
+  *) warn "usage: $0 [--wait SECONDS]"; exit 2;;
+esac
 
 if [[ -f "$ENV_FILE" ]]; then
   set -a
@@ -51,8 +59,7 @@ if ! webui_model_ok "${WEBUI_MODEL:-}"; then
   exit 2
 fi
 
-auth="$(printf '%s' "${WEBUI_AUTH:-false}" | tr '[:upper:]' '[:lower:]')"
-if [[ "$auth" != "true" ]]; then
+if ! webui_auth_on; then
   log "WEBUI_AUTH is not true; no login to check"
   exit 0
 fi
@@ -60,10 +67,14 @@ fi
 URL="${QCM_WEBUI_URL:-http://${WEBUI_BIND:-127.0.0.1}:9090}"
 CONTAINER="${QCM_WEBUI_CONTAINER:-bonsai-webui}"
 
-if ! curl -fsS -m 5 -o /dev/null "$URL/health" 2>/dev/null; then
-  log "the chat UI at $URL does not answer; nothing to check"
-  exit 0
-fi
+deadline=$(( SECONDS + WAIT ))
+until curl -fsS -m 5 -o /dev/null "$URL/health" 2>/dev/null; do
+  if (( SECONDS >= deadline )); then
+    log "the chat UI at $URL does not answer; nothing to check"
+    exit 0
+  fi
+  sleep 3
+done
 
 code="$(curl -s -m 15 -o /dev/null -w '%{http_code}' \
   -H 'Content-Type: application/json' \
@@ -78,13 +89,13 @@ fi
 warn "!!! admin@localhost / admin CAN SIGN IN to the chat UI at $URL !!!
 This data volume was made with WEBUI_AUTH=false. With login on, those public
 credentials give anyone who reaches the UI full admin rights.
-Stopping the $CONTAINER container now.
 Fix: back up the open-webui-data volume, then start again with a FRESH
 volume and WEBUI_AUTH=true, and sign up the real admin first. Or set
 WEBUI_AUTH=false in .env to go back to the no-login, loopback-only setup."
 if docker stop "$CONTAINER" >/dev/null 2>&1; then
-  warn "stopped $CONTAINER"
+  warn "stopped the $CONTAINER container"
   exit 1
 fi
-warn "COULD NOT STOP $CONTAINER — stop it by hand now: docker stop $CONTAINER"
+warn "!!! COULD NOT STOP $CONTAINER — the chat UI is STILL RUNNING and STILL
+accepts admin@localhost / admin. Stop it by hand NOW: docker stop $CONTAINER"
 exit 3

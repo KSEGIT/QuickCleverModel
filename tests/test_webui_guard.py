@@ -25,7 +25,13 @@ FAKE_CURL = r"""#!/usr/bin/env bash
 printf 'curl %s\n' "$*" >> "$FAKE_LOG"
 for a in "$@"; do last="$a"; done
 case "$last" in
-  */health) [ "${FAKE_UI_UP:-0}" = 1 ] && exit 0; exit 7;;
+  */health)
+    [ "${FAKE_UI_UP:-0}" = 1 ] && exit 0
+    if [ -n "${FAKE_UI_UP_AFTER:-}" ]; then
+      n=$(grep -c '/health' "$FAKE_LOG")
+      [ "$n" -ge "$FAKE_UI_UP_AFTER" ] && exit 0
+    fi
+    exit 7;;
   */api/v1/auths/signin) printf '%s' "${FAKE_SIGNIN:-400}"; exit 0;;
 esac
 exit 1
@@ -54,7 +60,7 @@ class GuardTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def run_guard(self, env_lines, **fake):
+    def run_guard(self, env_lines, args=(), **fake):
         with open(self.env_file, "w") as fh:
             fh.write("".join(line + "\n" for line in env_lines))
         env = {
@@ -65,8 +71,8 @@ class GuardTest(unittest.TestCase):
             "FAKE_LOG": self.log,
         }
         env.update({k: str(v) for k, v in fake.items()})
-        r = subprocess.run(["bash", GUARD], capture_output=True, text=True,
-                           env=env)
+        r = subprocess.run(["bash", GUARD, *args], capture_output=True,
+                           text=True, env=env)
         with open(self.log) as fh:
             calls = fh.read()
         return r, calls
@@ -105,6 +111,20 @@ class GuardTest(unittest.TestCase):
                               FAKE_SIGNIN=200, FAKE_DOCKER_RC=1)
         self.assertEqual(r.returncode, 3)
         self.assertIn("COULD NOT STOP", r.stderr)
+        self.assertIn("STILL RUNNING", r.stderr)
+        self.assertNotIn("stopped the", r.stderr)
+
+    def test_it_waits_for_a_ui_that_is_still_starting(self):
+        """FAKE_UI_UP_AFTER: /health answers from the Nth call on."""
+        r, calls = self.run_guard(["WEBUI_AUTH=true"], FAKE_UI_UP_AFTER=2,
+                                  FAKE_SIGNIN=400, args=["--wait", "10"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("signin", calls, "it gave up on a UI that was starting")
+
+    def test_without_wait_it_checks_once(self):
+        r, calls = self.run_guard(["WEBUI_AUTH=true"], FAKE_UI_UP_AFTER=2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("signin", calls)
 
     def test_a_bad_model_id_is_refused(self):
         r, calls = self.run_guard(['WEBUI_MODEL=\'a"]},{"x\''])
@@ -117,20 +137,15 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
 
-class ModelIdRulesMatch(unittest.TestCase):
-    """update.sh and webui-guard.sh check WEBUI_MODEL separately; a rule
-    changed in one place only would let one of them pass a bad id."""
+class OneModelIdRule(unittest.TestCase):
+    """update.sh and webui-guard.sh both read the rule from lib/webui.sh."""
 
-    @staticmethod
-    def _pattern(path):
-        with open(path) as fh:
-            found = re.findall(r"^MODEL_ID_RE='([^']+)'$", fh.read(), re.M)
-        return found
-
-    def test_both_scripts_use_the_same_pattern(self):
-        a, b = self._pattern(UPDATE_SH), self._pattern(GUARD)
-        self.assertEqual(len(a), 1, "update.sh must define MODEL_ID_RE once")
-        self.assertEqual(a, b)
+    def test_neither_script_defines_its_own(self):
+        for path in (UPDATE_SH, GUARD):
+            with open(path) as fh:
+                body = fh.read()
+            self.assertNotRegex(body, r"(?m)^\s*(QCM_)?MODEL_ID_RE=", path)
+            self.assertIn("lib/webui.sh", body, path)
 
 
 class OpenWebuiVersionIsNotHandCopied(unittest.TestCase):

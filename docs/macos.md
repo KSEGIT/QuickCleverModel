@@ -82,6 +82,11 @@ docker compose --env-file .env -f docker/compose.yaml up -d
 
 It points at `host.docker.internal:8080`.
 
+Migration note: `docker/compose.yaml` now sets
+`ENABLE_PERSISTENT_CONFIG=false`, like the Linux file. `.env` wins on every
+start, so settings you change in the Open WebUI Admin Panel no longer
+survive a restart. Put them in `.env` instead.
+
 Tunables (env): `BONSAI_CTX` (default 8192), `BONSAI_PORT`, `BONSAI_HOST`,
 `BONSAI_MODELS_MAX` (default 1 — see
 [architecture.md](architecture.md#model-selection)). The model trains to

@@ -91,6 +91,18 @@ log()  { printf '%s  %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 warn() { printf '%s  WARN %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die()  { printf '%s  FAIL %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; exit 1; }
 
+# webui_model_ok and webui_auth_on, shared with webui-guard.sh so the two
+# can never disagree about what a valid WEBUI_MODEL is. Read once, now: a
+# rollback may check out a commit without this file. preflight refuses to go
+# on without it; --help and friends need none of it.
+if [[ -f "$ROOT/lib/webui.sh" ]]; then
+  # shellcheck source=lib/webui.sh
+  . "$ROOT/lib/webui.sh"
+fi
+
+# Set by start_stack when it refused to start the chat UI (see there).
+UI_HELD=0
+
 cleanup() {
   # Remove the DIRECTORY, not the individual paths. The curl config holds the
   # API key, and a path assigned lazily inside a subshell — `ask` reached
@@ -161,16 +173,6 @@ webui_image_in_file() {
 image_ref_ok() {
   # A plain image reference: no spaces, no shell or YAML noise.
   [[ -n "${1:-}" && "$1" =~ ^[A-Za-z0-9._/:@-]+$ ]]
-}
-
-# Model ids go into OPENAI_API_CONFIGS as JSON in docker/compose.linux.yaml.
-# A quote, comma or bracket would break that JSON or add entries, so allow
-# only plain id characters. webui-guard.sh uses the same pattern, and
-# tests/test_webui_guard.py keeps the two equal.
-MODEL_ID_RE='^[A-Za-z0-9._:/-]+$'
-
-webui_model_ok() {
-  [[ -z "${1:-}" || "$1" =~ $MODEL_ID_RE ]]
 }
 
 newest_snapshots_first() {
@@ -753,7 +755,8 @@ webui_container() {
 # different Open WebUI image starts, and records the file in $STATE. <image>
 # is the image to run tar in: the one in use now, so it is already on disk.
 # The container is stopped first, so the SQLite database is copied while
-# nothing writes to it. The archive is made by root inside the container with
+# nothing writes to it. ./cache (downloaded embedding models and the like)
+# is left out: Open WebUI rebuilds it, and it can be gigabytes. The archive is made by root inside the container with
 # umask 077: chats and the secret key stay readable by root only.
 snapshot_webui_data() {
   local img="${1:-}" cid name
@@ -769,7 +772,7 @@ snapshot_webui_data() {
   compose stop open-webui || { warn "could not stop open-webui"; return 1; }
   if ! docker run --rm --volumes-from "$cid" -v "$SNAP_DIR:/snap" \
        --entrypoint sh "$img" -c \
-       'umask 077 && tar -czf "/snap/$1.part" -C /app/backend/data .' sh "$name"; then
+       'umask 077 && tar -czf "/snap/$1.part" --exclude=./cache -C /app/backend/data .' sh "$name"; then
     rm -f -- "$SNAP_DIR/$name.part"
     warn "could not snapshot the open-webui-data volume"
     return 1
@@ -784,14 +787,26 @@ snapshot_webui_data() {
   log "open-webui data saved to $SNAP_DIR/$name"
 }
 
-# restore_webui_data <snapshot> <image>
+# restore_webui_data <snapshot> <image>...
 #
 # Puts a snapshot back into the open-webui-data volume. Run by do_rollback
 # when it returns to an older Open WebUI image, because the newer image may
 # already have migrated the database past what the older one can read. Chats
 # made after the snapshot are lost; the warning says so.
+#
+# tar runs in the first of the given images that is on disk: the old image
+# may have been pruned, and pulling one now could fail. The archive is
+# listed before anything is deleted, and ./cache is kept, as the snapshot
+# left it out.
 restore_webui_data() {
-  local snap="${1:-}" img="${2:-}" cid
+  local snap="${1:-}" img="" cand cid
+  shift
+  for cand in "$@"; do
+    if [[ -n "$cand" ]] && docker image inspect "$cand" >/dev/null 2>&1; then
+      img="$cand"; break
+    fi
+  done
+  [[ -n "$img" ]] || { warn "no open-webui image on disk to run the restore in"; return 1; }
   [[ -f "$snap" ]] || { warn "snapshot $snap is missing"; return 1; }
   cid="$(webui_container)"
   [[ -n "$cid" ]] || { warn "no open-webui container to restore into"; return 1; }
@@ -799,19 +814,128 @@ restore_webui_data() {
   compose stop open-webui || { warn "could not stop open-webui"; return 1; }
   docker run --rm --volumes-from "$cid" -v "$(dirname "$snap"):/snap:ro" \
     --entrypoint sh "$img" -c \
-    'tar -tzf "/snap/$1" >/dev/null && find /app/backend/data -mindepth 1 -delete && tar -xzf "/snap/$1" -C /app/backend/data' \
+    'tar -tzf "/snap/$1" >/dev/null && find /app/backend/data -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf {} + && tar -xzf "/snap/$1" -C /app/backend/data' \
     sh "$(basename "$snap")"
 }
 
+# webui_image_id_now [ref]
+#
+# The ONE key for rollback points and snapshots: the image ID the open-webui
+# container runs. Only when there is no container yet does it fall back to
+# the ID the tag names. Mixing the two let a republished tag look unchanged.
+webui_image_id_now() {
+  local cid id=""
+  cid="$(webui_container)"
+  [[ -n "$cid" ]] && id="$(docker inspect "$cid" --format '{{.Image}}' 2>/dev/null)"
+  [[ -n "$id" ]] || id="$(docker image inspect "${1:-$WEBUI_IMAGE}" --format '{{.Id}}' 2>/dev/null)"
+  printf '%s' "$id"
+}
+
+# Run inside the open-webui image, so it needs nothing on the host. Open
+# WebUI keeps its SQLite database in WAL mode, and new rows (the no-login
+# admin among them) can still sit in webui.db-wal. The volume is mounted
+# read-only, so the database and its WAL are copied to the container's own
+# /tmp and opened there; opening the volume copy with immutable=1 skips the
+# WAL and misses those rows (seen on v0.13.4).
+ADMIN_PROBE_PY='import os, shutil, sqlite3, tempfile
+src = "/app/backend/data"
+if not os.path.exists(os.path.join(src, "webui.db")):
+    print("none"); raise SystemExit
+d = tempfile.mkdtemp()
+for name in ("webui.db", "webui.db-wal"):
+    if os.path.exists(os.path.join(src, name)):
+        shutil.copy(os.path.join(src, name), os.path.join(d, name))
+c = sqlite3.connect(os.path.join(d, "webui.db"))
+try:
+    n = c.execute("select count(*) from user where lower(email) = ?",
+                  ("admin@localhost",)).fetchone()[0]
+except sqlite3.OperationalError:
+    print("none"); raise SystemExit
+print("found" if n else "none")'
+
+# default_admin_in_volume <image>
+#   0  the open-webui-data volume holds admin@localhost — the account Open
+#      WebUI makes while login is off, with the password "admin"
+#   1  it does not (or there is no data yet)
+#   2  could not tell
+# Reads the volume read-only, in a throwaway container with no network.
+default_admin_in_volume() {
+  local img="${1:-}" cid proj vol out
+  local -a mount=()
+  cid="$(webui_container)"
+  if [[ -n "$cid" ]]; then
+    mount=(--volumes-from "$cid:ro")
+  else
+    proj="$(compose config --format json 2>/dev/null \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin).get("name", ""))' 2>/dev/null)"
+    [[ -n "$proj" ]] && vol="$(docker volume ls -q \
+      --filter "label=com.docker.compose.project=$proj" \
+      --filter "label=com.docker.compose.volume=open-webui-data" 2>/dev/null | head -1)"
+    [[ -n "${vol:-}" ]] || return 1
+    mount=(-v "$vol:/app/backend/data:ro")
+  fi
+  [[ -n "$img" ]] && docker image inspect "$img" >/dev/null 2>&1 || return 2
+  out="$(docker run --rm --network none "${mount[@]}" --entrypoint python3 \
+    "$img" -c "$ADMIN_PROBE_PY" 2>/dev/null)"
+  case "$out" in
+    found) return 0;;
+    none)  return 1;;
+    *)     return 2;;
+  esac
+}
+
+# start_stack <compose up options...>
+#
+# `compose up`, except that it never starts the chat UI with WEBUI_AUTH=true
+# over a data volume that holds the old no-login admin account. Open WebUI
+# would accept admin@localhost / admin on its login page. Then only llama is
+# started, open-webui is stopped, UI_HELD=1 tells the caller why the UI is
+# down, and webui-guard.sh stays the second line of defence after a start.
+start_stack() {
+  UI_HELD=0
+  if webui_auth_on; then
+    local rc=0
+    default_admin_in_volume "$WEBUI_IMAGE" || rc=$?
+    if (( rc == 0 )); then
+      UI_HELD=1
+      warn "NOT starting the chat UI: WEBUI_AUTH=true, but its data volume holds
+admin@localhost (password \"admin\"), made while login was off. With login on,
+anyone who reaches the UI could sign in as admin. Starting llama only.
+Fix: back up the open-webui-data volume and start with a FRESH one, or set
+WEBUI_AUTH=false in .env."
+      compose stop open-webui || warn "could not stop open-webui"
+      compose up "$@" llama
+      return
+    elif (( rc == 2 )); then
+      warn "could not check the open-webui data for the old no-login admin;
+webui-guard.sh checks the running UI instead"
+    fi
+  fi
+  compose up "$@"
+}
+
+# run_webui_guard [wait-seconds]
+#
+# webui-guard.sh: with WEBUI_AUTH=true, stops the UI if the old no-login
+# account admin@localhost / admin can sign in. It waits up to the given time
+# for a UI that is still starting. Returns the guard's exit code; 0 is clear.
 run_webui_guard() {
-  # webui-guard.sh: with WEBUI_AUTH=true, stops the UI if the old no-login
-  # account admin@localhost / admin can sign in. Exit 0 means all clear.
-  local guard="$ROOT/webui-guard.sh"
+  local guard="$ROOT/webui-guard.sh" rc=0
   if [[ ! -f "$guard" ]]; then
     warn "no $guard — skipping the default-admin check"
     return 0
   fi
-  QCM_ENV_FILE="$ENV_FILE" QCM_WEBUI_URL="$WEBUI_URL" bash "$guard"
+  QCM_ENV_FILE="$ENV_FILE" QCM_WEBUI_URL="$WEBUI_URL" \
+    bash "$guard" --wait "${1:-0}" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) warn "webui-guard.sh STOPPED the chat UI: it accepted admin@localhost / admin";;
+    3) warn "!!! webui-guard.sh could NOT stop the chat UI. It is STILL RUNNING
+and still accepts admin@localhost / admin. Stop it by hand NOW:
+  docker stop bonsai-webui";;
+    *) warn "webui-guard.sh failed (exit $rc) — see its message above";;
+  esac
+  return "$rc"
 }
 
 local_image_digest() {
@@ -922,12 +1046,73 @@ running_working_dir() {
   printf '%s' "$dir"
 }
 
+# reexec_if_updater_changed <old-head> <target> <pin_arg> <ui_before> <webui_ref_before>
+#
+# Called right after the merge. When the merge changed update.sh, hand the
+# rest of this run to the NEW update.sh, which is now on disk together with
+# every file it needs. Without this, the run that delivers a fix to the
+# updater still finishes with the old updater, and the fix waits a week.
+#
+# The new copy resumes at update_apply with the values below. They are a
+# versioned contract (QCM_RESUME_V=1): a later update.sh must keep accepting
+# version 1, because the OLD copy is always the one that writes it.
+# QCM_UPDATE_REEXEC names the new copy, so only that copy counts as handed
+# over and a leaked value cannot fake one; the lock on fd 9 is kept across
+# the exec (see take_lock).
+reexec_if_updater_changed() {
+  local old="${1:-}" target="${2:-}" copy self_temp=0
+  [[ -n "$old" && -n "$target" ]] || return 0
+  [[ "${QCM_UPDATE_REEXEC:-}" == "$SELF" ]] && return 0
+  git -C "$ROOT" diff --quiet "$old" HEAD -- update.sh 2>/dev/null && return 0
+  copy="$(mktemp "${TMPDIR:-/tmp}/bonsai-update.XXXXXX")" \
+    || { warn "mktemp failed; finishing this run with the current update.sh"; return 0; }
+  if ! cat "$ROOT/update.sh" > "$copy" 2>/dev/null || [[ ! -s "$copy" ]]; then
+    rm -f -- "$copy"
+    warn "could not copy the new update.sh; finishing this run with the current one"
+    return 0
+  fi
+  chmod +x "$copy"
+  log "this update changes update.sh — handing the rest of the run to the new version"
+  looks_like_temp_copy && self_temp=1
+  export QCM_UPDATE_REEXEC="$copy" BONSAI_UPDATE_REEXEC="$copy" BONSAI_UPDATE_ROOT="$ROOT"
+  export QCM_RESUME_V=1 QCM_RESUME_OLD="$old" QCM_RESUME_TARGET="$target" \
+         QCM_RESUME_PIN="${3:-}" QCM_RESUME_UI_BEFORE="${4:-0}" \
+         QCM_RESUME_WEBUI_REF="${5:-}"
+  # exec runs no EXIT trap, so clean up what this copy owns first.
+  cleanup
+  (( self_temp )) && rm -f -- "$SELF"
+  exec bash "$copy" --resume-after-merge
+}
+
+# resume_after_merge: the entry point of a handed-over copy.
+resume_after_merge() {
+  [[ -n "${QCM_UPDATE_REEXEC:-}" && "$QCM_UPDATE_REEXEC" == "$SELF" ]] \
+    || die "--resume-after-merge is internal: only update.sh itself starts it"
+  [[ "${QCM_RESUME_V:-}" == "1" ]] \
+    || die "cannot resume: unknown handoff version '${QCM_RESUME_V:-}'"
+  [[ -n "${QCM_RESUME_OLD:-}" && -n "${QCM_RESUME_TARGET:-}" ]] \
+    || die "cannot resume: the handoff is missing the commits"
+  preflight update
+  take_lock
+  log "resuming the update with the new update.sh"
+  update_apply "$QCM_RESUME_OLD" "$QCM_RESUME_TARGET" 1 "${QCM_RESUME_PIN:-}" \
+    "${QCM_RESUME_UI_BEFORE:-0}" "${QCM_RESUME_WEBUI_REF:-}"
+}
+
 take_lock() {
   # One writer at a time. The weekly timer and a human running --rollback can
   # otherwise interleave `git reset --hard`, `docker tag` and the state
   # rewrite on the same checkout, and the loser silently corrupts the winner.
   # Held on fd 9 for the life of the process; the kernel drops it on exit, so
   # a killed run leaves nothing to clean up.
+  # Handed over by reexec_if_updater_changed: fd 9 is still the lock the
+  # previous copy took, and exec kept it. Taking it again on a new open file
+  # would conflict with ourselves.
+  if [[ -n "${QCM_UPDATE_REEXEC:-}" && "$QCM_UPDATE_REEXEC" == "$SELF" ]] \
+     && { : >&9; } 2>/dev/null; then
+    log "keeping the update lock from the run that handed over"
+    return 0
+  fi
   command -v flock >/dev/null 2>&1 || {
     warn "flock not found; running without a lock"; return 0; }
   # Derived from $STATE so the lock always lands beside the state it guards.
@@ -967,6 +1152,8 @@ This is the Linux/Docker path; macOS uses ./stack.sh"
   [[ -f "$COMPOSE_FILE" ]] || die "no compose file at $COMPOSE_FILE"
   [[ -f "$ENV_FILE" ]]     || die "no .env at $ENV_FILE"
   [[ -n "${BONSAI_API_KEY:-}" ]] || die "BONSAI_API_KEY is not set in $ENV_FILE"
+  declare -F webui_model_ok >/dev/null && declare -F webui_auth_on >/dev/null \
+    || die "cannot read $ROOT/lib/webui.sh — the checkout is incomplete"
   webui_model_ok "${WEBUI_MODEL:-}" || die "WEBUI_MODEL='${WEBUI_MODEL}' in $ENV_FILE is not a plain model id
 (allowed: letters, digits and . _ : / -). It is written into Open WebUI's
 OPENAI_API_CONFIGS JSON, so anything else could break or change that config."
@@ -1042,7 +1229,7 @@ record_rollback_point() {
   fi
   local sha webui llama pins
   sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
-  webui="$(docker image inspect "$WEBUI_IMAGE" --format '{{.Id}}' 2>/dev/null)"
+  webui="$(webui_image_id_now)"
   llama="$(docker image inspect "$LLAMA_IMAGE" --format '{{.Id}}' 2>/dev/null)"
   # Retag rather than copy: the old layers stay on disk under a second name,
   # so rollback is a tag move and needs no network. Recording the image id
@@ -1243,10 +1430,22 @@ this run introduced, because the recorded point predates it"
     changed=1
   fi
 
-  # Data second: only when the container last ran an image other than the
-  # recorded one. When the new image never started, the data never moved.
-  if [[ -n "$snap" && -n "$webui" && -n "$webui_ran" && "$webui_ran" != "$webui" ]]; then
-    if restore_webui_data "$snap" "$webui"; then
+  # Appended after the reset so the pin survives even when the reset failed,
+  # and written here, once, before any step below can return early.
+  if [[ "$pin" == "pin" && -n "$bad" && "$bad" != "$sha" ]]; then
+    printf 'bad=%s\n' "$bad" >> "$STATE" \
+      || warn "could not pin the failed commit; it may be retried next week"
+  fi
+
+  # Data: only when the container last ran an image other than the recorded
+  # one. When the new image never started, the data never moved.
+  local need_restore=0
+  [[ -n "$webui" && -n "$webui_ran" && "$webui_ran" != "$webui" ]] && need_restore=1
+  if (( need_restore )) && [[ -z "$snap" ]]; then
+    warn "a different open-webui image ran since the rollback point, and no data
+snapshot of ${webui:0:19} was recorded — its database changes stay"
+  elif (( need_restore )); then
+    if restore_webui_data "$snap" "$webui" "$webui_ran" "$WEBUI_IMAGE"; then
       changed=1
     else
       # Do NOT go on to the recreate below: it would start the older image
@@ -1257,10 +1456,6 @@ this run introduced, because the recorded point predates it"
       warn "could not restore the open-webui data from $snap. The chat UI is
 LEFT STOPPED. Run ./update.sh --rollback again to retry, or restore the
 snapshot by hand (see docs/updating.md)."
-      if [[ "$pin" == "pin" && -n "$bad" && "$bad" != "$sha" ]]; then
-        printf 'bad=%s\n' "$bad" >> "$STATE" \
-          || warn "could not pin the failed commit; it may be retried next week"
-      fi
       if (( changed )); then
         compose up -d --force-recreate llama \
           || warn "compose failed to recreate llama during rollback"
@@ -1268,19 +1463,10 @@ snapshot by hand (see docs/updating.md)."
       warn "the previous state was NOT fully restored — see the warnings above"
       return 1
     fi
-  elif [[ -z "$snap" && -n "$webui" && -n "$webui_ran" && "$webui_ran" != "$webui" ]]; then
-    warn "a different open-webui image ran since the rollback point, and no data
-snapshot of ${webui:0:19} was recorded — its database changes stay"
-  fi
-
-  # Appended after the reset so the pin survives even when the reset failed.
-  if [[ "$pin" == "pin" && -n "$bad" && "$bad" != "$sha" ]]; then
-    printf 'bad=%s\n' "$bad" >> "$STATE" \
-      || warn "could not pin the failed commit; it may be retried next week"
   fi
 
   if (( changed )); then
-    compose up -d --force-recreate \
+    start_stack -d --force-recreate \
       || { warn "compose failed during rollback"; restored=0; }
   else
     warn "nothing was actually restored, so the stack is left running as it is
@@ -1291,7 +1477,9 @@ snapshot of ${webui:0:19} was recorded — its database changes stay"
   if wait_for_health; then smoke; verdict=$?; fi
   local rb_ui_deadline="$WEBUI_TIMEOUT"
   (( UI_WAS_UP )) || rb_ui_deadline="$PRECHECK_TIMEOUT"
-  if (( verdict == 0 )) && ! webui_ok "$rb_ui_deadline"; then
+  if (( UI_HELD )); then
+    warn "the chat UI was NOT started — its data holds the old no-login admin (see above)"
+  elif (( verdict == 0 )) && ! webui_ok "$rb_ui_deadline"; then
     if (( UI_WAS_UP )); then
       warn "models answer but the chat UI at $WEBUI_URL does not"
       verdict=1
@@ -1305,10 +1493,19 @@ before this run — start it separately"
     fi
   fi
 
+  # Whatever the verdict, and whether the UI was up before or not: the UI
+  # may just have been recreated with the login setting .env has now.
+  local guard_rc=0
+  run_webui_guard "$PRECHECK_TIMEOUT" || guard_rc=$?
+
   if (( ! restored )); then
     # Answering is not the same as being restored: a pruned image or a failed
     # reset can leave the bad code in place and still serve.
     warn "the previous state was NOT fully restored — see the warnings above"
+    return 1
+  fi
+  if (( UI_HELD || guard_rc != 0 )); then
+    warn "rolled back, but the chat UI is NOT serving safely — see above"
     return 1
   fi
   case "$verdict" in
@@ -1500,7 +1697,7 @@ this run as unable to judge the models, not as proof they are dead"
   UI_WAS_UP=$ui_before
   # Before any model verdict can return or exit: a busy router or a rotated
   # key must not let a UI that accepts admin@localhost / admin run on.
-  if (( ui_before )) && ! run_webui_guard; then
+  if (( ui_before )) && ! run_webui_guard 0; then
     die "webui-guard.sh found the chat UI accepting the old no-login admin
 account and stopped it (see above). Not updating until that is fixed."
   fi
@@ -1654,6 +1851,21 @@ will not blame the new commit if it fails"
     log "code already at ${head_sha:0:12}; updating images only"
   fi
 
+  # The merge may have brought a new update.sh: it finishes this run.
+  (( moved )) && reexec_if_updater_changed "$head_sha" "$target" "$pin_arg" \
+    "$ui_before" "$webui_ref_before"
+  update_apply "$head_sha" "$target" "$moved" "$pin_arg" "$ui_before" "$webui_ref_before"
+}
+
+# update_apply <old-head> <target> <moved> <pin_arg> <ui_before> <webui_ref_before>
+#
+# The second half of an update: everything after the code has moved. Split
+# out so a handed-over copy (reexec_if_updater_changed) can resume here.
+update_apply() {
+  local head_sha="$1" target="$2" moved="$3" pin_arg="$4" ui_before="$5"
+  local webui_ref_before="$6"
+  UI_WAS_UP=$ui_before
+
   log "building llama image"
   if ! compose build llama; then
     # Undo only what this run did. Nothing has been replaced — :cuda still
@@ -1703,14 +1915,9 @@ touch the running stack"
 
   # The image ID that runs now, read BEFORE the pull: a republished tag is
   # moved by the pull, and reading it afterwards would see the new image on
-  # both sides and skip the data snapshot below. The running container is
-  # the best witness; the tag is the fallback when there is no container.
-  local id_before id_after webui_cid_now
-  webui_cid_now="$(webui_container)"
-  [[ -n "$webui_cid_now" ]] \
-    && id_before="$(docker inspect "$webui_cid_now" --format '{{.Image}}' 2>/dev/null)"
-  [[ -n "${id_before:-}" ]] \
-    || id_before="$(docker image inspect "$webui_ref_before" --format '{{.Id}}' 2>/dev/null)"
+  # both sides and skip the data snapshot below.
+  local id_before id_after
+  id_before="$(webui_image_id_now "$webui_ref_before")"
 
   log "pulling open-webui"
   local webui_before webui_after want_now
@@ -1742,7 +1949,7 @@ UI here and was rolled back"
   fi
 
   log "restarting stack"
-  compose up -d || { warn "compose up failed"; do_rollback; exit 1; }
+  start_stack -d || { warn "compose up failed"; do_rollback; exit 1; }
 
   log "waiting for health"
   # This one DOES pin. Build and compose up both succeeded, so the container
@@ -1763,7 +1970,11 @@ recreate containers, raise BONSAI_HEALTH_TIMEOUT in .env before the next run"
   # restart deadline on it.
   local ui_deadline="$WEBUI_TIMEOUT"
   (( ui_before )) || ui_deadline="$PRECHECK_TIMEOUT"
-  if ! webui_ok "$ui_deadline"; then
+  if (( UI_HELD )); then
+    # Not started on purpose (start_stack said why). Not the commit's fault,
+    # so no rollback; the models are still judged below.
+    ui_still_down=1
+  elif ! webui_ok "$ui_deadline"; then
     if (( ! ui_before )); then
       ui_still_down=1
       # Already down before this run touched anything, so rolling back cannot
@@ -1778,14 +1989,14 @@ separately"
     fi
   fi
 
-  # Again after the restart, before the model verdict can exit: the new
-  # image or a changed .env can expose the old admin account too.
-  local guard_ok=1
-  (( ui_still_down )) || run_webui_guard || guard_ok=0
+  # After every start, before the model verdict can exit, and whether the UI
+  # was up before or not: the new image or a changed .env can expose the old
+  # admin account. A UI that is still starting gets a bounded wait.
+  local guard_rc=0
+  run_webui_guard "$PRECHECK_TIMEOUT" || guard_rc=$?
 
   log "smoke testing every model"
   smoke; local verdict=$?
-  (( guard_ok )) || warn "webui-guard.sh stopped the chat UI after the update (see above)"
   if (( verdict == 2 )); then
     # We could not ask. Tearing down a stack we failed to interrogate would
     # turn our own broken credentials or network into a real outage.
@@ -1798,6 +2009,18 @@ above, then run ./update.sh --rollback yourself if you want the old version."
     exit 1
   fi
 
+  if (( UI_HELD )); then
+    warn "update applied and the models are verified, but the chat UI was NOT
+started: its data holds the old no-login admin (see above)."
+    return 1
+  fi
+
+  if (( guard_rc != 0 )); then
+    warn "update applied and the models are verified, but the chat UI check
+failed — see the webui-guard.sh message above"
+    return 1
+  fi
+
   if (( ui_still_down )); then
     # The models are proven and the update stands — rolling back would not
     # start a container that was already stopped. But "verified" would be a
@@ -1806,12 +2029,6 @@ above, then run ./update.sh --rollback yourself if you want the old version."
     warn "update applied and the models are verified, but the chat UI at
 $WEBUI_URL is still down — it was down before this run too. Start it
 separately; nothing here will fix it."
-    return 1
-  fi
-
-  if (( ! guard_ok )); then
-    warn "update applied and the models are verified, but webui-guard.sh
-stopped the chat UI — see its message above"
     return 1
   fi
 
@@ -1847,6 +2064,7 @@ fi
 
 case "${1:-}" in
   "")         cmd_update;;
+  --resume-after-merge) resume_after_merge;;
   --check)    cmd_check;;
   --rollback)
     preflight rollback

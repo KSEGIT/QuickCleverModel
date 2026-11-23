@@ -3592,7 +3592,7 @@ class TheDefaultAdminCheckRunsEveryTime(unittest.TestCase):
         r = run_real(setup, 'cmd_update')
         out = r.stdout + r.stderr
         self.assertIn("GUARD 2", out)
-        self.assertIn("stopped the chat UI", out)
+        self.assertIn("chat UI check\nfailed", out)
         self.assertIn("rc=1", out)
         self.assertNotIn("update complete and verified", out)
 
@@ -3639,3 +3639,287 @@ class TheDefaultAdminCheckRunsEveryTime(unittest.TestCase):
                          'run_webui_guard')
         self.assertIn("GUARD env=/x/.env url=http://127.0.0.1:9", r.stdout)
         self.assertIn("rc=0", r.stdout)
+
+    def test_a_guard_that_could_not_stop_the_ui_is_not_called_stopped(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_root = os.path.join(d, "root")
+            os.makedirs(fake_root)
+            with open(os.path.join(fake_root, "webui-guard.sh"), "w") as fh:
+                fh.write('exit 3\n')
+            r = run_real(f'ROOT={shlex.quote(fake_root)}', 'run_webui_guard')
+        self.assertIn("could NOT stop", r.stderr)
+        self.assertIn("STILL RUNNING", r.stderr)
+        self.assertNotIn("STOPPED the chat UI", r.stderr)
+        self.assertIn("rc=3", r.stdout)
+
+
+class ANewUpdaterFinishesItsOwnDelivery(unittest.TestCase):
+    """The run that merged a new update.sh used to finish with the old copy,
+    so an updater fix took effect only a week later."""
+
+    def _root_with_new_updater(self, d):
+        root = os.path.join(d, "root")
+        os.makedirs(root)
+        with open(os.path.join(root, "update.sh"), "w") as fh:
+            fh.write('echo "NEW ran $1 v=$QCM_RESUME_V old=$QCM_RESUME_OLD '
+                     'target=$QCM_RESUME_TARGET pin=$QCM_RESUME_PIN '
+                     'ui=$QCM_RESUME_UI_BEFORE ref=$QCM_RESUME_WEBUI_REF '
+                     'flag=$([ "$QCM_UPDATE_REEXEC" = "$0" ] && echo self)"\n')
+        return root
+
+    def test_a_changed_updater_takes_over_after_the_merge(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root_with_new_updater(d)
+            r = run_real(f'ROOT={shlex.quote(root)}; '
+                         'git() { case "$*" in *"diff --quiet"*) return 1;; esac; return 0; }',
+                         'reexec_if_updater_changed OLD NEW pin 1 ref/webui:2')
+        self.assertIn("NEW ran --resume-after-merge v=1 old=OLD target=NEW "
+                      "pin=pin ui=1 ref=ref/webui:2 flag=self", r.stdout, r.stderr)
+        self.assertNotIn("rc=", r.stdout, "the old copy must not carry on")
+
+    def test_an_unchanged_updater_carries_on(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root_with_new_updater(d)
+            r = run_real(f'ROOT={shlex.quote(root)}; git() {{ return 0; }}',
+                         'reexec_if_updater_changed OLD NEW pin 1 ref')
+        self.assertNotIn("NEW ran", r.stdout)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+
+    def test_a_handed_over_copy_never_hands_over_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root_with_new_updater(d)
+            r = run_real(f'ROOT={shlex.quote(root)}; QCM_UPDATE_REEXEC="$SELF"; '
+                         'git() { return 1; }',
+                         'reexec_if_updater_changed OLD NEW pin 1 ref')
+        self.assertNotIn("NEW ran", r.stdout)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+
+    def test_cmd_update_hands_over_right_after_the_merge(self):
+        setup = (
+            UPDATE_STUBS +
+            'reexec_if_updater_changed() { echo "HANDOFF $*"; }; '
+            'compose() { echo "COMPOSE $1"; return 0; }; docker() { return 0; }; '
+            'run_webui_guard() { return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("HANDOFF OLD NEW pin 1 ", out)
+        self.assertLess(out.index("moving to NEW"), out.index("HANDOFF"))
+        self.assertLess(out.index("HANDOFF"), out.index("building llama image"))
+
+    def test_resume_needs_a_real_handoff(self):
+        r = run_real(':', 'resume_after_merge')
+        self.assertIn("internal", r.stderr)
+        r = run_real('QCM_UPDATE_REEXEC="$SELF"; QCM_RESUME_V=2', 'resume_after_merge')
+        self.assertIn("unknown handoff version", r.stderr)
+
+    def test_resume_runs_the_second_half_with_the_handed_values(self):
+        r = run_real(
+            'QCM_UPDATE_REEXEC="$SELF"; QCM_RESUME_V=1; QCM_RESUME_OLD=OLD; '
+            'QCM_RESUME_TARGET=NEW; QCM_RESUME_PIN=pin; QCM_RESUME_UI_BEFORE=1; '
+            'QCM_RESUME_WEBUI_REF=ref/webui:1; preflight() { :; }; take_lock() { :; }; '
+            'update_apply() { echo "APPLY $*"; }',
+            'resume_after_merge')
+        self.assertIn("APPLY OLD NEW 1 pin 1 ref/webui:1", r.stdout, r.stderr)
+
+    def test_the_lock_is_kept_across_the_handoff(self):
+        with tempfile.TemporaryDirectory() as d:
+            lock = os.path.join(d, "lock")
+            r = run_real(f'exec 9>{shlex.quote(lock)}; QCM_UPDATE_REEXEC="$SELF"; '
+                         'flock() { echo FLOCK; return 1; }',
+                         'take_lock')
+        self.assertIn("keeping the update lock", r.stdout)
+        self.assertNotIn("FLOCK", r.stdout)
+
+
+class TheGuardRunsAfterEveryStart(unittest.TestCase):
+    """A UI started or recreated by any path must be checked, whether it was
+    up before or not."""
+
+    def test_after_an_update_even_when_the_ui_was_down_before(self):
+        setup = (
+            UPDATE_STUBS +
+            'webui_ok() { return 1; }; '
+            'resolve_webui_image() { echo "$WEBUI_IMAGE"; }; '
+            'docker() { return 0; }; compose() { return 0; }; '
+            'run_webui_guard() { echo "GUARD wait=$1"; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        self.assertIn("GUARD wait=", r.stdout, r.stdout + r.stderr)
+
+    def test_after_a_rollback(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write("sha=SAME\nwebui=\nllama=sha256:L\nverified=1\n")
+            # Fully restorable (the llama image already matches), so the
+            # only thing wrong is what the guard finds.
+            setup = (
+                f'STATE={shlex.quote(state)}; UI_WAS_UP=0; '
+                'git() { case "$*" in *"rev-parse HEAD"*) echo SAME;; esac; return 0; }; '
+                'resolve_webui_image() { echo old/webui:1; }; '
+                'webui_container() { :; }; '
+                'docker() { case "$1 $2" in "image inspect") echo sha256:L;; esac; return 0; }; '
+                'compose() { return 0; }; wait_for_health() { return 0; }; '
+                'webui_ok() { return 1; }; smoke() { return 0; }; '
+                'run_webui_guard() { echo "GUARD wait=$1"; return 1; }'
+            )
+            r = run_real(setup, 'do_rollback')
+        out = r.stdout + r.stderr
+        self.assertIn("GUARD wait=", out)
+        self.assertIn("NOT serving safely", out)
+        self.assertIn("rc=1", out)
+
+
+class TheOldAdminNeverStartsWithLoginOn(unittest.TestCase):
+    """Before the UI starts with WEBUI_AUTH=true, its data volume is checked
+    for admin@localhost; the post-start guard is the second line."""
+
+    def _start(self, auth, probe_rc):
+        setup = (
+            f'WEBUI_AUTH={auth}; '
+            f'default_admin_in_volume() {{ echo "PROBE $1"; return {probe_rc}; }}; '
+            'compose() { echo "COMPOSE $*"; return 0; }'
+        )
+        return run_real(setup, 'start_stack -d; echo "held=$UI_HELD"')
+
+    def test_a_volume_with_the_old_admin_starts_llama_only(self):
+        r = self._start("true", 0)
+        out = r.stdout + r.stderr
+        self.assertIn("COMPOSE stop open-webui", out)
+        self.assertIn("COMPOSE up -d llama", out)
+        self.assertNotIn("COMPOSE up -d\n", out)
+        self.assertIn("held=1", out)
+        self.assertIn("NOT starting the chat UI", out)
+
+    def test_a_clean_volume_starts_everything(self):
+        r = self._start("true", 1)
+        self.assertIn("COMPOSE up -d\n", r.stdout)
+        self.assertIn("held=0", r.stdout)
+
+    def test_an_unknown_answer_starts_and_leaves_it_to_the_guard(self):
+        r = self._start("true", 2)
+        self.assertIn("COMPOSE up -d\n", r.stdout)
+        self.assertIn("checks the running UI", r.stderr)
+
+    def test_login_off_does_not_look(self):
+        r = self._start("false", 0)
+        self.assertNotIn("PROBE", r.stdout)
+        self.assertIn("COMPOSE up -d\n", r.stdout)
+
+    def _probe(self, answer, log="/dev/null"):
+        setup = (
+            'webui_container() { echo cid1; }; '
+            f'docker() {{ case "$1" in image) return 0;; '
+            f'run) echo "ARGS $*" > {shlex.quote(log)}; echo {answer};; '
+            'esac; return 0; }'
+        )
+        return run_real(setup, 'default_admin_in_volume img:1')
+
+    def test_the_probe_reads_the_volume_read_only_without_network(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "log")
+            r = self._probe("found", log)
+            with open(log) as fh:
+                args = fh.read()
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertIn("--volumes-from cid1:ro", args)
+        self.assertIn("--network none", args)
+        self.assertIn("webui.db-wal", args,
+                      "rows still in the WAL would be missed")
+
+    def test_the_probe_answers(self):
+        self.assertIn("rc=1", self._probe("none").stdout)
+        self.assertIn("rc=2", self._probe("garbage").stdout)
+
+    def test_an_update_with_a_held_ui_is_not_rolled_back(self):
+        setup = (
+            UPDATE_STUBS +
+            'resolve_webui_image() { echo "$WEBUI_IMAGE"; }; '
+            'docker() { return 0; }; '
+            'start_stack() { UI_HELD=1; }; '
+            'do_rollback() { echo ROLLBACK; }; '
+            'run_webui_guard() { return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertNotIn("ROLLBACK", out)
+        self.assertIn("was NOT\nstarted", out)
+        self.assertIn("rc=1", out)
+
+
+class SnapshotAndRestoreDetails(unittest.TestCase):
+
+    def test_the_restore_runs_in_an_image_that_is_on_disk(self):
+        with tempfile.TemporaryDirectory() as d:
+            snap = os.path.join(d, "s.tar.gz")
+            open(snap, "w").close()
+            setup = (
+                'webui_container() { echo cid1; }; compose() { return 0; }; '
+                'docker() { case "$1 $2" in "image inspect") '
+                '[ "$3" = sha256:B ];; run*) echo "RUN $*";; esac; }'
+            )
+            r = run_real(setup, f'restore_webui_data {shlex.quote(snap)} '
+                                'sha256:A sha256:B other')
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        run = [l for l in r.stdout.splitlines() if l.startswith("RUN")][0]
+        self.assertIn("sha256:B", run, "the pruned image was used")
+        self.assertIn("! -name cache", run, "the restore deleted the cache")
+        self.assertLess(run.index("tar -tzf"), run.index("-delete")
+                        if "-delete" in run else run.index("rm -rf"),
+                        "the archive must be checked before anything goes")
+
+    def test_no_image_on_disk_means_no_restore(self):
+        with tempfile.TemporaryDirectory() as d:
+            snap = os.path.join(d, "s.tar.gz")
+            open(snap, "w").close()
+            r = run_real('docker() { case "$1" in image) return 1;; '
+                         'run) echo RAN;; esac; }; compose() { return 0; }',
+                         f'restore_webui_data {shlex.quote(snap)} sha256:A')
+        self.assertIn("rc=1", r.stdout)
+        self.assertNotIn("RAN", r.stdout)
+
+    def test_the_snapshot_leaves_the_cache_out(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        fn = body[body.index("snapshot_webui_data() {"):body.index("# restore_webui_data")]
+        self.assertIn("--exclude=./cache", fn)
+
+    def test_rollback_points_use_the_running_containers_image(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s")
+            r = run_real(
+                f'STATE={shlex.quote(state)}; '
+                'git() { case "$*" in *"rev-parse HEAD"*) echo abc;; esac; return 0; }; '
+                'webui_container() { echo cid1; }; '
+                'docker() { case "$1 $2" in "inspect cid1") echo sha256:RUN;; '
+                '"image inspect") echo sha256:TAG;; esac; return 0; }',
+                'record_rollback_point 1')
+            with open(state) as fh:
+                body = fh.read()
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertIn("webui=sha256:RUN", body)
+
+    def test_the_pin_is_written_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write("sha=OLD\nwebui=sha256:A\nllama=sha256:L\nverified=1\n"
+                         "webui_snapshot=sha256:A /snaps/a.tar.gz\n")
+            setup = (
+                f'STATE={shlex.quote(state)}; '
+                'git() { case "$*" in *"rev-parse HEAD"*) echo NEW;; esac; return 0; }; '
+                'stash_local_edits() { return 0; }; '
+                'resolve_webui_image() { echo old/webui:1; }; '
+                'webui_container() { echo cid1; }; '
+                'docker() { case "$1 $2" in "inspect cid1") echo sha256:B;; '
+                '"image inspect") case "$3" in old/webui:1) echo sha256:A;; '
+                '*) echo sha256:L;; esac;; esac; return 0; }; '
+                'restore_webui_data() { return 0; }; compose() { return 0; }; '
+                'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+                'smoke() { return 0; }; run_webui_guard() { return 0; }'
+            )
+            run_real(setup, 'do_rollback pin')
+            with open(state) as fh:
+                body = fh.read()
+        self.assertEqual(body.count("bad=NEW"), 1, body)
