@@ -111,7 +111,7 @@ LLAMA_BIND=100.x.y.z
 
 Then restart: `docker compose --env-file .env -f docker/compose.linux.yaml up -d`.
 
-The API on :8080 asks for the key, except `/health` and `/v1/models` (see
+The API on :8080 asks for the key on every route except `/health` (see
 [docs/architecture.md](docs/architecture.md)).
 
 Never use `0.0.0.0` unless you mean to share with the whole office LAN.
