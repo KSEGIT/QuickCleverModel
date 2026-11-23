@@ -99,8 +99,8 @@ LLAMA_BIND=100.x.y.z
 Then restart: `docker compose --env-file .env -f docker/compose.linux.yaml up -d`.
 
 Warning: the chat UI has no login by default. Binding it opens the UI to your
-whole tailnet. On a shared tailnet, set `WEBUI_AUTH: "true"` in
-`docker/compose.linux.yaml` first. The API on :8080 always asks for the key.
+whole tailnet. On a shared tailnet, set `WEBUI_AUTH=true` in `.env` first
+(see `.env.example` for an existing install). The API on :8080 always asks for the key.
 
 Never use `0.0.0.0` unless you mean to share with the whole office LAN.
 
