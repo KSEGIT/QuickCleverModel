@@ -87,8 +87,17 @@ ssh -N -L 9090:127.0.0.1:9090 -L 8080:127.0.0.1:8080 user@<box-ip>
 ```
 
 **Option 2 — Tailscale bind (good for daily use).** The box keeps the ports
-open on its Tailscale address, so any machine on your tailnet can connect. On
-the box, add this to `.env` (use the box's own Tailscale IP, from
+open on its Tailscale address, so any machine on your tailnet can connect.
+
+First create the chat UI admin. On the Docker paths the UI asks for a login
+by default (`WEBUI_AUTH=true`), and the first account to sign up becomes the
+admin. Sign up over loopback or the SSH tunnel above, before you bind. After
+that, sign-up is off; the admin adds other users and shares the model with
+them (see `WEBUI_MODEL` in `.env.example`). An install that ran without login
+needs a fresh `open-webui-data` volume before login works (see `.env.example`).
+The native macOS UI (`start-webui.sh`) has no login; do not bind it.
+
+Then, on the box, add this to `.env` (use the box's own Tailscale IP, from
 `tailscale ip -4`):
 
 ```bash
@@ -98,11 +107,8 @@ LLAMA_BIND=100.x.y.z
 
 Then restart: `docker compose --env-file .env -f docker/compose.linux.yaml up -d`.
 
-The chat UI asks for a login by default (`WEBUI_AUTH=true`). The first account
-to sign up becomes the admin, so create it over loopback or an SSH tunnel
-before you bind the UI. Sign-up is then off; the admin adds other users.
-An install that ran without login needs a fresh `open-webui-data` volume
-before login works (see `.env.example`). The API on :8080 always asks for the key.
+The API on :8080 asks for the key, except `/health` and `/v1/models` (see
+[docs/architecture.md](docs/architecture.md)).
 
 Never use `0.0.0.0` unless you mean to share with the whole office LAN.
 
