@@ -204,6 +204,20 @@ logged no allocation failures, even while the machine was already 12 GB into
 swap. It is not the default only because one-at-a-time leaves more headroom for
 everything else on the box — see [decisions.md](decisions.md).
 
+#### Fixed model set (`QCM_MODELS`)
+
+To serve only some presets, set `QCM_MODELS` in `.env` to a comma list of
+model IDs, for example `QCM_MODELS=bonsai-27b-ternary`. `start-server.sh`
+then drops every other section from `run/models.ini`. The router does not
+list those models and cannot load them, so a request for one gets an error
+and does not evict the main model under `--models-max 1`. Empty (the default)
+serves every preset whose weights exist. A listed ID that is not in the preset,
+or whose weights are missing, stops the start with an error.
+
+This limits the preset only. At Prism `922be44`, a client with the API key can
+still call `POST /models` to download a model from Hugging Face into the cache;
+no flag turns that route off. Keep the key away from users.
+
 ### Adding another model
 
 `models.ini.in` is the committed template; `start-server.sh` interpolates `@ROOT@`
@@ -301,9 +315,23 @@ Re-verified against the router:
 /models/load           no-key 401      (the load/unload control endpoint)
 ```
 
-The key is enforced once, at the router. Children bind `127.0.0.1` and are
-stripped of it (`unset_reserved_args`), so it is not duplicated per model —
-confirmed absent from the unauthenticated `/v1/models` response.
+The key never goes on a command line, where any local user could read it with
+`ps` or `/proc/<pid>/cmdline`. `start-server.sh` writes it to `run/api-key`
+(mode 0400), starts the router with `--api-key-file`, and removes
+`BONSAI_API_KEY` from the environment before `exec`, so the router and its
+children do not inherit it. The key file must stay in place while the server
+runs: each child reads it when it starts.
+
+Children bind `127.0.0.1`. At Prism `922be44` the router strips `--api-key`
+from the children it spawns, but not `--api-key-file` (upstream fixed this in
+`982a3329af`, #28938). So each child gets the file path, never the key, and
+checks the key too. Proxied requests keep their `Authorization` header, so
+clients see no change. One known effect: the router's own calls to a child for
+`POST /v1/streams/lookup` and `DELETE /v1/stream` (stream resume and stop)
+send no key, so the child answers 401. No QCM client uses these routes.
+
+On Docker, `BONSAI_API_KEY` is still in the container config (`docker inspect`)
+because the entrypoint needs it. Members of the `docker` group can read it.
 
 Two endpoints are public by upstream design, not by regression:
 `/health` and `/v1/models` both return 200 without a key

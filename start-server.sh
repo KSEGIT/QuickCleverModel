@@ -88,8 +88,8 @@ done
 
 # 0.0.0.0 is REQUIRED: binding 127.0.0.1 makes the server unreachable from the
 # Docker VM. Everything is therefore also reachable from your LAN, so the API
-# key below is not optional hygiene. Children bind 127.0.0.1 and are stripped of
-# the key by the router, so it is enforced exactly once, here.
+# key below is not optional hygiene. Children bind 127.0.0.1; the key file step
+# at the end says how they treat the key.
 HOST="${BONSAI_HOST:-0.0.0.0}"
 PORT="${BONSAI_PORT:-8080}"
 CTX="${BONSAI_CTX:-8192}"   # conservative shared floor; raise only after measuring
@@ -111,6 +111,15 @@ CTX_TEXT="${BONSAI_CTX_TEXT:-$CTX}"
 MODELS_MAX="${BONSAI_MODELS_MAX:-1}"
 
 : "${BONSAI_API_KEY:?BONSAI_API_KEY not set — create .env with: BONSAI_API_KEY=bonsai-\$(openssl rand -hex 20)}"
+# The key reaches llama-server through --api-key-file (below), which reads one
+# key per line and skips lines that start with '#'. Reject keys that this
+# format would change. A '#' key is the dangerous one: the server would load
+# no key and run with no auth. Never print the value.
+case "$BONSAI_API_KEY" in
+  *$'\n'*|*$'\r'*|'#'*|*,*)
+    echo "invalid BONSAI_API_KEY: use one key with no line break, no comma and no leading '#'" >&2
+    exit 2 ;;
+esac
 
 # Render the preset. Paths must be absolute: the children are spawned by the
 # router and inheriting CWD is fragile.
@@ -205,8 +214,60 @@ awk -v qwen9="$qwen9" -v qwen4="$qwen4" -v granite="$granite" \
 ' "$PRESET" > "$PRESET.available"
 mv "$PRESET.available" "$PRESET"
 
+# QCM_MODELS: the only presets the router may serve, as a comma list of
+# section names. Empty serves every preset whose weights exist. Every other
+# section is dropped from the rendered file, so the router cannot list or load
+# it and a request for it cannot evict the main model. A listed name that is
+# not in the preset, or whose weights are missing, stops the start.
+if [[ -n "${QCM_MODELS:-}" ]]; then
+  allowed=","
+  IFS=',' read -r -a requested <<< "$QCM_MODELS"
+  for name in "${requested[@]}"; do
+    name="${name//[[:space:]]/}"
+    [[ -n "$name" ]] || continue
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+      echo "invalid QCM_MODELS entry: $name" >&2
+      exit 2
+    }
+    grep -qxF "[$name]" "$PRESET" || {
+      echo "QCM_MODELS names $name, but the preset has no such model or its weights are missing" >&2
+      exit 2
+    }
+    allowed+="$name,"
+  done
+  [[ "$allowed" != "," ]] || { echo "QCM_MODELS lists no model" >&2; exit 2; }
+  awk -v allowed="$allowed" '
+    /^\[/ { name = substr($0, 2, index($0, "]") - 2)
+            show = name == "*" || index(allowed, "," name ",") > 0 }
+    show { print }
+  ' "$PRESET" > "$PRESET.allowed"
+  mv "$PRESET.allowed" "$PRESET"
+fi
+
+# The key goes to the server in a file, never on its command line: argv is
+# readable by every local user (ps, /proc/<pid>/cmdline), in a container too.
+# printf is a bash builtin, so no process ever carries the key in argv. umask
+# and noclobber give a new 0600 file, never one planted at this path; it is
+# then made 0400. The key leaves the environment before exec, so the server
+# and its children do not inherit it either.
+#
+# Router mode, Prism 922be44: the router strips --api-key from the children it
+# spawns, but not --api-key-file (upstream fixed this later, 982a3329af).
+# The children (127.0.0.1 only) therefore get the file path, not the key, and
+# check the key too. Proxied requests keep their Authorization header, so
+# clients see no change.
+KEY_FILE="$ROOT/run/api-key"
+rm -f -- "$KEY_FILE"
+( umask 077 && set -C && printf '%s\n' "$BONSAI_API_KEY" > "$KEY_FILE" ) || {
+  echo "cannot write the key file $KEY_FILE" >&2
+  exit 1
+}
+chmod 400 "$KEY_FILE"
+unset BONSAI_API_KEY BONSAI_SERVER_KEY
+
 echo "server : $SERVER (router)"
 echo "preset : $PRESET"
+echo "models : ${QCM_MODELS:-all presets with weights}"
 echo "listen : http://$HOST:$PORT  (ctx=$CTX, text-ctx=$CTX_TEXT, models-max=$MODELS_MAX)"
 
 # No -m: that is what selects router mode. No --mmproj either — it would be
@@ -215,5 +276,5 @@ exec "$SERVER" \
   --models-preset "$PRESET" \
   --models-max "$MODELS_MAX" \
   --host "$HOST" --port "$PORT" \
-  --api-key "$BONSAI_API_KEY" \
+  --api-key-file "$KEY_FILE" \
   "$@"

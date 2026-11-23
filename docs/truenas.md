@@ -15,6 +15,13 @@ before choosing it for agent work.
 | `bonsai-27b-1bit` | 32,768 | q4_0 | 99 |
 | `granite-4.1-8b-q4_k_m` | 32,768 | q4_0 | 32 |
 
+To serve fewer models, set `QCM_MODELS` in the private environment file to a
+comma list of the IDs above, for example `QCM_MODELS=qwen3.5-9b-q4_k_m`. The
+entrypoint drops every other preset, so the router cannot load it. Empty
+serves all four. The entrypoint passes the API key to llama-server in a 0400
+file, not on its command line; the health check uses the public `/health`
+route and sends no key.
+
 The router keeps one model resident. Each has one slot, flash attention on,
 ubatch 256, four context checkpoints, and a 256 MiB host prompt cache cap.
 The inference container is limited to 8 GiB RAM with no extra swap; Open WebUI

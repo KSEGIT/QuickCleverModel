@@ -20,8 +20,14 @@ class ServerStartup(unittest.TestCase):
             shutil.copyfile(ROOT / file, self.root / file)
         binary = self.root / "src/llama.cpp-prism/build/bin/llama-server"
         binary.parent.mkdir(parents=True)
-        binary.write_text("#!/bin/sh\nexit 0\n")
+        # Records what the launcher hands the server: argv one per line, env.
+        binary.write_text('#!/bin/sh\n'
+                          'dir=$(dirname "$0")\n'
+                          'printf "%s\\n" "$@" > "$dir/args"\n'
+                          'env > "$dir/env"\n'
+                          'exit 0\n')
         binary.chmod(0o755)
+        self.bin_dir = binary.parent
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("BONSAI_", "QCM_"))}
         self.env["BONSAI_API_KEY"] = "fixture-only"
@@ -90,6 +96,63 @@ class ServerStartup(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(set(self.presets().sections()),
                          {"*", *model_files} - {"granite-4.1-8b-q4_k_m"})
+
+    def server_args(self):
+        return (self.bin_dir / "args").read_text().splitlines()
+
+    def test_key_reaches_server_in_a_private_file_not_argv_or_env(self):
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.server_args()
+        self.assertNotIn("fixture-only", "\n".join(args))
+        self.assertNotIn("--api-key", args)
+        key_file = Path(args[args.index("--api-key-file") + 1])
+        self.assertEqual(key_file, self.root / "run/api-key")
+        self.assertEqual(key_file.read_text(), "fixture-only\n")
+        self.assertEqual(key_file.stat().st_mode & 0o777, 0o400)
+        self.assertNotIn("fixture-only", (self.bin_dir / "env").read_text())
+
+    def test_key_file_is_rewritten_on_restart(self):
+        self.assertEqual(self.run_launcher().returncode, 0)
+        result = self.run_launcher(BONSAI_API_KEY="fixture-rotated")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "run/api-key").read_text(), "fixture-rotated\n")
+
+    def test_key_the_file_format_would_change_fails_before_start(self):
+        # '#' lines are comments in --api-key-file: the server would run with
+        # no key at all. A line break splits one key in two. A comma was a
+        # list separator for --api-key but is literal in the file.
+        for key in ("#fixture", "fixture\nsecond", "fixture\rx", "a,b"):
+            with self.subTest(key=key):
+                result = self.run_launcher(BONSAI_API_KEY=key)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("BONSAI_API_KEY", result.stderr)
+                self.assertNotIn(key, result.stderr)
+                self.assertFalse((self.bin_dir / "args").exists())
+
+    def test_model_allowlist_drops_every_other_preset(self):
+        result = self.run_launcher(QCM_MODELS="bonsai-27b-ternary")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(self.presets().sections()), {"*", "bonsai-27b-ternary"})
+        self.assertEqual(self.presets()["*"]["jinja"], "true")
+
+    def test_model_allowlist_takes_a_comma_list_with_spaces(self):
+        model = self.root / "models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf"
+        model.parent.mkdir(parents=True)
+        model.touch()
+        result = self.run_launcher(QCM_MODELS=" bonsai-27b-1bit , qwen3.5-4b-q4_k_m,")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(self.presets().sections()),
+                         {"*", "bonsai-27b-1bit", "qwen3.5-4b-q4_k_m"})
+
+    def test_model_allowlist_rejects_unknown_or_absent_models(self):
+        # qwen3.5-9b-q4_k_m is a real preset, but its weights are absent here.
+        for value in ("bonsai-27b-ternry", "qwen3.5-9b-q4_k_m", "*", "a]b", ","):
+            with self.subTest(value=value):
+                result = self.run_launcher(QCM_MODELS=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("QCM_MODELS", result.stderr)
+                self.assertFalse((self.bin_dir / "args").exists())
 
     def test_bad_context_fails_before_start(self):
         result = self.run_launcher(QCM_AGENT_CTX="huge")
