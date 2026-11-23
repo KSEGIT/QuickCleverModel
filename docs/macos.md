@@ -20,7 +20,7 @@ cmake -S src/llama.cpp-prism -B src/llama.cpp-prism/build -DCMAKE_BUILD_TYPE=Rel
 cmake --build src/llama.cpp-prism/build --target llama-server -j
 
 # 2. Python env for Open WebUI
-python3.11 -m venv .venv && .venv/bin/pip install open-webui==0.11.3
+python3.11 -m venv .venv && .venv/bin/pip install open-webui==0.13.4
 
 # 3. API key (enforced by the router — the server binds 0.0.0.0)
 printf 'BONSAI_API_KEY=bonsai-%s\n' "$(openssl rand -hex 20)" > .env && chmod 600 .env

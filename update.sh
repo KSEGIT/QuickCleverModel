@@ -73,7 +73,7 @@ ENV_FILE="$ROOT/.env"
 STATE="$ROOT/run/update-state"
 LLAMA_IMAGE="bonsai-llama:cuda"
 ROLLBACK_IMAGE="bonsai-llama:rollback"
-WEBUI_IMAGE="ghcr.io/open-webui/open-webui:v0.11.3"
+WEBUI_IMAGE="ghcr.io/open-webui/open-webui:v0.13.4"
 LLAMA_CONTAINER="bonsai-llama-1"
 
 log()  { printf '%s  %s\n' "$(date -u +%H:%M:%S)" "$*"; }
