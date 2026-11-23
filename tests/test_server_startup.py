@@ -112,47 +112,123 @@ class ServerStartup(unittest.TestCase):
         self.assertEqual(key_file.stat().st_mode & 0o777, 0o400)
         self.assertNotIn("fixture-only", (self.bin_dir / "env").read_text())
 
-    def test_key_file_is_rewritten_on_restart(self):
+    def test_key_file_is_replaced_on_restart_without_leftovers(self):
         self.assertEqual(self.run_launcher().returncode, 0)
+        old_inode = (self.root / "run/api-key").stat().st_ino
         result = self.run_launcher(BONSAI_API_KEY="fixture-rotated")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.root / "run/api-key").read_text(), "fixture-rotated\n")
+        key_file = self.root / "run/api-key"
+        self.assertEqual(key_file.read_text(), "fixture-rotated\n")
+        self.assertEqual(key_file.stat().st_mode & 0o777, 0o400)
+        # Renamed over, not rewritten in place: a new inode, no temp files.
+        self.assertNotEqual(key_file.stat().st_ino, old_inode)
+        self.assertEqual(sorted(p.name for p in (self.root / "run").glob("api-key*")),
+                         ["api-key"])
+
+    def test_comma_separated_keys_become_one_key_per_line(self):
+        result = self.run_launcher(BONSAI_API_KEY="fixture-one,fixture-two")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "run/api-key").read_text(),
+                         "fixture-one\nfixture-two\n")
+        self.assertNotIn("fixture-two", "\n".join(self.server_args()))
 
     def test_key_the_file_format_would_change_fails_before_start(self):
-        # '#' lines are comments in --api-key-file: the server would run with
-        # no key at all. A line break splits one key in two. A comma was a
-        # list separator for --api-key but is literal in the file.
-        for key in ("#fixture", "fixture\nsecond", "fixture\rx", "a,b"):
+        # '#' lines are comments in --api-key-file: with no other key the
+        # server would run with no auth. A line break would add a key. An
+        # empty comma item is almost surely a typo.
+        for key in ("#fixture", "fixture,#second", "fixture\nsecond", "fixture\rx",
+                    ",fixture", "fixture,", "fixture,,second"):
             with self.subTest(key=key):
                 result = self.run_launcher(BONSAI_API_KEY=key)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("BONSAI_API_KEY", result.stderr)
-                self.assertNotIn(key, result.stderr)
+                self.assertNotIn("fixture", result.stderr)
                 self.assertFalse((self.bin_dir / "args").exists())
+                self.assertFalse((self.root / "run/api-key").exists())
+
+    BONSAI_WEIGHTS = {
+        "bonsai-27b-ternary": "Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-PQ2_0.gguf",
+        "bonsai-27b-1bit": "Bonsai-27B-gguf/Bonsai-27B-Q1_0.gguf",
+    }
+
+    def touch_weights(self, *names):
+        for name in names:
+            model = self.root / "models" / self.BONSAI_WEIGHTS[name]
+            model.parent.mkdir(parents=True, exist_ok=True)
+            model.touch()
 
     def test_model_allowlist_drops_every_other_preset(self):
+        self.touch_weights("bonsai-27b-ternary", "bonsai-27b-1bit")
         result = self.run_launcher(QCM_MODELS="bonsai-27b-ternary")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(set(self.presets().sections()), {"*", "bonsai-27b-ternary"})
         self.assertEqual(self.presets()["*"]["jinja"], "true")
+        self.assertIn("models : bonsai-27b-ternary\n", result.stdout)
+        self.assertNotIn("WARNING", result.stderr)
 
     def test_model_allowlist_takes_a_comma_list_with_spaces(self):
+        self.touch_weights("bonsai-27b-1bit")
         model = self.root / "models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf"
         model.parent.mkdir(parents=True)
         model.touch()
-        result = self.run_launcher(QCM_MODELS=" bonsai-27b-1bit , qwen3.5-4b-q4_k_m,")
+        result = self.run_launcher(QCM_MODELS=" bonsai-27b-1bit ,\tqwen3.5-4b-q4_k_m,")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(set(self.presets().sections()),
                          {"*", "bonsai-27b-1bit", "qwen3.5-4b-q4_k_m"})
 
     def test_model_allowlist_rejects_unknown_or_absent_models(self):
-        # qwen3.5-9b-q4_k_m is a real preset, but its weights are absent here.
-        for value in ("bonsai-27b-ternry", "qwen3.5-9b-q4_k_m", "*", "a]b", ","):
+        self.touch_weights("bonsai-27b-ternary")
+        # bonsai-27b-1bit and qwen3.5-9b-q4_k_m are real presets, but their
+        # weights are absent here. Spaces or line breaks inside are errors.
+        for value in ("bonsai-27b-ternry", "bonsai-27b-1bit", "qwen3.5-9b-q4_k_m",
+                      "bonsai-27b-ternary,bonsai-27b-1bit", "*", "a]b", ",",
+                      "bonsai-27b ternary", "bonsai-27b-ternary\nbonsai-27b-1bit",
+                      "bonsai-27b-ternary\n"):
             with self.subTest(value=value):
                 result = self.run_launcher(QCM_MODELS=value)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("QCM_MODELS", result.stderr)
                 self.assertFalse((self.bin_dir / "args").exists())
+
+    def test_model_allowlist_rejects_bonsai_without_weights(self):
+        # The weight filter never drops Bonsai sections; the allow-list check
+        # must still see that the file is missing.
+        result = self.run_launcher(QCM_MODELS="bonsai-27b-ternary")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("weights are missing", result.stderr)
+        self.assertIn("Ternary-Bonsai-27B-PQ2_0.gguf", result.stderr)
+
+    def test_model_allowlist_empties_the_download_cache(self):
+        self.touch_weights("bonsai-27b-ternary")
+        cache = self.root / "run/empty-model-cache"
+        cache.mkdir(parents=True)
+        (cache / "models--someone--other-GGUF").mkdir()
+        result = self.run_launcher(QCM_MODELS="bonsai-27b-ternary",
+                                   LLAMA_CACHE="/somewhere/else")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        env = (self.bin_dir / "env").read_text().splitlines()
+        self.assertIn(f"LLAMA_CACHE={cache}", env)
+        self.assertEqual(list(cache.iterdir()), [])
+
+    def test_no_allowlist_leaves_the_download_cache_alone(self):
+        result = self.run_launcher(LLAMA_CACHE="/somewhere/else")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LLAMA_CACHE=/somewhere/else",
+                      (self.bin_dir / "env").read_text().splitlines())
+
+    def test_model_allowlist_warns_when_nothing_loads_at_startup(self):
+        self.touch_weights("bonsai-27b-1bit")
+        result = self.run_launcher(QCM_MODELS="bonsai-27b-1bit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("load-on-startup", result.stderr)
+
+    def test_model_allowlist_warns_about_default_models_it_drops(self):
+        self.touch_weights("bonsai-27b-ternary")
+        result = self.run_launcher(QCM_MODELS="bonsai-27b-ternary",
+                                   DEFAULT_MODELS="bonsai-27b-ternary, qwen3.5-9b-q4_k_m")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DEFAULT_MODELS names qwen3.5-9b-q4_k_m", result.stderr)
+        self.assertNotIn("names bonsai-27b-ternary", result.stderr)
 
     def test_bad_context_fails_before_start(self):
         result = self.run_launcher(QCM_AGENT_CTX="huge")

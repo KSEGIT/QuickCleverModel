@@ -111,15 +111,22 @@ CTX_TEXT="${BONSAI_CTX_TEXT:-$CTX}"
 MODELS_MAX="${BONSAI_MODELS_MAX:-1}"
 
 : "${BONSAI_API_KEY:?BONSAI_API_KEY not set — create .env with: BONSAI_API_KEY=bonsai-\$(openssl rand -hex 20)}"
-# The key reaches llama-server through --api-key-file (below), which reads one
-# key per line and skips lines that start with '#'. Reject keys that this
-# format would change. A '#' key is the dangerous one: the server would load
-# no key and run with no auth. Never print the value.
+# The keys reach llama-server through --api-key-file (below), which reads one
+# key per line and skips lines that start with '#'. BONSAI_API_KEY keeps the
+# --api-key meaning: a comma separates several keys, and each one goes on its
+# own line. Reject what the file format would change. A '#' key is the
+# dangerous one: the server skips it, and with no other key it runs with no
+# auth. Never print a key.
+key_error() { echo "invalid BONSAI_API_KEY: $1" >&2; exit 2; }
 case "$BONSAI_API_KEY" in
-  *$'\n'*|*$'\r'*|'#'*|*,*)
-    echo "invalid BONSAI_API_KEY: use one key with no line break, no comma and no leading '#'" >&2
-    exit 2 ;;
+  *$'\n'*|*$'\r'*) key_error "it must not contain a line break" ;;
+  ,*|*,|*,,*) key_error "a comma-separated key is empty" ;;
 esac
+IFS=',' read -r -a api_keys <<< "$BONSAI_API_KEY"
+for api_key in "${api_keys[@]}"; do
+  [[ "$api_key" != '#'* ]] || key_error "a key must not start with '#'"
+done
+unset api_key
 
 # Render the preset. Paths must be absolute: the children are spawned by the
 # router and inheriting CWD is fragile.
@@ -201,73 +208,117 @@ if [[ "$qwen36" == true ]]; then
     echo "WARNING: Qwen3.6 hybrid inference has under 32 GiB physical RAM; 64 GiB is preferred." >&2
   fi
 fi
+# QCM_MODELS: the only presets the router may serve, as a comma list of
+# section names. Empty serves every preset whose weights exist. Every other
+# section is dropped from the rendered file (awk below), so the router cannot
+# list or load it and a request for it cannot evict the main model. A listed
+# name that is not in the preset, or whose model file is missing, stops the
+# start. Spaces around a name are fine; a space or line break inside one is
+# an error, not something to guess at.
+allowed=""
+models_shown="all presets with weights"
+trim() { local s="${1#"${1%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+if [[ -n "${QCM_MODELS:-}" ]]; then
+  case "$QCM_MODELS" in
+    *$'\n'*|*$'\r'*) echo "invalid QCM_MODELS: it must not contain a line break" >&2; exit 2 ;;
+  esac
+  allowed=","
+  IFS=',' read -r -a requested <<< "$QCM_MODELS"
+  for name in ${requested[@]+"${requested[@]}"}; do
+    name="$(trim "$name")"
+    [[ -n "$name" ]] || continue
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+      echo "invalid QCM_MODELS entry '$name': use preset IDs separated by commas" >&2
+      exit 2
+    }
+    grep -qxF "[$name]" "$PRESET" || {
+      echo "QCM_MODELS names $name, but the preset has no such model" >&2
+      exit 2
+    }
+    model="$(awk -v section="[$name]" '
+      $0 == section { inside = 1; next }
+      /^\[/ { inside = 0 }
+      inside && $1 == "model" { sub(/^model[ \t]*=[ \t]*/, ""); print; exit }
+    ' "$PRESET")"
+    [[ -n "$model" && -f "$model" ]] || {
+      echo "QCM_MODELS names $name, but its weights are missing: ${model:-no model line}" >&2
+      exit 2
+    }
+    allowed+="$name,"
+  done
+  [[ "$allowed" != "," ]] || { echo "QCM_MODELS lists no model" >&2; exit 2; }
+  models_shown="${allowed:1:${#allowed}-2}"
+fi
+
 awk -v qwen9="$qwen9" -v qwen4="$qwen4" -v granite="$granite" \
-    -v qwen36="$qwen36" -v gemma4="$gemma4" '
+    -v qwen36="$qwen36" -v gemma4="$gemma4" -v allowed="$allowed" '
   /^\[/ { show = 1 }
   /^\[qwen3\.5-9b-q4_k_m\]/ { show = qwen9 == "true" }
   /^\[qwen3\.5-4b-q4_k_m\]/ { show = qwen4 == "true" }
   /^\[granite-4\.1-8b-q4_k_m\]/ { show = granite == "true" }
   /^\[qwen3\.6-35b-a3b\]/ { show = qwen36 == "true" }
   /^\[gemma4-e4b\]/ { show = gemma4 == "true" }
+  /^\[/ && allowed != "" {
+    name = substr($0, 2, index($0, "]") - 2)
+    if (name != "*" && index(allowed, "," name ",") == 0) show = 0
+  }
   /^ngl = auto$/ { next }
   show { print }
 ' "$PRESET" > "$PRESET.available"
 mv "$PRESET.available" "$PRESET"
 
-# QCM_MODELS: the only presets the router may serve, as a comma list of
-# section names. Empty serves every preset whose weights exist. Every other
-# section is dropped from the rendered file, so the router cannot list or load
-# it and a request for it cannot evict the main model. A listed name that is
-# not in the preset, or whose weights are missing, stops the start.
-if [[ -n "${QCM_MODELS:-}" ]]; then
-  allowed=","
-  IFS=',' read -r -a requested <<< "$QCM_MODELS"
-  for name in "${requested[@]}"; do
-    name="${name//[[:space:]]/}"
-    [[ -n "$name" ]] || continue
-    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
-      echo "invalid QCM_MODELS entry: $name" >&2
-      exit 2
-    }
-    grep -qxF "[$name]" "$PRESET" || {
-      echo "QCM_MODELS names $name, but the preset has no such model or its weights are missing" >&2
-      exit 2
-    }
-    allowed+="$name,"
+if [[ -n "$allowed" ]]; then
+  # The router also lists and loads models from the llama.cpp download cache
+  # (load_from_cache). LLAMA_CACHE is the first place Prism 922be44 looks
+  # (common/hf-cache.cpp), so point it at an empty directory of our own,
+  # emptied on every start. It overrides any LLAMA_CACHE from .env.
+  export LLAMA_CACHE="$ROOT/run/empty-model-cache"
+  rm -rf -- "$LLAMA_CACHE"
+  mkdir -p "$LLAMA_CACHE"
+
+  grep -Eq '^load-on-startup[[:space:]]*=[[:space:]]*true' "$PRESET" ||
+    echo "WARNING: no model in QCM_MODELS has load-on-startup = true; nothing loads until the first request." >&2
+  # DEFAULT_MODELS is Open WebUI's pre-selected model list. Warn only: it may
+  # name a model on another connection.
+  IFS=',' read -r -a default_models <<< "${DEFAULT_MODELS:-}"
+  for name in ${default_models[@]+"${default_models[@]}"}; do
+    name="$(trim "$name")"
+    [[ -z "$name" || "$allowed" == *",$name,"* ]] ||
+      echo "WARNING: DEFAULT_MODELS names $name, which QCM_MODELS does not serve here." >&2
   done
-  [[ "$allowed" != "," ]] || { echo "QCM_MODELS lists no model" >&2; exit 2; }
-  awk -v allowed="$allowed" '
-    /^\[/ { name = substr($0, 2, index($0, "]") - 2)
-            show = name == "*" || index(allowed, "," name ",") > 0 }
-    show { print }
-  ' "$PRESET" > "$PRESET.allowed"
-  mv "$PRESET.allowed" "$PRESET"
 fi
 
-# The key goes to the server in a file, never on its command line: argv is
+# The keys go to the server in a file, never on its command line: argv is
 # readable by every local user (ps, /proc/<pid>/cmdline), in a container too.
-# printf is a bash builtin, so no process ever carries the key in argv. umask
-# and noclobber give a new 0600 file, never one planted at this path; it is
-# then made 0400. The key leaves the environment before exec, so the server
-# and its children do not inherit it either.
+# printf is a bash builtin, so no process ever carries a key in argv. mktemp
+# makes a new 0600 file; it is made 0400 and then renamed over run/api-key in
+# one step, so a reader never sees a half-written or missing file. The key
+# leaves the environment before exec, so the server and its children do not
+# inherit it either.
 #
 # Router mode, Prism 922be44: the router strips --api-key from the children it
 # spawns, but not --api-key-file (upstream fixed this later, 982a3329af).
 # The children (127.0.0.1 only) therefore get the file path, not the key, and
 # check the key too. Proxied requests keep their Authorization header, so
-# clients see no change.
+# clients see no change. Each child reads the file when it starts: if this
+# script runs again while a server runs, children that server starts later
+# use the new keys, while its router keeps the old ones until it restarts.
 KEY_FILE="$ROOT/run/api-key"
-rm -f -- "$KEY_FILE"
-( umask 077 && set -C && printf '%s\n' "$BONSAI_API_KEY" > "$KEY_FILE" ) || {
-  echo "cannot write the key file $KEY_FILE" >&2
+key_tmp="$(umask 077 && mktemp "$KEY_FILE.XXXXXX")" || {
+  echo "cannot create a temporary key file in $ROOT/run" >&2
   exit 1
 }
-chmod 400 "$KEY_FILE"
-unset BONSAI_API_KEY BONSAI_SERVER_KEY
+if ! printf '%s\n' "${api_keys[@]}" > "$key_tmp" \
+   || ! chmod 400 "$key_tmp" || ! mv -f -- "$key_tmp" "$KEY_FILE"; then
+  rm -f -- "$key_tmp"
+  echo "cannot write the key file $KEY_FILE" >&2
+  exit 1
+fi
+unset BONSAI_API_KEY BONSAI_SERVER_KEY api_keys
 
 echo "server : $SERVER (router)"
 echo "preset : $PRESET"
-echo "models : ${QCM_MODELS:-all presets with weights}"
+echo "models : $models_shown"
 echo "listen : http://$HOST:$PORT  (ctx=$CTX, text-ctx=$CTX_TEXT, models-max=$MODELS_MAX)"
 
 # No -m: that is what selects router mode. No --mmproj either — it would be
