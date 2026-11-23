@@ -213,8 +213,21 @@ list those models and cannot load them, so a request for one gets an error
 and does not evict the main model under `--models-max 1`. Empty (the default)
 serves every preset whose weights exist. Spaces around an ID are fine. These
 stop the start with an error: an ID that is not in the preset, an ID whose
-`model` file is missing (Bonsai presets too), and a space or line break inside
-an ID.
+`model` file is missing (Bonsai presets too), an empty comma item, and a space
+or line break inside an ID. The preset lookup accepts CRLF lines and
+`model=/path` without spaces.
+
+Keep the IDs your clients ask for, or their requests fail:
+
+| client | model ID it uses |
+|---|---|
+| `setup-opencode.sh` | `bonsai-27b-ternary-text` (default model); without `BONSAI_CTX` it asks `/props` of `bonsai-27b-1bit` for the context, else uses 8192 |
+| `claude-bonsai.sh` | `bonsai-27b-ternary-text` (`BONSAI_CLAUDE_MODEL` changes it) |
+| `bench.sh` | `bonsai-27b-ternary` (`-m` changes it) |
+| Open WebUI, `setup-codex.sh`, `update.sh` | whatever `/v1/models` lists |
+
+So `QCM_MODELS=bonsai-27b-ternary` alone drops `bonsai-27b-ternary-text`, and
+opencode and Claude Code then fail. Add it to the list if you use them.
 
 The router also lists and loads models from the llama.cpp download cache. With
 `QCM_MODELS` set, `start-server.sh` points `LLAMA_CACHE` (the first cache
@@ -332,19 +345,21 @@ Re-verified against the router:
 ```
 
 The key never goes on a command line, where any local user could read it with
-`ps` or `/proc/<pid>/cmdline`. `start-server.sh` writes it to `run/api-key`
-(mode 0400), starts the router with `--api-key-file`, and removes
-`BONSAI_API_KEY` from the environment before `exec`, so the router and its
-children do not inherit it. As with `--api-key`, a comma in `BONSAI_API_KEY`
-separates several keys; each goes on its own line. A key that starts with `#`,
-an empty comma item, or a line break stops the start: the file format skips
-`#` lines, so such a key would silently not count.
+`ps` or `/proc/<pid>/cmdline`. `start-server.sh` writes it to
+`run/api-key.<PID>` (mode 0400), starts the router with `--api-key-file`, and
+removes `BONSAI_API_KEY` from the environment before `exec`, so the router and
+its children do not inherit it. As with `--api-key`, a comma in
+`BONSAI_API_KEY` separates several keys; each goes on its own line. These stop
+the start: a key that starts with `#` (the file format skips `#` lines, so it
+would silently not count), an empty comma item, a line break, and a double
+quote (`--api-key` read quotes as CSV quoting; the file does not).
 
 The key file must stay in place while the server runs: each child reads it
-when it starts. `start-server.sh` writes a temporary file and renames it over
-`run/api-key` in one step. So if you run it again while a server runs, the
-children that server starts later read the new keys, while its router keeps
-the old ones until it restarts. Restart the whole server to change the key.
+when it starts. The `<PID>` is the script's own PID, which the server keeps
+after `exec`, so each server has its own file. Running `start-server.sh` again
+while a server runs writes a new file and never changes the keys that server
+uses. At start, the script removes `run/api-key.<PID>` files whose process is
+gone. Restart the server to change the key.
 
 Children bind `127.0.0.1`. At Prism `922be44` the router strips `--api-key`
 from the children it spawns, but not `--api-key-file` (upstream fixed this in

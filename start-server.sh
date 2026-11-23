@@ -116,10 +116,12 @@ MODELS_MAX="${BONSAI_MODELS_MAX:-1}"
 # --api-key meaning: a comma separates several keys, and each one goes on its
 # own line. Reject what the file format would change. A '#' key is the
 # dangerous one: the server skips it, and with no other key it runs with no
-# auth. Never print a key.
+# auth. --api-key also read double quotes as CSV quoting, which the file does
+# not, so no key may contain one. Never print a key.
 key_error() { echo "invalid BONSAI_API_KEY: $1" >&2; exit 2; }
 case "$BONSAI_API_KEY" in
   *$'\n'*|*$'\r'*) key_error "it must not contain a line break" ;;
+  *'"'*) key_error "a key must not contain a double quote (\")" ;;
   ,*|*,|*,,*) key_error "a comma-separated key is empty" ;;
 esac
 IFS=',' read -r -a api_keys <<< "$BONSAI_API_KEY"
@@ -213,41 +215,46 @@ fi
 # section is dropped from the rendered file (awk below), so the router cannot
 # list or load it and a request for it cannot evict the main model. A listed
 # name that is not in the preset, or whose model file is missing, stops the
-# start. Spaces around a name are fine; a space or line break inside one is
-# an error, not something to guess at.
+# start. Spaces around a name are fine; an empty item, or a space or line
+# break inside a name, is an error, not something to guess at. The preset
+# lookup accepts CRLF lines and `model=/path` without spaces, as llama-server
+# does.
 allowed=""
+allowed_models=()
 models_shown="all presets with weights"
 trim() { local s="${1#"${1%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+models_error() { echo "invalid QCM_MODELS: $1" >&2; exit 2; }
 if [[ -n "${QCM_MODELS:-}" ]]; then
   case "$QCM_MODELS" in
-    *$'\n'*|*$'\r'*) echo "invalid QCM_MODELS: it must not contain a line break" >&2; exit 2 ;;
+    *$'\n'*|*$'\r'*) models_error "it must not contain a line break" ;;
   esac
-  allowed=","
-  IFS=',' read -r -a requested <<< "$QCM_MODELS"
+  IFS=',' read -r -a requested <<< "$QCM_MODELS,"
   for name in ${requested[@]+"${requested[@]}"}; do
     name="$(trim "$name")"
-    [[ -n "$name" ]] || continue
-    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
-      echo "invalid QCM_MODELS entry '$name': use preset IDs separated by commas" >&2
-      exit 2
-    }
-    grep -qxF "[$name]" "$PRESET" || {
-      echo "QCM_MODELS names $name, but the preset has no such model" >&2
-      exit 2
-    }
-    model="$(awk -v section="[$name]" '
-      $0 == section { inside = 1; next }
-      /^\[/ { inside = 0 }
-      inside && $1 == "model" { sub(/^model[ \t]*=[ \t]*/, ""); print; exit }
+    [[ -n "$name" ]] || models_error "a comma-separated item is empty"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+      models_error "entry '$name' is not a preset ID; separate IDs with commas"
+    # Prints nothing if there is no [name] section, "found" if the section
+    # has no model line, else "found <model path>".
+    info="$(awk -v want="$name" '
+      { sub(/\r$/, "") }
+      /^\[/ { inside = substr($0, 2, index($0, "]") - 2) == want
+              if (inside) found = 1
+              next }
+      inside && model == "" && /^[ \t]*model[ \t]*=/ {
+        sub(/^[ \t]*model[ \t]*=[ \t]*/, ""); sub(/[ \t]+$/, ""); model = $0 }
+      END { if (found) print "found" (model == "" ? "" : " " model) }
     ' "$PRESET")"
-    [[ -n "$model" && -f "$model" ]] || {
-      echo "QCM_MODELS names $name, but its weights are missing: ${model:-no model line}" >&2
-      exit 2
-    }
-    allowed+="$name,"
+    [[ -n "$info" ]] || models_error "$name is not in the preset"
+    model="${info#found}"
+    model="${model# }"
+    [[ -n "$model" && -f "$model" ]] ||
+      models_error "$name names weights that are missing: ${model:-no model line}"
+    allowed_models+=("$name")
   done
-  [[ "$allowed" != "," ]] || { echo "QCM_MODELS lists no model" >&2; exit 2; }
-  models_shown="${allowed:1:${#allowed}-2}"
+  [[ ${#allowed_models[@]} -gt 0 ]] || models_error "it lists no model"
+  allowed=",$(IFS=','; printf '%s' "${allowed_models[*]}"),"
+  models_shown="$(IFS=','; printf '%s' "${allowed_models[*]}")"
 fi
 
 awk -v qwen9="$qwen9" -v qwen4="$qwen4" -v granite="$granite" \
@@ -291,20 +298,31 @@ fi
 # The keys go to the server in a file, never on its command line: argv is
 # readable by every local user (ps, /proc/<pid>/cmdline), in a container too.
 # printf is a bash builtin, so no process ever carries a key in argv. mktemp
-# makes a new 0600 file; it is made 0400 and then renamed over run/api-key in
-# one step, so a reader never sees a half-written or missing file. The key
-# leaves the environment before exec, so the server and its children do not
-# inherit it either.
+# makes a new 0600 file; it is made 0400 and then renamed into place in one
+# step, so a reader never sees a half-written file. The key leaves the
+# environment before exec, so the server and its children do not inherit it.
 #
 # Router mode, Prism 922be44: the router strips --api-key from the children it
 # spawns, but not --api-key-file (upstream fixed this later, 982a3329af).
 # The children (127.0.0.1 only) therefore get the file path, not the key, and
-# check the key too. Proxied requests keep their Authorization header, so
-# clients see no change. Each child reads the file when it starts: if this
-# script runs again while a server runs, children that server starts later
-# use the new keys, while its router keeps the old ones until it restarts.
-KEY_FILE="$ROOT/run/api-key"
-key_tmp="$(umask 077 && mktemp "$KEY_FILE.XXXXXX")" || {
+# check the key too, reading the file when each one starts. Proxied requests
+# keep their Authorization header, so clients see no change.
+#
+# One file per server: run/api-key.<pid>. $$ stays the server's PID after
+# exec, so a second run of this script writes its own file and never changes
+# the keys a running server's children read. Files of servers that are gone
+# are removed. Only "No such process" counts as gone: a PID owned by another
+# user answers "Operation not permitted" and its file stays.
+for old_key_file in "$ROOT"/run/api-key.*; do
+  old_pid="${old_key_file##*/api-key.}"
+  [[ "$old_pid" =~ ^[0-9]+$ && "$old_pid" != "$$" ]] || continue
+  if [[ "$(LC_ALL=C kill -0 "$old_pid" 2>&1)" == *"No such process"* ]]; then
+    rm -f -- "$old_key_file"
+  fi
+done
+unset old_key_file old_pid
+KEY_FILE="$ROOT/run/api-key.$$"
+key_tmp="$(umask 077 && mktemp "$ROOT/run/.api-key-tmp.XXXXXX")" || {
   echo "cannot create a temporary key file in $ROOT/run" >&2
   exit 1
 }

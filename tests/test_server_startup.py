@@ -100,51 +100,82 @@ class ServerStartup(unittest.TestCase):
     def server_args(self):
         return (self.bin_dir / "args").read_text().splitlines()
 
+    def key_file(self):
+        args = self.server_args()
+        return Path(args[args.index("--api-key-file") + 1])
+
+    def key_files(self):
+        return sorted(p.name for p in (self.root / "run").glob("*api-key*"))
+
     def test_key_reaches_server_in_a_private_file_not_argv_or_env(self):
         result = self.run_launcher()
         self.assertEqual(result.returncode, 0, result.stderr)
         args = self.server_args()
         self.assertNotIn("fixture-only", "\n".join(args))
         self.assertNotIn("--api-key", args)
-        key_file = Path(args[args.index("--api-key-file") + 1])
-        self.assertEqual(key_file, self.root / "run/api-key")
+        key_file = self.key_file()
+        self.assertEqual(key_file.parent, self.root / "run")
+        self.assertRegex(key_file.name, r"^api-key\.[0-9]+$")
         self.assertEqual(key_file.read_text(), "fixture-only\n")
         self.assertEqual(key_file.stat().st_mode & 0o777, 0o400)
         self.assertNotIn("fixture-only", (self.bin_dir / "env").read_text())
+        self.assertEqual(self.key_files(), [key_file.name])
 
-    def test_key_file_is_replaced_on_restart_without_leftovers(self):
-        self.assertEqual(self.run_launcher().returncode, 0)
-        old_inode = (self.root / "run/api-key").stat().st_ino
-        result = self.run_launcher(BONSAI_API_KEY="fixture-rotated")
+    def test_second_run_leaves_a_live_server_key_file_alone(self):
+        # This test process stands in for a running server.
+        live = self.root / f"run/api-key.{os.getpid()}"
+        live.parent.mkdir(parents=True)
+        live.write_text("fixture-live\n")
+        live.chmod(0o400)
+        result = self.run_launcher(BONSAI_API_KEY="fixture-new")
         self.assertEqual(result.returncode, 0, result.stderr)
-        key_file = self.root / "run/api-key"
-        self.assertEqual(key_file.read_text(), "fixture-rotated\n")
-        self.assertEqual(key_file.stat().st_mode & 0o777, 0o400)
-        # Renamed over, not rewritten in place: a new inode, no temp files.
-        self.assertNotEqual(key_file.stat().st_ino, old_inode)
-        self.assertEqual(sorted(p.name for p in (self.root / "run").glob("api-key*")),
-                         ["api-key"])
+        self.assertEqual(live.read_text(), "fixture-live\n")
+        self.assertNotEqual(self.key_file(), live)
+        self.assertEqual(self.key_file().read_text(), "fixture-new\n")
+
+    def test_key_files_of_gone_servers_are_removed(self):
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        run = self.root / "run"
+        run.mkdir()
+        stale = run / f"api-key.{gone.pid}"
+        stale.write_text("fixture-stale\n")
+        stale.chmod(0o400)
+        other = run / "api-key.backup"
+        other.write_text("not ours to remove\n")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(stale.exists())
+        self.assertTrue(other.exists())
+        # No temporary file is left behind.
+        self.assertEqual(self.key_files(), sorted([self.key_file().name, other.name]))
 
     def test_comma_separated_keys_become_one_key_per_line(self):
         result = self.run_launcher(BONSAI_API_KEY="fixture-one,fixture-two")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.root / "run/api-key").read_text(),
-                         "fixture-one\nfixture-two\n")
+        self.assertEqual(self.key_file().read_text(), "fixture-one\nfixture-two\n")
         self.assertNotIn("fixture-two", "\n".join(self.server_args()))
 
     def test_key_the_file_format_would_change_fails_before_start(self):
         # '#' lines are comments in --api-key-file: with no other key the
         # server would run with no auth. A line break would add a key. An
-        # empty comma item is almost surely a typo.
+        # empty comma item is almost surely a typo. A double quote was CSV
+        # quoting for --api-key, but is literal in the file.
         for key in ("#fixture", "fixture,#second", "fixture\nsecond", "fixture\rx",
-                    ",fixture", "fixture,", "fixture,,second"):
+                    ",fixture", "fixture,", "fixture,,second",
+                    '"fixture"', 'fix"ture', 'fixture,"second,third"'):
             with self.subTest(key=key):
                 result = self.run_launcher(BONSAI_API_KEY=key)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("BONSAI_API_KEY", result.stderr)
                 self.assertNotIn("fixture", result.stderr)
                 self.assertFalse((self.bin_dir / "args").exists())
-                self.assertFalse((self.root / "run/api-key").exists())
+                self.assertEqual(self.key_files(), [])
+
+    def test_double_quote_error_names_the_cause(self):
+        result = self.run_launcher(BONSAI_API_KEY='fix"ture')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("double quote", result.stderr)
 
     BONSAI_WEIGHTS = {
         "bonsai-27b-ternary": "Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-PQ2_0.gguf",
@@ -171,7 +202,7 @@ class ServerStartup(unittest.TestCase):
         model = self.root / "models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf"
         model.parent.mkdir(parents=True)
         model.touch()
-        result = self.run_launcher(QCM_MODELS=" bonsai-27b-1bit ,\tqwen3.5-4b-q4_k_m,")
+        result = self.run_launcher(QCM_MODELS=" bonsai-27b-1bit ,\tqwen3.5-4b-q4_k_m ")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(set(self.presets().sections()),
                          {"*", "bonsai-27b-1bit", "qwen3.5-4b-q4_k_m"})
@@ -183,19 +214,51 @@ class ServerStartup(unittest.TestCase):
         for value in ("bonsai-27b-ternry", "bonsai-27b-1bit", "qwen3.5-9b-q4_k_m",
                       "bonsai-27b-ternary,bonsai-27b-1bit", "*", "a]b", ",",
                       "bonsai-27b ternary", "bonsai-27b-ternary\nbonsai-27b-1bit",
-                      "bonsai-27b-ternary\n"):
+                      "bonsai-27b-ternary\n", "bonsai-27b-ternary,",
+                      ",bonsai-27b-ternary", "bonsai-27b-ternary,,bonsai-27b-ternary",
+                      "bonsai-27b-ternary, ,bonsai-27b-ternary"):
             with self.subTest(value=value):
                 result = self.run_launcher(QCM_MODELS=value)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("QCM_MODELS", result.stderr)
                 self.assertFalse((self.bin_dir / "args").exists())
 
+    def write_preset(self, text):
+        (self.root / "models.ini.in").write_bytes(text.encode())
+
+    def test_model_allowlist_reads_crlf_presets(self):
+        self.touch_weights("bonsai-27b-ternary")
+        template = (ROOT / "models.ini.in").read_text().replace("\n", "\r\n")
+        self.write_preset(template)
+        result = self.run_launcher(QCM_MODELS="bonsai-27b-ternary")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(self.presets().sections()), {"*", "bonsai-27b-ternary"})
+        result = self.run_launcher(QCM_MODELS="bonsai-27b-1bit")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("weights that are missing", result.stderr)
+
+    def test_model_allowlist_reads_model_lines_without_spaces(self):
+        for name in ("alpha", "gamma"):
+            model = self.root / f"models/{name}.gguf"
+            model.parent.mkdir(parents=True, exist_ok=True)
+            model.touch()
+        self.write_preset("[*]\njinja = true\n\n"
+                          "[alpha]\nmodel=@ROOT@/models/alpha.gguf\n\n"
+                          "[beta]\nmodel =@ROOT@/models/beta.gguf\n\n"
+                          "[gamma]\n  model=  @ROOT@/models/gamma.gguf  \r\n")
+        result = self.run_launcher(QCM_MODELS="alpha,gamma")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(self.presets().sections()), {"*", "alpha", "gamma"})
+        result = self.run_launcher(QCM_MODELS="beta")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("beta.gguf", result.stderr)
+
     def test_model_allowlist_rejects_bonsai_without_weights(self):
         # The weight filter never drops Bonsai sections; the allow-list check
         # must still see that the file is missing.
         result = self.run_launcher(QCM_MODELS="bonsai-27b-ternary")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("weights are missing", result.stderr)
+        self.assertIn("weights that are missing", result.stderr)
         self.assertIn("Ternary-Bonsai-27B-PQ2_0.gguf", result.stderr)
 
     def test_model_allowlist_empties_the_download_cache(self):
