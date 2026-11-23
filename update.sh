@@ -831,14 +831,20 @@ webui_image_id_now() {
   printf '%s' "$id"
 }
 
-# Run inside the open-webui image, so it needs nothing on the host. Open
-# WebUI keeps its SQLite database in WAL mode, and new rows (the no-login
-# admin among them) can still sit in webui.db-wal. The volume is mounted
-# read-only, so the database and its WAL are copied to the container's own
-# /tmp and opened there; opening the volume copy with immutable=1 skips the
-# WAL and misses those rows (seen on v0.13.4).
+# Run inside the open-webui image, so it needs nothing on the host.
+# It answers "found" only when the auth row for admin@localhost still takes
+# the password "admin" — checked the way Open WebUI v0.13.4 does it
+# (utils/auth.py verify_password: argon2 for "$argon2" hashes, else bcrypt;
+# models/auths.py: table auth, columns email and password). An admin who
+# changed that password is "none". No auth table, or no hash library, is
+# "unknown": this check then holds nothing and webui-guard.sh decides.
+# Open WebUI keeps its SQLite database in WAL mode, and new rows can still
+# sit in webui.db-wal. The volume is mounted read-only, so the database and
+# its WAL are copied to the container's own /tmp and opened there; opening
+# the volume copy with immutable=1 skips the WAL (seen on v0.13.4).
+# QCM_PROBE_DATA exists for the tests only.
 ADMIN_PROBE_PY='import os, shutil, sqlite3, tempfile
-src = "/app/backend/data"
+src = os.environ.get("QCM_PROBE_DATA", "/app/backend/data")
 if not os.path.exists(os.path.join(src, "webui.db")):
     print("none"); raise SystemExit
 d = tempfile.mkdtemp()
@@ -847,17 +853,39 @@ for name in ("webui.db", "webui.db-wal"):
         shutil.copy(os.path.join(src, name), os.path.join(d, name))
 c = sqlite3.connect(os.path.join(d, "webui.db"))
 try:
-    n = c.execute("select count(*) from user where lower(email) = ?",
-                  ("admin@localhost",)).fetchone()[0]
-except sqlite3.OperationalError:
-    print("none"); raise SystemExit
-print("found" if n else "none")'
+    rows = c.execute("select password from auth where lower(email) = ?",
+                     ("admin@localhost",)).fetchall()
+except sqlite3.Error:
+    print("unknown"); raise SystemExit
+
+def takes_admin(h):
+    if not h:
+        return False
+    if h.startswith("$argon2"):
+        from argon2 import PasswordHasher
+        from argon2.exceptions import InvalidHashError, VerificationError
+        try:
+            return PasswordHasher().verify(h, "admin")
+        except (InvalidHashError, VerificationError):
+            return False
+    import bcrypt
+    try:
+        return bcrypt.checkpw(b"admin", h.encode("utf-8"))
+    except ValueError:
+        return False
+
+try:
+    hit = any(takes_admin(r[0]) for r in rows)
+except Exception:
+    print("unknown"); raise SystemExit
+print("found" if hit else "none")'
 
 # default_admin_in_volume <image>
-#   0  the open-webui-data volume holds admin@localhost — the account Open
-#      WebUI makes while login is off, with the password "admin"
-#   1  it does not (or there is no data yet)
-#   2  could not tell
+#   0  the open-webui-data volume holds admin@localhost, the account Open
+#      WebUI makes while login is off, and it still takes the password
+#      "admin"
+#   1  it does not, its password was changed, or there is no data yet
+#   2  could not tell (unknown database layout, no hash library, no image)
 # Reads the volume read-only, in a throwaway container with no network.
 default_admin_in_volume() {
   local img="${1:-}" cid proj vol out
@@ -899,8 +927,9 @@ start_stack() {
     if (( rc == 0 )); then
       UI_HELD=1
       warn "NOT starting the chat UI: WEBUI_AUTH=true, but its data volume holds
-admin@localhost (password \"admin\"), made while login was off. With login on,
-anyone who reaches the UI could sign in as admin. Starting llama only.
+admin@localhost, made while login was off, and that account still takes the
+password \"admin\". With login on, anyone who reaches the UI could sign in as
+admin. Starting llama only.
 Fix: back up the open-webui-data volume and start with a FRESH one, or set
 WEBUI_AUTH=false in .env."
       compose stop open-webui || warn "could not stop open-webui"
@@ -1059,6 +1088,10 @@ running_working_dir() {
 # QCM_UPDATE_REEXEC names the new copy, so only that copy counts as handed
 # over and a leaked value cannot fake one; the lock on fd 9 is kept across
 # the exec (see take_lock).
+# The interpreter the handover execs. A variable only so the tests can make
+# the exec fail; nothing reads it from the environment.
+UPDATER_SHELL="bash"
+
 reexec_if_updater_changed() {
   local old="${1:-}" target="${2:-}" copy self_temp=0
   [[ -n "$old" && -n "$target" ]] || return 0
@@ -1072,27 +1105,74 @@ reexec_if_updater_changed() {
     return 0
   fi
   chmod +x "$copy"
+  # A new update.sh that does not even parse would die at once, leaving the
+  # merged code unbuilt. Finish with this copy instead.
+  if ! "$BASH" -n "$copy" 2>/dev/null; then
+    rm -f -- "$copy"
+    warn "the new update.sh does not parse; finishing this run with the current one"
+    return 0
+  fi
   log "this update changes update.sh — handing the rest of the run to the new version"
   looks_like_temp_copy && self_temp=1
   export QCM_UPDATE_REEXEC="$copy" BONSAI_UPDATE_REEXEC="$copy" BONSAI_UPDATE_ROOT="$ROOT"
   export QCM_RESUME_V=1 QCM_RESUME_OLD="$old" QCM_RESUME_TARGET="$target" \
          QCM_RESUME_PIN="${3:-}" QCM_RESUME_UI_BEFORE="${4:-0}" \
          QCM_RESUME_WEBUI_REF="${5:-}"
-  # exec runs no EXIT trap, so clean up what this copy owns first.
+  # exec runs no EXIT trap, so clean up what this copy owns first. Bash keeps
+  # reading this script through its open file, so deleting it is safe even
+  # if the exec below fails and the run carries on here.
   cleanup
   (( self_temp )) && rm -f -- "$SELF"
-  exec bash "$copy" --resume-after-merge
+  # execfail: a failed exec returns here instead of ending the shell.
+  shopt -s execfail
+  exec "$UPDATER_SHELL" "$copy" --resume-after-merge
+  # Only reached when the exec failed. Undo the handover and finish here.
+  warn "could not start the new update.sh; finishing this run with the current one"
+  rm -f -- "$copy"
+  unset QCM_UPDATE_REEXEC QCM_RESUME_V QCM_RESUME_OLD QCM_RESUME_TARGET \
+        QCM_RESUME_PIN QCM_RESUME_UI_BEFORE QCM_RESUME_WEBUI_REF
+  (( self_temp )) && export BONSAI_UPDATE_REEXEC="$SELF"
+  RUN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/bonsai-run.XXXXXX" 2>/dev/null)" || RUN_TMP=""
+  return 0
+}
+
+# undo_handover_merge <old-head> <target>
+#
+# A handed-over copy that cannot even start its work must not leave the
+# merged code in place, unbuilt: the next run would find the code current
+# and report "already up to date". Same undo as a failed build.
+undo_handover_merge() {
+  local old="${1:-}" target="${2:-}"
+  [[ -n "$old" ]] || { warn "no old commit in the handoff; cannot undo the merge"; return 1; }
+  if ! stash_local_edits; then
+    warn "leaving the checkout on ${target:0:12} to preserve uncommitted work"
+    return 1
+  fi
+  git -C "$ROOT" reset --hard "$old" >/dev/null 2>&1 \
+    || { warn "could not undo the merge; the checkout is left on ${target:0:12}"; return 1; }
+  warn "undid the merge: the checkout is back on ${old:0:12}"
 }
 
 # resume_after_merge: the entry point of a handed-over copy.
 resume_after_merge() {
+  # Not started by a real handover: touch nothing.
   [[ -n "${QCM_UPDATE_REEXEC:-}" && "$QCM_UPDATE_REEXEC" == "$SELF" ]] \
     || die "--resume-after-merge is internal: only update.sh itself starts it"
-  [[ "${QCM_RESUME_V:-}" == "1" ]] \
-    || die "cannot resume: unknown handoff version '${QCM_RESUME_V:-}'"
-  [[ -n "${QCM_RESUME_OLD:-}" && -n "${QCM_RESUME_TARGET:-}" ]] \
-    || die "cannot resume: the handoff is missing the commits"
-  preflight update
+  local why=""
+  if [[ "${QCM_RESUME_V:-}" != "1" ]]; then
+    why="unknown handoff version '${QCM_RESUME_V:-}'"
+  elif [[ -z "${QCM_RESUME_OLD:-}" || -z "${QCM_RESUME_TARGET:-}" ]]; then
+    why="the handoff is missing the commits"
+  elif ! ( preflight update ); then
+    # In a subshell: preflight ends with die, and the merge must still be
+    # undone after it.
+    why="preflight failed (see above)"
+  fi
+  if [[ -n "$why" ]]; then
+    warn "cannot resume the update: $why — undoing the merge"
+    undo_handover_merge "${QCM_RESUME_OLD:-}" "${QCM_RESUME_TARGET:-}"
+    exit 1
+  fi
   take_lock
   log "resuming the update with the new update.sh"
   update_apply "$QCM_RESUME_OLD" "$QCM_RESUME_TARGET" 1 "${QCM_RESUME_PIN:-}" \

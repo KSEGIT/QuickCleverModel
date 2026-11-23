@@ -3964,3 +3964,159 @@ class SnapshotAndRestoreDetails(unittest.TestCase):
             with open(state) as fh:
                 body = fh.read()
         self.assertEqual(body.count("bad=NEW"), 1, body)
+
+
+class TheAdminProbeChecksThePassword(unittest.TestCase):
+    """An admin@localhost row whose password was changed is safe; holding
+    the UI down for it would keep it down forever. The probe is the real
+    ADMIN_PROBE_PY from update.sh, run against a fixture database, with a
+    fake bcrypt module so the runner needs no real one."""
+
+    FAKE_BCRYPT = (
+        "def checkpw(pw, h):\n"
+        "    if h == b'BROKEN':\n"
+        "        raise ValueError('bad hash')\n"
+        "    return h == b'HASH-' + pw\n"
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.data = os.path.join(self.tmp, "data")
+        os.makedirs(self.data)
+        self.mods = os.path.join(self.tmp, "mods")
+        os.makedirs(self.mods)
+        with open(os.path.join(self.mods, "bcrypt.py"), "w") as fh:
+            fh.write(self.FAKE_BCRYPT)
+        r = run_fn('printf "%s" "$ADMIN_PROBE_PY" #')
+        self.probe = r.stdout
+        self.assertIn("select password from auth", self.probe)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _db(self, rows, table=True):
+        import sqlite3
+        c = sqlite3.connect(os.path.join(self.data, "webui.db"))
+        if table:
+            c.execute("create table auth (id text, email text, password text, "
+                      "active boolean)")
+            c.executemany("insert into auth values (?, ?, ?, 1)", rows)
+        else:
+            c.execute("create table other (x text)")
+        c.commit()
+        c.close()
+
+    def _run(self, mods=None):
+        env = dict(os.environ, QCM_PROBE_DATA=self.data,
+                   PYTHONPATH=mods if mods is not None else self.mods)
+        r = subprocess.run(["python3", "-c", self.probe], capture_output=True,
+                           text=True, env=env)
+        return r.stdout.strip()
+
+    def test_the_default_password_is_found(self):
+        self._db([("1", "admin@localhost", "HASH-admin")])
+        self.assertEqual(self._run(), "found")
+
+    def test_a_changed_password_is_none(self):
+        self._db([("1", "admin@localhost", "HASH-s3cret")])
+        self.assertEqual(self._run(), "none")
+
+    def test_no_such_account_is_none(self):
+        self._db([("1", "real@example.com", "HASH-admin")])
+        self.assertEqual(self._run(), "none")
+
+    def test_no_database_is_none(self):
+        self.assertEqual(self._run(), "none")
+
+    def test_an_unknown_layout_is_unknown(self):
+        self._db([], table=False)
+        self.assertEqual(self._run(), "unknown")
+
+    def test_no_hash_library_is_unknown(self):
+        self._db([("1", "admin@localhost", "HASH-admin")])
+        broken = os.path.join(self.tmp, "broken")
+        os.makedirs(broken)
+        with open(os.path.join(broken, "bcrypt.py"), "w") as fh:
+            fh.write("raise ImportError('no bcrypt here')\n")
+        self.assertEqual(self._run(mods=broken), "unknown")
+
+    def test_a_malformed_hash_is_not_found(self):
+        self._db([("1", "admin@localhost", "BROKEN")])
+        self.assertEqual(self._run(), "none")
+
+    def test_unknown_does_not_hold_the_ui(self):
+        r = run_real(
+            'WEBUI_AUTH=true; default_admin_in_volume() { return 2; }; '
+            'compose() { echo "COMPOSE $*"; }',
+            'start_stack -d; echo "held=$UI_HELD"')
+        self.assertIn("COMPOSE up -d\n", r.stdout)
+        self.assertIn("held=0", r.stdout)
+
+
+class AFailedHandoverNeverStrandsTheMerge(unittest.TestCase):
+    """Merged code with no build and no rollback looks "already up to date"
+    to every later run."""
+
+    def _root(self, d, body):
+        root = os.path.join(d, "root")
+        os.makedirs(root)
+        with open(os.path.join(root, "update.sh"), "w") as fh:
+            fh.write(body)
+        return root
+
+    def test_a_new_updater_that_does_not_parse_is_not_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d, 'echo NEW RAN\nif then fi (\n')
+            r = run_real(f'ROOT={shlex.quote(root)}; '
+                         'git() { case "$*" in *"diff --quiet"*) return 1;; esac; return 0; }',
+                         'reexec_if_updater_changed OLD NEW pin 1 ref')
+        self.assertIn("does not parse", r.stderr)
+        self.assertNotIn("NEW RAN", r.stdout)
+        self.assertIn("rc=0", r.stdout, "this copy must carry on")
+
+    def test_a_failed_exec_carries_on_with_this_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d, 'echo NEW RAN\n')
+            r = run_real(f'ROOT={shlex.quote(root)}; UPDATER_SHELL=/nonexistent/bash; '
+                         'git() { case "$*" in *"diff --quiet"*) return 1;; esac; return 0; }',
+                         'reexec_if_updater_changed OLD NEW pin 1 ref; '
+                         'echo "after flag=[${QCM_UPDATE_REEXEC:-}] v=[${QCM_RESUME_V:-}] '
+                         'tmp=$([ -d "$RUN_TMP" ] && echo yes)"')
+        self.assertIn("could not start the new update.sh", r.stderr)
+        self.assertIn("after flag=[] v=[] tmp=yes", r.stdout,
+                      "the handoff must be undone so this copy runs normally")
+
+    def _resume(self, extra):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "log")
+            setup = (
+                f'L={shlex.quote(log)}; QCM_UPDATE_REEXEC="$SELF"; '
+                'QCM_RESUME_OLD=OLD; QCM_RESUME_TARGET=NEW; '
+                'stash_local_edits() { echo STASH >> "$L"; }; '
+                'git() { echo "GIT $*" >> "$L"; return 0; }; '
+                'take_lock() { :; }; update_apply() { echo APPLY >> "$L"; }; '
+                + extra
+            )
+            r = run_real(setup, 'resume_after_merge')
+            body = open(log).read() if os.path.exists(log) else ""
+            return r, body
+
+    def test_a_failed_preflight_undoes_the_merge(self):
+        r, body = self._resume('QCM_RESUME_V=1; preflight() { die "boom"; }')
+        self.assertIn("preflight failed", r.stderr)
+        self.assertIn("STASH", body)
+        self.assertIn("reset --hard OLD", body)
+        self.assertLess(body.index("STASH"), body.index("reset --hard OLD"))
+        self.assertNotIn("APPLY", body)
+        self.assertNotIn("rc=0", r.stdout, "it must exit non-zero")
+
+    def test_an_unknown_handoff_version_undoes_the_merge(self):
+        r, body = self._resume('QCM_RESUME_V=9; preflight() { :; }')
+        self.assertIn("unknown handoff version", r.stderr)
+        self.assertIn("reset --hard OLD", body)
+        self.assertNotIn("APPLY", body)
+
+    def test_a_good_handoff_does_not_undo(self):
+        r, body = self._resume('QCM_RESUME_V=1; preflight() { :; }')
+        self.assertIn("APPLY", body)
+        self.assertNotIn("reset --hard", body)
