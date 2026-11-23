@@ -3273,8 +3273,7 @@ class TheWebuiImageComesFromCompose(unittest.TestCase):
                          "    image: \"right/webui:2\"  # pinned\n"
                          "volumes:\n  open-webui-data:\n")
             r = run_real(':', f'webui_image_in_file {shlex.quote(f)}')
-        self.assertIn("right/webui:2
-rc=0", r.stdout, r.stderr)
+        self.assertIn("right/webui:2\nrc=0", r.stdout, r.stderr)
 
     def test_a_commit_that_changes_the_image_is_followed(self):
         """After the merge, the pull and the snapshot use the NEW image."""
