@@ -20,7 +20,7 @@ cmake -S src/llama.cpp-prism -B src/llama.cpp-prism/build -DCMAKE_BUILD_TYPE=Rel
 cmake --build src/llama.cpp-prism/build --target llama-server -j
 
 # 2. Python env for Open WebUI
-python3.11 -m venv .venv && .venv/bin/pip install open-webui==0.11.3
+python3.11 -m venv .venv && .venv/bin/pip install open-webui==0.13.4
 
 # 3. API key (enforced by the router — the server binds 0.0.0.0)
 printf 'BONSAI_API_KEY=bonsai-%s\n' "$(openssl rand -hex 20)" > .env && chmod 600 .env
@@ -81,6 +81,11 @@ docker compose --env-file .env -f docker/compose.yaml up -d
 ```
 
 It points at `host.docker.internal:8080`.
+
+Migration note: `docker/compose.yaml` now sets
+`ENABLE_PERSISTENT_CONFIG=false`, like the Linux file. `.env` wins on every
+start, so settings you change in the Open WebUI Admin Panel no longer
+survive a restart. Put them in `.env` instead.
 
 Tunables (env): `BONSAI_CTX` (default 8192), `BONSAI_PORT`, `BONSAI_HOST`,
 `BONSAI_MODELS_MAX` (default 1 — see

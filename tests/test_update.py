@@ -2208,7 +2208,7 @@ class RollbackAvoidsNoOpRecreate(unittest.TestCase):
                 'image:bonsai-llama:rollback) echo sha256:llama;; '
                 'image:bonsai-llama:cuda) echo sha256:llama;; '
                 'image:sha256:webui) return 0;; '
-                'image:ghcr.io/open-webui/open-webui:v0.11.3) echo sha256:webui;; '
+                'image:ghcr.io/open-webui/open-webui:*) echo sha256:webui;; '
                 'tag:*) echo "TAG RAN";; esac; }; '
                 'compose() { echo "COMPOSE RAN"; }; '
                 'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
@@ -3228,3 +3228,895 @@ class SystemdUnits(unittest.TestCase):
             body = fh.read()
         self.assertIn("WantedBy=timers.target", body,
                       "without an [Install] section `systemctl enable` fails")
+
+
+# --- Open WebUI image, data snapshots and the default-admin check ------------
+
+# The cmd_update stubs every test below shares: a box where the code moves
+# (OLD -> NEW), the models answer and the UI answers before and after.
+UPDATE_STUBS = (
+    'preflight() { :; }; take_lock() { :; }; '
+    'is_pinned_bad() { return 1; }; record_rollback_point() { :; }; '
+    'wait_for_health() { return 0; }; smoke() { return 0; }; '
+    'webui_ok() { return 0; }; stash_local_edits() { :; }; '
+    'local_image_digest() { echo "digest-$1"; }; '
+    'remote_image_digest() { echo other; }; '
+    'git() { case "$*" in *"merge-base --is-ancestor"*) return 1;; '
+    '*"rev-parse HEAD"*) echo OLD;; *rev-parse*) echo NEW;; esac; return 0; }; '
+)
+
+
+class TheWebuiImageComesFromCompose(unittest.TestCase):
+    """A hand-copied tag in update.sh had to be bumped in step with the
+    compose file. A commit that bumped only the compose file made the run
+    pull and start the new image while it compared and restored the old."""
+
+    def test_compose_names_the_image(self):
+        r = run_real(
+            "compose() { printf 'bonsai-llama:cuda\\nexample/webui:9.9\\n'; }",
+            'resolve_webui_image')
+        self.assertIn("example/webui:9.9rc=0", r.stdout, r.stderr)
+
+    def test_noise_from_compose_falls_back_to_the_file(self):
+        """A compose that prints something that is not one image reference
+        must not become the image name."""
+        r = run_real('compose() { echo "two words"; }', 'resolve_webui_image')
+        self.assertRegex(r.stdout, r"ghcr\.io/open-webui/open-webui:\S+rc=0")
+        self.assertIn("read ", r.stderr)
+
+    def test_the_file_parser_reads_only_the_open_webui_service(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "c.yaml")
+            with open(f, "w") as fh:
+                fh.write("services:\n  llama:\n    image: wrong:1\n"
+                         "  open-webui:\n    container_name: x\n"
+                         "    image: \"right/webui:2\"  # pinned\n"
+                         "volumes:\n  open-webui-data:\n")
+            r = run_real(':', f'webui_image_in_file {shlex.quote(f)}')
+        self.assertIn("right/webui:2\nrc=0", r.stdout, r.stderr)
+
+    def test_a_commit_that_changes_the_image_is_followed(self):
+        """After the merge, the pull and the snapshot use the NEW image."""
+        setup = (
+            UPDATE_STUBS +
+            'WEBUI_IMAGE=old/webui:1; '
+            'resolve_webui_image() { echo new/webui:2; }; '
+            'docker() { case "$*" in "image inspect old/webui:1"*) echo sha256:A;; '
+            '"image inspect new/webui:2"*) echo sha256:B;; esac; return 0; }; '
+            'snapshot_webui_data() { echo "SNAPSHOT $1"; }; '
+            'run_webui_guard() { return 0; }; '
+            'compose() { echo "COMPOSE $1 $2"; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("old/webui:1 -> new/webui:2", out)
+        self.assertIn("COMPOSE pull open-webui", out)
+        self.assertIn("SNAPSHOT sha256:A", out)
+        self.assertLess(out.index("SNAPSHOT sha256:A"), out.index("COMPOSE up"),
+                        "the data must be saved before the new image starts")
+        self.assertIn("update complete and verified", out)
+
+    def test_a_ui_broken_by_an_image_change_in_the_commit_pins_it(self):
+        setup = (
+            UPDATE_STUBS +
+            'WEBUI_IMAGE=old/webui:1; '
+            'resolve_webui_image() { echo new/webui:2; }; '
+            'docker() { return 0; }; compose() { return 0; }; '
+            'W=0; webui_ok() { W=$((W+1)); [ "$W" = 1 ] && return 0; return 1; }; '
+            'do_rollback() { echo "ROLLBACK pin=[${1:-}]"; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("ROLLBACK pin=[pin]", out,
+                      "the commit chose the image, so the commit is to blame")
+        self.assertIn("changed\nthe open-webui image", out)
+
+
+class WebuiDataIsSnapshotted(unittest.TestCase):
+    """Open WebUI migrates its database on first start, one way. An image
+    rollback without the data left a database the old image cannot read."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.snaps = os.path.join(self.tmp, "snaps")
+        self.state = os.path.join(self.tmp, "state")
+        with open(self.state, "w") as fh:
+            fh.write("sha=x\nwebui=sha256:A\n")
+        self.log = os.path.join(self.tmp, "log")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _read(self, path):
+        if not os.path.exists(path):
+            return ""
+        with open(path) as fh:
+            return fh.read()
+
+    def _snapshot(self, run_rc=0):
+        setup = (
+            f'SNAP_DIR={shlex.quote(self.snaps)}; STATE={shlex.quote(self.state)}; '
+            f'L={shlex.quote(self.log)}; '
+            'compose() { case "$1" in ps) echo cid1;; stop) echo "STOP $2" >> "$L";; '
+            'esac; return 0; }; '
+            'docker() { echo "DOCKER $*" >> "$L"; '
+            '[ "$1" = run ] || return 0; '
+            f'[ {run_rc} = 0 ] || return {run_rc}; '
+            'for a in "$@"; do last="$a"; done; : > "$SNAP_DIR/$last.part"; }'
+        )
+        r = run_real(setup, 'snapshot_webui_data sha256:A')
+        return r, self._read(self.log), self._read(self.state)
+
+    def test_the_volume_is_saved_and_recorded(self):
+        r, log, state = self._snapshot()
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertLess(log.index("STOP open-webui"), log.index("DOCKER run"),
+                        "the database must not be copied while it is written")
+        self.assertIn("--volumes-from cid1", log)
+        self.assertIn("umask 077", log, "chats must stay root-only")
+        files = os.listdir(self.snaps)
+        self.assertEqual(len(files), 1, files)
+        self.assertTrue(files[0].endswith(".tar.gz"), files)
+        self.assertIn(f"webui_snapshot=sha256:A {self.snaps}/{files[0]}", state)
+
+    def test_a_failed_copy_records_nothing(self):
+        r, _, state = self._snapshot(run_rc=1)
+        self.assertIn("rc=1", r.stdout)
+        self.assertNotIn("webui_snapshot=", state)
+        self.assertEqual(os.listdir(self.snaps), [], "a half archive was left")
+
+    def test_only_the_newest_two_are_kept(self):
+        os.makedirs(self.snaps)
+        names = [f"open-webui-data-2026010{i}T000000Z.tar.gz" for i in range(1, 5)]
+        for n in names:
+            open(os.path.join(self.snaps, n), "w").close()
+        open(os.path.join(self.snaps, "keep-me.txt"), "w").close()
+        r = run_real(':', f'prune_snapshots {shlex.quote(self.snaps)} 2')
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertEqual(sorted(os.listdir(self.snaps)),
+                         sorted(names[2:] + ["keep-me.txt"]))
+
+    def test_the_proven_points_snapshot_survives_pruning(self):
+        """Unverified runs keep an older rollback point, so its snapshot can
+        be older than the newest two — and it is the only usable one."""
+        os.makedirs(self.snaps)
+        names = [f"open-webui-data-2026010{i}T000000Z.tar.gz" for i in range(1, 5)]
+        for n in names:
+            open(os.path.join(self.snaps, n), "w").close()
+        oldest = os.path.join(self.snaps, names[0])
+        with open(self.state, "w") as fh:
+            fh.write(f"sha=x\nwebui=sha256:A\nwebui_snapshot=sha256:A {oldest}\n")
+        r = run_real(f'STATE={shlex.quote(self.state)}',
+                     f'prune_snapshots {shlex.quote(self.snaps)} 2')
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertEqual(sorted(os.listdir(self.snaps)),
+                         sorted([names[0]] + names[2:]))
+
+    def test_a_republished_tag_still_gets_a_snapshot(self):
+        """Same tag, new image: the pull moves the tag, so the old ID must
+        come from the running container, read before the pull."""
+        setup = (
+            UPDATE_STUBS +
+            'resolve_webui_image() { echo "$WEBUI_IMAGE"; }; '
+            'webui_container() { echo cid1; }; '
+            'docker() { case "$1 $2" in "inspect cid1") echo sha256:A;; '
+            '"image inspect") echo sha256:B;; esac; return 0; }; '
+            'snapshot_webui_data() { echo "SNAPSHOT $1"; }; '
+            'run_webui_guard() { return 0; }; '
+            'compose() { echo "COMPOSE $1"; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("SNAPSHOT sha256:A", out)
+        self.assertLess(out.index("SNAPSHOT"), out.index("COMPOSE up"))
+
+    def test_no_container_means_nothing_to_save(self):
+        r = run_real(
+            f'SNAP_DIR={shlex.quote(self.snaps)}; STATE={shlex.quote(self.state)}; '
+            'compose() { return 0; }; docker() { echo DOCKER RAN; }',
+            'snapshot_webui_data sha256:A')
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertNotIn("DOCKER RAN", r.stdout)
+
+    def test_no_snapshot_means_the_new_image_does_not_start(self):
+        setup = (
+            UPDATE_STUBS +
+            'WEBUI_IMAGE=old/webui:1; '
+            'resolve_webui_image() { echo new/webui:2; }; '
+            'docker() { case "$*" in "image inspect old/webui:1"*) echo sha256:A;; '
+            '"image inspect new/webui:2"*) echo sha256:B;; esac; return 0; }; '
+            'snapshot_webui_data() { return 1; }; '
+            'do_rollback() { echo "ROLLBACK"; return 0; }; '
+            'compose() { echo "COMPOSE $1"; return 0; }'
+        )
+        # cmd_update exits after the rollback, so no rc= line follows.
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("ROLLBACK", out)
+        self.assertIn("will NOT be started", out)
+        self.assertNotIn("COMPOSE up", out)
+
+    def test_the_same_image_takes_no_snapshot(self):
+        setup = (
+            UPDATE_STUBS +
+            'resolve_webui_image() { echo "$WEBUI_IMAGE"; }; '
+            'docker() { case "$1 $2" in "image inspect") echo sha256:A;; esac; '
+            'return 0; }; '
+            'snapshot_webui_data() { echo SNAPSHOT; }; '
+            'run_webui_guard() { return 0; }; compose() { return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        self.assertNotIn("SNAPSHOT", r.stdout + r.stderr)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+
+
+class RollbackBringsTheDataBack(unittest.TestCase):
+    """do_rollback restores the snapshot taken under the image it returns to,
+    and only when the container ran a different image since."""
+
+    def _rollback(self, ran, snap_line):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write("sha=SAME\nwebui=sha256:A\nllama=sha256:L\n"
+                         f"verified=1\n{snap_line}")
+            setup = (
+                f'STATE={shlex.quote(state)}; '
+                'git() { case "$*" in *"rev-parse HEAD"*) echo SAME;; esac; return 0; }; '
+                'resolve_webui_image() { echo old/webui:1; }; '
+                'webui_container() { echo cid1; }; '
+                f'docker() {{ case "$1 $2" in "inspect cid1") echo {ran};; '
+                '"image inspect") case "$3" in old/webui:1) echo sha256:A;; '
+                '*) echo sha256:L;; esac;; esac; return 0; }; '
+                'restore_webui_data() { echo "RESTORE $1 FROM $2"; return 0; }; '
+                'compose() { echo "COMPOSE $1"; return 0; }; '
+                'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+                'smoke() { return 0; }'
+            )
+            r = run_real(setup, 'do_rollback')
+            return r.stdout + r.stderr
+
+    def test_a_newer_image_ran_so_the_data_comes_back(self):
+        out = self._rollback("sha256:B",
+                             "webui_snapshot=sha256:A /snaps/one two.tar.gz\n")
+        self.assertIn("RESTORE /snaps/one two.tar.gz FROM sha256:A", out)
+        self.assertIn("COMPOSE up", out, "restored data needs a recreate")
+        self.assertIn("rollback verified", out)
+
+    def test_the_new_image_never_ran_so_the_data_stays(self):
+        out = self._rollback("sha256:A",
+                             "webui_snapshot=sha256:A /snaps/one.tar.gz\n")
+        self.assertNotIn("RESTORE", out)
+
+    def test_a_failed_restore_leaves_the_ui_stopped(self):
+        """Recreating would start the old image on half-restored data, and
+        a recreated container would hide the unfinished restore from the
+        next --rollback."""
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write("sha=OLD\nwebui=sha256:A\nllama=sha256:L\nverified=1\n"
+                         "webui_snapshot=sha256:A /snaps/a.tar.gz\n")
+            setup = (
+                f'STATE={shlex.quote(state)}; '
+                'git() { case "$*" in *"rev-parse HEAD"*) echo NEW;; esac; return 0; }; '
+                'stash_local_edits() { return 0; }; '
+                'resolve_webui_image() { echo old/webui:1; }; '
+                'webui_container() { echo cid1; }; '
+                'docker() { case "$1 $2" in "inspect cid1") echo sha256:B;; '
+                '"image inspect") case "$3" in old/webui:1) echo sha256:A;; '
+                '*) echo sha256:L;; esac;; esac; return 0; }; '
+                'restore_webui_data() { return 1; }; '
+                'compose() { echo "COMPOSE $*"; return 0; }; '
+                'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+                'smoke() { return 0; }'
+            )
+            r = run_real(setup, 'do_rollback pin')
+            out = r.stdout + r.stderr
+            with open(state) as fh:
+                body = fh.read()
+        self.assertIn("rc=1", out)
+        self.assertIn("LEFT STOPPED", out)
+        self.assertIn("COMPOSE up -d --force-recreate llama", out)
+        self.assertNotIn("COMPOSE up -d --force-recreate\n", out,
+                         "the whole stack, UI included, was recreated")
+        self.assertIn("bad=NEW", body, "the pin must survive the early stop")
+
+    def test_no_rollback_image_means_the_data_stays(self):
+        """With image A pruned, the newer image keeps running, so putting
+        A's data back would only lose the chats since the snapshot."""
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write("sha=SAME\nwebui=sha256:A\nllama=sha256:L\nverified=1\n"
+                         "webui_snapshot=sha256:A /snaps/a.tar.gz\n")
+            setup = (
+                f'STATE={shlex.quote(state)}; '
+                'git() { case "$*" in *"rev-parse HEAD"*) echo SAME;; esac; return 0; }; '
+                'resolve_webui_image() { echo old/webui:1; }; '
+                'webui_container() { echo cid1; }; '
+                'docker() { case "$1 $2" in "inspect cid1") echo sha256:B;; '
+                '"image inspect") case "$3" in sha256:A) return 1;; '
+                'old/webui:1) echo sha256:B;; *) echo sha256:L;; esac;; esac; return 0; }; '
+                'restore_webui_data() { echo RESTORE; return 0; }; '
+                'compose() { return 0; }; wait_for_health() { return 0; }; '
+                'webui_ok() { return 0; }; smoke() { return 0; }; '
+                'run_webui_guard() { return 0; }'
+            )
+            r = run_real(setup, 'do_rollback')
+        out = r.stdout + r.stderr
+        self.assertNotIn("RESTORE", out)
+        self.assertIn("not restoring the open-webui data", out)
+        self.assertIn("rc=1", out)
+
+    def test_a_snapshot_of_another_image_is_not_used(self):
+        out = self._rollback("sha256:B",
+                             "webui_snapshot=sha256:Z /snaps/z.tar.gz\n")
+        self.assertNotIn("RESTORE", out)
+        self.assertIn("no data\nsnapshot of sha256:A", out)
+
+
+class WebuiModelIsChecked(unittest.TestCase):
+    """WEBUI_MODEL is pasted into OPENAI_API_CONFIGS JSON in the compose
+    file, so it must be a plain id; and a typo leaves users with one model
+    that never answers."""
+
+    def test_plain_ids_pass(self):
+        for good in ("", "bonsai-27b-ternary", "qwen3.5-9b-q4_k_m",
+                     "org/model:tag"):
+            r = run_real(':', f'webui_model_ok {shlex.quote(good)}')
+            self.assertIn("rc=0", r.stdout, good)
+
+    def test_json_breaking_ids_fail(self):
+        for bad in ('a"b', "a b", "a,b", 'x"]},{"y', "a$b", "a;b"):
+            r = run_real(':', f'webui_model_ok {shlex.quote(bad)}')
+            self.assertIn("rc=1", r.stdout, bad)
+
+    def test_preflight_refuses_a_bad_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "f")
+            open(f, "w").close()
+            r = run_real(f'{_TOOLS_PRESENT}; COMPOSE_FILE={shlex.quote(f)}; '
+                         f'ENV_FILE={shlex.quote(f)}; '
+                         'BONSAI_API_KEY=k; WEBUI_MODEL=\'a"b\'',
+                         'preflight update')
+        self.assertIn("is not a plain model id", r.stderr)
+        self.assertNotIn("rc=0", r.stdout)
+
+    def _smoke(self, model):
+        script = (
+            'set -uo pipefail; export BONSAI_UPDATE_LIB=1; '
+            f'source "{UPDATE_SH}"; API=http://stub; BONSAI_API_KEY=k; '
+            f'WEBUI_MODEL={shlex.quote(model)}; '
+            'ask() { case "$1" in '
+            f'*models) ASK_CODE=200; ASK_BODY={shlex.quote(MODELS_LIST)};; '
+            f'*) ASK_CODE=200; ASK_BODY={shlex.quote(GOOD_CONTENT)};; '
+            'esac; return 0; }; smoke; echo "rc=$?"'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        return r.stdout + r.stderr
+
+    def test_a_model_the_server_lacks_is_reported(self):
+        out = self._smoke("bonsai-27b-typo")
+        self.assertIn("WEBUI_MODEL=bonsai-27b-typo is not in", out)
+        self.assertIn("rc=0", out, "a warning, not a verdict on the models")
+
+    def test_a_served_model_says_nothing(self):
+        self.assertNotIn("WEBUI_MODEL", self._smoke("bonsai-27b-ternary"))
+
+
+class TheDefaultAdminCheckRunsEveryTime(unittest.TestCase):
+    """A run that serves can still expose admin@localhost / admin."""
+
+    def test_a_tripped_guard_fails_the_update(self):
+        setup = (
+            UPDATE_STUBS +
+            'resolve_webui_image() { echo "$WEBUI_IMAGE"; }; '
+            'docker() { return 0; }; compose() { return 0; }; '
+            'G=0; run_webui_guard() { G=$((G+1)); echo "GUARD $G"; '
+            '[ "$G" = 1 ]; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("GUARD 2", out)
+        self.assertIn("chat UI check\nfailed", out)
+        self.assertIn("rc=1", out)
+        self.assertNotIn("update complete and verified", out)
+
+    def test_it_runs_before_a_model_verdict_can_exit(self):
+        """smoke returning 2 (busy router, rotated key) used to skip the
+        guard on the way out."""
+        setup = (
+            UPDATE_STUBS +
+            'smoke() { return 2; }; '
+            'resolve_webui_image() { echo "$WEBUI_IMAGE"; }; '
+            'docker() { return 0; }; compose() { echo "COMPOSE $1"; return 0; }; '
+            'run_webui_guard() { echo GUARD; return 1; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("GUARD", out)
+        self.assertIn("Not updating", out)
+        self.assertNotIn("COMPOSE", out, "nothing may change after a trip")
+
+    def test_a_guard_that_could_not_stop_says_still_running(self):
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; is_pinned_bad() { return 1; }; '
+            'record_rollback_point() { :; }; wait_for_health() { return 0; }; '
+            'smoke() { return 0; }; webui_ok() { return 0; }; '
+            'git() { case "$*" in *rev-parse*) echo SAME;; esac; return 0; }; '
+            'run_webui_guard() { return 3; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("could NOT stop it", out)
+        self.assertIn("STILL RUNNING", out)
+        self.assertNotIn("and stopped it", out)
+
+    def test_nothing_to_do_still_runs_it(self):
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; is_pinned_bad() { return 1; }; '
+            'record_rollback_point() { :; }; wait_for_health() { return 0; }; '
+            'smoke() { return 0; }; webui_ok() { return 0; }; '
+            'local_image_digest() { echo same; }; remote_image_digest() { echo same; }; '
+            'git() { case "$*" in *"merge-base --is-ancestor"*) return 0;; '
+            '*rev-parse*) echo SAME;; esac; return 0; }; '
+            'run_webui_guard() { echo GUARD; return 1; }'
+        )
+        # die exits, so no rc= line follows.
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("GUARD", out)
+        self.assertIn("Not updating", out)
+        self.assertNotIn("nothing to do", out)
+
+    def test_the_real_guard_is_called_with_the_run_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_root = os.path.join(d, "root")
+            os.makedirs(fake_root)
+            with open(os.path.join(fake_root, "webui-guard.sh"), "w") as fh:
+                fh.write('echo "GUARD env=$QCM_ENV_FILE url=$QCM_WEBUI_URL"; exit 0\n')
+            r = run_real(f'ROOT={shlex.quote(fake_root)}; ENV_FILE=/x/.env',
+                         'run_webui_guard')
+        self.assertIn("GUARD env=/x/.env url=http://127.0.0.1:9", r.stdout)
+        self.assertIn("rc=0", r.stdout)
+
+    def test_a_guard_that_could_not_stop_the_ui_is_not_called_stopped(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake_root = os.path.join(d, "root")
+            os.makedirs(fake_root)
+            with open(os.path.join(fake_root, "webui-guard.sh"), "w") as fh:
+                fh.write('exit 3\n')
+            r = run_real(f'ROOT={shlex.quote(fake_root)}', 'run_webui_guard')
+        self.assertIn("could NOT stop", r.stderr)
+        self.assertIn("STILL RUNNING", r.stderr)
+        self.assertNotIn("STOPPED the chat UI", r.stderr)
+        self.assertIn("rc=3", r.stdout)
+
+
+class ANewUpdaterFinishesItsOwnDelivery(unittest.TestCase):
+    """The run that merged a new update.sh used to finish with the old copy,
+    so an updater fix took effect only a week later."""
+
+    def _root_with_new_updater(self, d):
+        root = os.path.join(d, "root")
+        os.makedirs(root)
+        with open(os.path.join(root, "update.sh"), "w") as fh:
+            fh.write('echo "NEW ran $1 v=$QCM_RESUME_V old=$QCM_RESUME_OLD '
+                     'target=$QCM_RESUME_TARGET pin=$QCM_RESUME_PIN '
+                     'ui=$QCM_RESUME_UI_BEFORE ref=$QCM_RESUME_WEBUI_REF '
+                     'flag=$([ "$QCM_UPDATE_REEXEC" = "$0" ] && echo self)"\n')
+        return root
+
+    def test_a_changed_updater_takes_over_after_the_merge(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root_with_new_updater(d)
+            r = run_real(f'ROOT={shlex.quote(root)}; '
+                         'git() { case "$*" in *"diff --quiet"*) return 1;; esac; return 0; }',
+                         'reexec_if_updater_changed OLD NEW pin 1 ref/webui:2')
+        self.assertIn("NEW ran --resume-after-merge v=1 old=OLD target=NEW "
+                      "pin=pin ui=1 ref=ref/webui:2 flag=self", r.stdout, r.stderr)
+        self.assertNotIn("rc=", r.stdout, "the old copy must not carry on")
+
+    def test_an_unchanged_updater_carries_on(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root_with_new_updater(d)
+            r = run_real(f'ROOT={shlex.quote(root)}; git() {{ return 0; }}',
+                         'reexec_if_updater_changed OLD NEW pin 1 ref')
+        self.assertNotIn("NEW ran", r.stdout)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+
+    def test_a_handed_over_copy_never_hands_over_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root_with_new_updater(d)
+            r = run_real(f'ROOT={shlex.quote(root)}; QCM_UPDATE_REEXEC="$SELF"; '
+                         'git() { return 1; }',
+                         'reexec_if_updater_changed OLD NEW pin 1 ref')
+        self.assertNotIn("NEW ran", r.stdout)
+        self.assertIn("rc=0", r.stdout, r.stderr)
+
+    def test_cmd_update_hands_over_right_after_the_merge(self):
+        setup = (
+            UPDATE_STUBS +
+            'reexec_if_updater_changed() { echo "HANDOFF $*"; }; '
+            'compose() { echo "COMPOSE $1"; return 0; }; docker() { return 0; }; '
+            'run_webui_guard() { return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("HANDOFF OLD NEW pin 1 ", out)
+        self.assertLess(out.index("moving to NEW"), out.index("HANDOFF"))
+        self.assertLess(out.index("HANDOFF"), out.index("building llama image"))
+
+    def test_resume_needs_a_real_handoff(self):
+        r = run_real(':', 'resume_after_merge')
+        self.assertIn("internal", r.stderr)
+        r = run_real('QCM_UPDATE_REEXEC="$SELF"; QCM_RESUME_V=2', 'resume_after_merge')
+        self.assertIn("unknown handoff version", r.stderr)
+
+    def test_resume_runs_the_second_half_with_the_handed_values(self):
+        r = run_real(
+            'QCM_UPDATE_REEXEC="$SELF"; QCM_RESUME_V=1; QCM_RESUME_OLD=OLD; '
+            'QCM_RESUME_TARGET=NEW; QCM_RESUME_PIN=pin; QCM_RESUME_UI_BEFORE=1; '
+            'QCM_RESUME_WEBUI_REF=ref/webui:1; preflight() { :; }; take_lock() { :; }; '
+            'update_apply() { echo "APPLY $*"; }',
+            'resume_after_merge')
+        self.assertIn("APPLY OLD NEW 1 pin 1 ref/webui:1", r.stdout, r.stderr)
+
+    def test_the_lock_is_kept_across_the_handoff(self):
+        with tempfile.TemporaryDirectory() as d:
+            lock = os.path.join(d, "lock")
+            r = run_real(f'exec 9>{shlex.quote(lock)}; QCM_UPDATE_REEXEC="$SELF"; '
+                         'flock() { echo FLOCK; return 1; }',
+                         'take_lock')
+        self.assertIn("keeping the update lock", r.stdout)
+        self.assertNotIn("FLOCK", r.stdout)
+
+
+class TheGuardRunsAfterEveryStart(unittest.TestCase):
+    """A UI started or recreated by any path must be checked, whether it was
+    up before or not."""
+
+    def test_after_an_update_even_when_the_ui_was_down_before(self):
+        setup = (
+            UPDATE_STUBS +
+            'webui_ok() { return 1; }; '
+            'resolve_webui_image() { echo "$WEBUI_IMAGE"; }; '
+            'docker() { return 0; }; compose() { return 0; }; '
+            'run_webui_guard() { echo "GUARD wait=$1"; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        self.assertIn("GUARD wait=", r.stdout, r.stdout + r.stderr)
+
+    def test_after_a_rollback(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write("sha=SAME\nwebui=\nllama=sha256:L\nverified=1\n")
+            # Fully restorable (the llama image already matches), so the
+            # only thing wrong is what the guard finds.
+            setup = (
+                f'STATE={shlex.quote(state)}; UI_WAS_UP=0; '
+                'git() { case "$*" in *"rev-parse HEAD"*) echo SAME;; esac; return 0; }; '
+                'resolve_webui_image() { echo old/webui:1; }; '
+                'webui_container() { :; }; '
+                'docker() { case "$1 $2" in "image inspect") echo sha256:L;; esac; return 0; }; '
+                'compose() { return 0; }; wait_for_health() { return 0; }; '
+                'webui_ok() { return 1; }; smoke() { return 0; }; '
+                'run_webui_guard() { echo "GUARD wait=$1"; return 1; }'
+            )
+            r = run_real(setup, 'do_rollback')
+        out = r.stdout + r.stderr
+        self.assertIn("GUARD wait=", out)
+        self.assertIn("NOT serving safely", out)
+        self.assertIn("rc=1", out)
+
+
+class TheOldAdminNeverStartsWithLoginOn(unittest.TestCase):
+    """Before the UI starts with WEBUI_AUTH=true, its data volume is checked
+    for admin@localhost; the post-start guard is the second line."""
+
+    def _start(self, auth, probe_rc):
+        setup = (
+            f'WEBUI_AUTH={auth}; '
+            f'default_admin_in_volume() {{ echo "PROBE $1"; return {probe_rc}; }}; '
+            'compose() { echo "COMPOSE $*"; return 0; }'
+        )
+        return run_real(setup, 'start_stack -d; echo "held=$UI_HELD"')
+
+    def test_a_volume_with_the_old_admin_starts_llama_only(self):
+        r = self._start("true", 0)
+        out = r.stdout + r.stderr
+        self.assertIn("COMPOSE stop open-webui", out)
+        self.assertIn("COMPOSE up -d llama", out)
+        self.assertNotIn("COMPOSE up -d\n", out)
+        self.assertIn("held=1", out)
+        self.assertIn("NOT starting the chat UI", out)
+
+    def test_a_clean_volume_starts_everything(self):
+        r = self._start("true", 1)
+        self.assertIn("COMPOSE up -d\n", r.stdout)
+        self.assertIn("held=0", r.stdout)
+
+    def test_an_unknown_answer_starts_and_leaves_it_to_the_guard(self):
+        r = self._start("true", 2)
+        self.assertIn("COMPOSE up -d\n", r.stdout)
+        self.assertIn("checks the running UI", r.stderr)
+
+    def test_login_off_does_not_look(self):
+        r = self._start("false", 0)
+        self.assertNotIn("PROBE", r.stdout)
+        self.assertIn("COMPOSE up -d\n", r.stdout)
+
+    def _probe(self, answer, log="/dev/null"):
+        setup = (
+            'webui_container() { echo cid1; }; '
+            f'docker() {{ case "$1" in image) return 0;; '
+            f'run) echo "ARGS $*" > {shlex.quote(log)}; echo {answer};; '
+            'esac; return 0; }'
+        )
+        return run_real(setup, 'default_admin_in_volume img:1')
+
+    def test_the_probe_reads_the_volume_read_only_without_network(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "log")
+            r = self._probe("found", log)
+            with open(log) as fh:
+                args = fh.read()
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertIn("--volumes-from cid1:ro", args)
+        self.assertIn("--network none", args)
+        self.assertIn("webui.db-wal", args,
+                      "rows still in the WAL would be missed")
+
+    def test_the_probe_answers(self):
+        self.assertIn("rc=1", self._probe("none").stdout)
+        self.assertIn("rc=2", self._probe("garbage").stdout)
+
+    def test_an_update_with_a_held_ui_is_not_rolled_back(self):
+        setup = (
+            UPDATE_STUBS +
+            'resolve_webui_image() { echo "$WEBUI_IMAGE"; }; '
+            'docker() { return 0; }; '
+            'start_stack() { UI_HELD=1; }; '
+            'do_rollback() { echo ROLLBACK; }; '
+            'run_webui_guard() { return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertNotIn("ROLLBACK", out)
+        self.assertIn("was NOT\nstarted", out)
+        self.assertIn("rc=1", out)
+
+
+class SnapshotAndRestoreDetails(unittest.TestCase):
+
+    def test_the_restore_runs_in_an_image_that_is_on_disk(self):
+        with tempfile.TemporaryDirectory() as d:
+            snap = os.path.join(d, "s.tar.gz")
+            open(snap, "w").close()
+            setup = (
+                'webui_container() { echo cid1; }; compose() { return 0; }; '
+                'docker() { case "$1 $2" in "image inspect") '
+                '[ "$3" = sha256:B ];; run*) echo "RUN $*";; esac; }'
+            )
+            r = run_real(setup, f'restore_webui_data {shlex.quote(snap)} '
+                                'sha256:A sha256:B other')
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        run = [l for l in r.stdout.splitlines() if l.startswith("RUN")][0]
+        self.assertIn("sha256:B", run, "the pruned image was used")
+        self.assertIn("! -name cache", run, "the restore deleted the cache")
+        self.assertLess(run.index("tar -tzf"), run.index("-delete")
+                        if "-delete" in run else run.index("rm -rf"),
+                        "the archive must be checked before anything goes")
+
+    def test_no_image_on_disk_means_no_restore(self):
+        with tempfile.TemporaryDirectory() as d:
+            snap = os.path.join(d, "s.tar.gz")
+            open(snap, "w").close()
+            r = run_real('docker() { case "$1" in image) return 1;; '
+                         'run) echo RAN;; esac; }; compose() { return 0; }',
+                         f'restore_webui_data {shlex.quote(snap)} sha256:A')
+        self.assertIn("rc=1", r.stdout)
+        self.assertNotIn("RAN", r.stdout)
+
+    def test_the_snapshot_leaves_the_cache_out(self):
+        with open(UPDATE_SH) as fh:
+            body = fh.read()
+        fn = body[body.index("snapshot_webui_data() {"):body.index("# restore_webui_data")]
+        self.assertIn("--exclude=./cache", fn)
+
+    def test_rollback_points_use_the_running_containers_image(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s")
+            r = run_real(
+                f'STATE={shlex.quote(state)}; '
+                'git() { case "$*" in *"rev-parse HEAD"*) echo abc;; esac; return 0; }; '
+                'webui_container() { echo cid1; }; '
+                'docker() { case "$1 $2" in "inspect cid1") echo sha256:RUN;; '
+                '"image inspect") echo sha256:TAG;; esac; return 0; }',
+                'record_rollback_point 1')
+            with open(state) as fh:
+                body = fh.read()
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertIn("webui=sha256:RUN", body)
+
+    def test_the_pin_is_written_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write("sha=OLD\nwebui=sha256:A\nllama=sha256:L\nverified=1\n"
+                         "webui_snapshot=sha256:A /snaps/a.tar.gz\n")
+            setup = (
+                f'STATE={shlex.quote(state)}; '
+                'git() { case "$*" in *"rev-parse HEAD"*) echo NEW;; esac; return 0; }; '
+                'stash_local_edits() { return 0; }; '
+                'resolve_webui_image() { echo old/webui:1; }; '
+                'webui_container() { echo cid1; }; '
+                'docker() { case "$1 $2" in "inspect cid1") echo sha256:B;; '
+                '"image inspect") case "$3" in old/webui:1) echo sha256:A;; '
+                '*) echo sha256:L;; esac;; esac; return 0; }; '
+                'restore_webui_data() { return 0; }; compose() { return 0; }; '
+                'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+                'smoke() { return 0; }; run_webui_guard() { return 0; }'
+            )
+            run_real(setup, 'do_rollback pin')
+            with open(state) as fh:
+                body = fh.read()
+        self.assertEqual(body.count("bad=NEW"), 1, body)
+
+
+class TheAdminProbeChecksThePassword(unittest.TestCase):
+    """An admin@localhost row whose password was changed is safe; holding
+    the UI down for it would keep it down forever. The probe is the real
+    ADMIN_PROBE_PY from update.sh, run against a fixture database, with a
+    fake bcrypt module so the runner needs no real one."""
+
+    FAKE_BCRYPT = (
+        "def checkpw(pw, h):\n"
+        "    if h == b'BROKEN':\n"
+        "        raise ValueError('bad hash')\n"
+        "    return h == b'HASH-' + pw\n"
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.data = os.path.join(self.tmp, "data")
+        os.makedirs(self.data)
+        self.mods = os.path.join(self.tmp, "mods")
+        os.makedirs(self.mods)
+        with open(os.path.join(self.mods, "bcrypt.py"), "w") as fh:
+            fh.write(self.FAKE_BCRYPT)
+        r = run_fn('printf "%s" "$ADMIN_PROBE_PY" #')
+        self.probe = r.stdout
+        self.assertIn("select password from auth", self.probe)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _db(self, rows, table=True):
+        import sqlite3
+        c = sqlite3.connect(os.path.join(self.data, "webui.db"))
+        if table:
+            c.execute("create table auth (id text, email text, password text, "
+                      "active boolean)")
+            c.executemany("insert into auth values (?, ?, ?, 1)", rows)
+        else:
+            c.execute("create table other (x text)")
+        c.commit()
+        c.close()
+
+    def _run(self, mods=None):
+        env = dict(os.environ, QCM_PROBE_DATA=self.data,
+                   PYTHONPATH=mods if mods is not None else self.mods)
+        r = subprocess.run(["python3", "-c", self.probe], capture_output=True,
+                           text=True, env=env)
+        return r.stdout.strip()
+
+    def test_the_default_password_is_found(self):
+        self._db([("1", "admin@localhost", "HASH-admin")])
+        self.assertEqual(self._run(), "found")
+
+    def test_a_changed_password_is_none(self):
+        self._db([("1", "admin@localhost", "HASH-s3cret")])
+        self.assertEqual(self._run(), "none")
+
+    def test_no_such_account_is_none(self):
+        self._db([("1", "real@example.com", "HASH-admin")])
+        self.assertEqual(self._run(), "none")
+
+    def test_no_database_is_none(self):
+        self.assertEqual(self._run(), "none")
+
+    def test_an_unknown_layout_is_unknown(self):
+        self._db([], table=False)
+        self.assertEqual(self._run(), "unknown")
+
+    def test_no_hash_library_is_unknown(self):
+        self._db([("1", "admin@localhost", "HASH-admin")])
+        broken = os.path.join(self.tmp, "broken")
+        os.makedirs(broken)
+        with open(os.path.join(broken, "bcrypt.py"), "w") as fh:
+            fh.write("raise ImportError('no bcrypt here')\n")
+        self.assertEqual(self._run(mods=broken), "unknown")
+
+    def test_a_malformed_hash_is_not_found(self):
+        self._db([("1", "admin@localhost", "BROKEN")])
+        self.assertEqual(self._run(), "none")
+
+    def test_unknown_does_not_hold_the_ui(self):
+        r = run_real(
+            'WEBUI_AUTH=true; default_admin_in_volume() { return 2; }; '
+            'compose() { echo "COMPOSE $*"; }',
+            'start_stack -d; echo "held=$UI_HELD"')
+        self.assertIn("COMPOSE up -d\n", r.stdout)
+        self.assertIn("held=0", r.stdout)
+
+
+class AFailedHandoverNeverStrandsTheMerge(unittest.TestCase):
+    """Merged code with no build and no rollback looks "already up to date"
+    to every later run."""
+
+    def _root(self, d, body):
+        root = os.path.join(d, "root")
+        os.makedirs(root)
+        with open(os.path.join(root, "update.sh"), "w") as fh:
+            fh.write(body)
+        return root
+
+    def test_a_new_updater_that_does_not_parse_is_not_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d, 'echo NEW RAN\nif then fi (\n')
+            r = run_real(f'ROOT={shlex.quote(root)}; '
+                         'git() { case "$*" in *"diff --quiet"*) return 1;; esac; return 0; }',
+                         'reexec_if_updater_changed OLD NEW pin 1 ref')
+        self.assertIn("does not parse", r.stderr)
+        self.assertNotIn("NEW RAN", r.stdout)
+        self.assertIn("rc=0", r.stdout, "this copy must carry on")
+
+    def test_a_failed_exec_carries_on_with_this_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d, 'echo NEW RAN\n')
+            r = run_real(f'ROOT={shlex.quote(root)}; UPDATER_SHELL=/nonexistent/bash; '
+                         'git() { case "$*" in *"diff --quiet"*) return 1;; esac; return 0; }',
+                         'reexec_if_updater_changed OLD NEW pin 1 ref; '
+                         'echo "after flag=[${QCM_UPDATE_REEXEC:-}] v=[${QCM_RESUME_V:-}] '
+                         'tmp=$([ -d "$RUN_TMP" ] && echo yes)"')
+        self.assertIn("could not start the new update.sh", r.stderr)
+        self.assertIn("after flag=[] v=[] tmp=yes", r.stdout,
+                      "the handoff must be undone so this copy runs normally")
+
+    def _resume(self, extra):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "log")
+            setup = (
+                f'L={shlex.quote(log)}; QCM_UPDATE_REEXEC="$SELF"; '
+                'QCM_RESUME_OLD=OLD; QCM_RESUME_TARGET=NEW; '
+                'stash_local_edits() { echo STASH >> "$L"; }; '
+                'git() { echo "GIT $*" >> "$L"; return 0; }; '
+                'take_lock() { :; }; update_apply() { echo APPLY >> "$L"; }; '
+                + extra
+            )
+            r = run_real(setup, 'resume_after_merge')
+            body = open(log).read() if os.path.exists(log) else ""
+            return r, body
+
+    def test_a_failed_preflight_undoes_the_merge(self):
+        r, body = self._resume('QCM_RESUME_V=1; preflight() { die "boom"; }')
+        self.assertIn("preflight failed", r.stderr)
+        self.assertIn("STASH", body)
+        self.assertIn("reset --hard OLD", body)
+        self.assertLess(body.index("STASH"), body.index("reset --hard OLD"))
+        self.assertNotIn("APPLY", body)
+        self.assertNotIn("rc=0", r.stdout, "it must exit non-zero")
+
+    def test_an_unknown_handoff_version_undoes_the_merge(self):
+        r, body = self._resume('QCM_RESUME_V=9; preflight() { :; }')
+        self.assertIn("unknown handoff version", r.stderr)
+        self.assertIn("reset --hard OLD", body)
+        self.assertNotIn("APPLY", body)
+
+    def test_a_good_handoff_does_not_undo(self):
+        r, body = self._resume('QCM_RESUME_V=1; preflight() { :; }')
+        self.assertIn("APPLY", body)
+        self.assertNotIn("reset --hard", body)

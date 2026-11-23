@@ -87,8 +87,21 @@ ssh -N -L 9090:127.0.0.1:9090 -L 8080:127.0.0.1:8080 user@<box-ip>
 ```
 
 **Option 2 — Tailscale bind (good for daily use).** The box keeps the ports
-open on its Tailscale address, so any machine on your tailnet can connect. On
-the box, add this to `.env` (use the box's own Tailscale IP, from
+open on its Tailscale address, so any machine on your tailnet can connect.
+
+The chat UI has no login by default. Before you bind it on a shared
+tailnet, turn login on: set `WEBUI_AUTH=true` in `.env` on a **fresh**
+`open-webui-data` volume (an old no-login volume holds `admin@localhost` /
+`admin`; see `.env.example`). Then create the admin first: the first account
+to sign up becomes the admin, so sign up over loopback or the SSH tunnel
+above, before you bind. After that, sign-up is off; the admin adds other
+users and shares the model with them (see `WEBUI_MODEL` in `.env.example`).
+The native macOS UI (`start-webui.sh`) has no login; do not bind it.
+
+Check it: `./webui-guard.sh`. It stops the chat UI if the old no-login
+account still signs in (see [docs/updating.md](docs/updating.md)).
+
+Then, on the box, add this to `.env` (use the box's own Tailscale IP, from
 `tailscale ip -4`):
 
 ```bash
@@ -98,9 +111,8 @@ LLAMA_BIND=100.x.y.z
 
 Then restart: `docker compose --env-file .env -f docker/compose.linux.yaml up -d`.
 
-Warning: the chat UI has no login by default. Binding it opens the UI to your
-whole tailnet. On a shared tailnet, set `WEBUI_AUTH=true` in `.env` first
-(see `.env.example` for an existing install). The API on :8080 always asks for the key.
+The API on :8080 asks for the key on every route except `/health` (see
+[docs/architecture.md](docs/architecture.md)).
 
 Never use `0.0.0.0` unless you mean to share with the whole office LAN.
 

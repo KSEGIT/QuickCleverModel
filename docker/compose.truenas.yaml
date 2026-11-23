@@ -64,7 +64,7 @@ services:
     restart: unless-stopped
 
   open-webui:
-    image: ghcr.io/open-webui/open-webui:v0.11.3
+    image: ghcr.io/open-webui/open-webui:v0.13.4
     mem_limit: 2g
     memswap_limit: 2g
     ports:
@@ -78,10 +78,12 @@ services:
       OPENAI_API_KEYS: "${BONSAI_API_KEY:?set a private BONSAI_API_KEY}"
       ENABLE_PERSISTENT_CONFIG: "false"
       WEBUI_AUTH: "true"
+      # The first account becomes the admin. Persistent config is off, so the
+      # env value must keep sign-up closed on every later start.
+      ENABLE_SIGNUP: "false"
       WEBUI_SECRET_KEY: "${WEBUI_SECRET_KEY:?set a private persistent WEBUI_SECRET_KEY}"
       DEFAULT_MODELS: "qwen3.5-9b-q4_k_m"
       ENABLE_OLLAMA_API: "false"
-      ENABLE_DIRECT_CONNECTIONS: "false"
       # Exact HTTP origins follow the two UI bindings. Override for a DNS
       # name or HTTPS proxy; use semicolon-separated origins, never '*'.
       WEBUI_URL: "${WEBUI_URL:-http://${WEBUI_BIND:-127.0.0.1}:9090}"

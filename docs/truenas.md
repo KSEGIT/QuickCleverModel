@@ -132,12 +132,13 @@ Edit that file. Fill every blank value: `QCM_IMAGE`, the three storage paths,
 published. Generate each secret separately with `openssl rand -hex 32`; keep
 the WebUI secret stable across restarts. The API key is shared only between
 the inference service, WebUI and your authorised clients. WebUI login is
-required.
+required, and sign-up stays off after the first account
+(`ENABLE_SIGNUP=false`).
 
 Bindings default to loopback. For a new WebUI data directory, keep those
 defaults through the first installation and create the administrator account
 through the SSH tunnel described below. Open WebUI
-[makes the first registered user an administrator](https://github.com/open-webui/open-webui/blob/v0.11.3/backend/open_webui/routers/auths.py).
+[makes the first registered user an administrator](https://github.com/open-webui/open-webui/blob/v0.13.4/backend/open_webui/routers/auths.py).
 Create and verify that account before exposing a UI listener on LAN or
 Tailscale, so another network client cannot claim the initial account.
 
@@ -210,6 +211,8 @@ must remain visible in the results.
 
 ## Add context labels in Open WebUI
 
+Note: these label steps were checked on Open WebUI v0.11.3 only.
+
 Sign in as an administrator, open **Settings**, then **Models** in its
 administrator section (direct path: `/?settings=admin%3Amodels`). Open each
 base model and edit **Model Name**. Append `(64K)` to Qwen9 and `(32K)` to the
@@ -217,10 +220,11 @@ other three names. Select **Save & Update** while keeping the disabled
 **Model ID** unchanged. These are
 display labels; they do not change the server's context setting. The installed
 v0.11.3 app retained all four IDs and passed four simple chat smokes after this
-label change on 2026-10-26. The packaged YAML sets the default model, but does
-not create these saved display labels automatically.
+label change on 2026-10-26. This check was not repeated on v0.13.4. The
+packaged YAML sets the default model, but does not create these saved display
+labels automatically.
 
-The pinned [v0.11.3 admin model settings](https://github.com/open-webui/open-webui/blob/v0.11.3/src/lib/components/admin/Settings/Models.svelte)
+The [v0.11.3 admin model settings](https://github.com/open-webui/open-webui/blob/v0.11.3/src/lib/components/admin/Settings/Models.svelte)
 list provider models and save their display overrides. Workspace model presets
 are a separate feature; creating a new preset can introduce a new ID.
 

@@ -59,13 +59,13 @@ services:
     restart: unless-stopped
 
   open-webui:
-    image: ghcr.io/open-webui/open-webui:v0.11.3
+    image: ghcr.io/open-webui/open-webui:v0.13.4
     container_name: bonsai-webui
     ports:
-      # WEBUI_AUTH is false by default — loopback by default, or the whole LAN gets
-      # an unauthenticated chat UI. Remote access: set WEBUI_BIND to the
-      # machine's Tailscale IP in .env (tailnet-only exposure), or prefer an
-      # ssh -L tunnel and leave this alone.
+      # Loopback by default: the UI has no login unless WEBUI_AUTH=true (below).
+      # Remote access: set WEBUI_BIND to the machine's Tailscale IP in .env
+      # (tailnet-only exposure), or prefer an ssh -L tunnel and leave this
+      # alone. With login on, create the admin before you bind beyond loopback.
       - "${WEBUI_BIND:-127.0.0.1}:9090:8080"
       # Second listener, same idea as LLAMA_BIND2 above. Set WEBUI_BIND2 to
       # the second tailscaled's IP in .env. Set WEBUI_AUTH=true in .env before
@@ -85,9 +85,32 @@ services:
       # NOTE this sends prompts off the machine — see .env.example.
       OPENAI_API_BASE_URLS: "http://llama:8080/v1${HETZNER_API_KEY:+;${HETZNER_API_BASE:-https://inference.hetzner.com/api/v1}}"
       OPENAI_API_KEYS: "${BONSAI_API_KEY}${HETZNER_API_KEY:+;${HETZNER_API_KEY}}"
-      # Login. Set WEBUI_AUTH=true in .env to require it (see .env.example: an
-      # install that already ran without login needs a fresh open-webui-data volume).
+      # Fixed chat model. Set WEBUI_MODEL in .env (one model id, e.g.
+      # bonsai-27b-ternary): the local connection (index "0") then lists only
+      # that model, and new chats start on it. Empty: all local models show,
+      # as before. Hetzner models, if HETZNER_API_KEY is set, still show.
+      # https://docs.openwebui.com/reference/env-configuration#openai_api_configs
+      # https://docs.openwebui.com/reference/env-configuration#default_models
+      OPENAI_API_CONFIGS: '{"0":{"model_ids":[${WEBUI_MODEL:+"${WEBUI_MODEL}"}]}}'
+      DEFAULT_MODELS: "${WEBUI_MODEL:-}"
+      # Login is off by default, so existing no-login installs keep working.
+      # Turn it on with WEBUI_AUTH=true in .env, on a FRESH open-webui-data
+      # volume only (see .env.example). The first account to sign up becomes
+      # the admin. Sign-up stays off after that: with
+      # ENABLE_PERSISTENT_CONFIG=false the env value wins on every start, so
+      # ENABLE_SIGNUP=false is what keeps it off. The admin adds more users in
+      # Admin Panel > Users.
       WEBUI_AUTH: "${WEBUI_AUTH:-false}"
+      ENABLE_SIGNUP: "${ENABLE_SIGNUP:-false}"
+      # Session secret. start.sh in the image reads WEBUI_SECRET_KEY, or else
+      # the file named by WEBUI_SECRET_KEY_FILE, and writes a new random key
+      # there when it is missing. Its default file sits OUTSIDE the data
+      # volume, so every container recreate made a new key and signed every
+      # user out. The file now lives in the volume and survives recreates.
+      # Set WEBUI_SECRET_KEY in .env to use your own key instead.
+      # https://github.com/open-webui/open-webui/blob/v0.13.4/backend/start.sh
+      WEBUI_SECRET_KEY: "${WEBUI_SECRET_KEY:-}"
+      WEBUI_SECRET_KEY_FILE: /app/backend/data/.webui_secret_key
       ENABLE_OLLAMA_API: "false"   # we are not running Ollama
       # Background generations (title, tags, follow-ups...) decode concurrently
       # with your reply and steal bandwidth on a single-GPU box — same reasoning

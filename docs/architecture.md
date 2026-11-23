@@ -384,9 +384,11 @@ Only `/health` and `/v1/health` are public at Prism `922be44`
 401 without it.
 
 On the Linux/NVIDIA path, **both ports are loopback-only by default**
-(`127.0.0.1:8080` / `:9090`) — the webui runs with `WEBUI_AUTH=false` by default, so
-publishing it would give your whole LAN an unauthenticated chat UI. The API key
-on :8080 is enforced either way.
+(`127.0.0.1:8080` / `:9090`) — the webui runs with `WEBUI_AUTH=false` by
+default, so publishing it would give your whole LAN an unauthenticated chat UI.
+Set `WEBUI_AUTH=true` in `.env` on a fresh data volume to require a login; the
+first account to sign up becomes the admin. The API key on :8080 is enforced
+either way.
 
 **Remote access** (e.g. you SSH into the box over Tailscale and browse from
 another machine): two options.
@@ -400,8 +402,9 @@ another machine): two options.
 
 - Or bind to the Tailscale interface: add `WEBUI_BIND=100.x.y.z` (the box's
   Tailscale IP) to `.env`, then `docker compose --env-file .env -f docker/compose.linux.yaml up -d`
-  to recreate. This exposes the **unauthenticated** UI to your whole tailnet —
-  fine on a personal tailnet, otherwise set `WEBUI_AUTH=true` in `.env` first.
+  to recreate. Without `WEBUI_AUTH=true` this exposes an **unauthenticated**
+  UI to your whole tailnet — fine on a personal tailnet, otherwise turn login
+  on first (fresh data volume, see `.env.example`).
   `LLAMA_BIND` does the same for :8080 (the API key is enforced there).
 
 On macOS, `make menubar-install` adds `stack.sh` execution as a persistent,

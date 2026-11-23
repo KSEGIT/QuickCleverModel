@@ -75,7 +75,9 @@ Three failures count as proof the commit is bad:
 - a model cannot answer,
 - the stack never becomes healthy after a clean build and start, or
 - the chat UI stops answering when no new Open WebUI image was pulled — the
-  service is defined in `docker/compose.linux.yaml`, so that is the code.
+  service is defined in `docker/compose.linux.yaml`, so that is the code, or
+- the chat UI stops answering after the commit itself named a different Open
+  WebUI image.
 
 Other failures do not pin. A build that lost the network, or a start that
 lost a race with the second network address, says nothing about the commit.
@@ -98,6 +100,78 @@ To try the same commit again anyway:
 ```bash
 sed -i '/^bad=/d' run/update-state
 ```
+
+## A new update.sh finishes its own update
+
+When the merged commit changes `update.sh`, the run hands over to the new
+`update.sh` right after the merge. The new version builds, restarts, checks
+and, if needed, rolls back. So a fix to the updater works in the same run that
+brings it, not a week later. The lock stays held across the handover.
+
+This needs the RUNNING `update.sh` to know how to hand over. The first update
+that brings the handover is still run by the old `update.sh` to the end, and
+that one takes no data snapshot before the new Open WebUI image starts. Before
+that first update, save the data by hand:
+
+```bash
+docker compose --env-file .env -f docker/compose.linux.yaml stop open-webui
+mkdir -p run/webui-snapshots
+docker run --rm --volumes-from bonsai-webui -v "$PWD/run/webui-snapshots:/snap" \
+  --entrypoint sh "$(docker inspect bonsai-webui --format '{{.Image}}')" -c \
+  'umask 077 && tar -czf /snap/open-webui-data-manual.tar.gz --exclude=./cache -C /app/backend/data .'
+docker compose --env-file .env -f docker/compose.linux.yaml start open-webui
+```
+
+The `docker inspect` part runs tar in the image the UI container runs now.
+
+## Open WebUI image and data
+
+`update.sh` reads the Open WebUI image from `docker/compose.linux.yaml`
+(`docker compose config --images`), again after each merge. No tag is copied
+into the script, so it always handles the image that compose runs.
+
+A new Open WebUI image migrates its database on first start, and putting the
+old image back does not undo that. So before a different image starts,
+`update.sh` stops the chat UI and saves the `open-webui-data` volume to
+`run/webui-snapshots/` (the newest 2 are kept, plus the one the rollback point
+needs; only root can read them; `cache/` is left out, as Open WebUI rebuilds
+it). Images are told apart by the ID the UI container really runs, so a
+re-published tag counts as a new image. If the update then rolls back to the
+older image, it puts that snapshot back too. Chats written after the snapshot
+are lost. If the restore fails, the chat UI stays stopped and
+`./update.sh --rollback` tries again. To restore by hand, stop the UI, then
+extract the archive into the volume as root. The first command lists the
+archive, so a missing or broken file stops it before anything is deleted:
+
+```bash
+docker compose --env-file .env -f docker/compose.linux.yaml stop open-webui
+docker run --rm --volumes-from bonsai-webui -v "$PWD/run/webui-snapshots:/snap:ro" \
+  --entrypoint sh ghcr.io/open-webui/open-webui:<old tag> -c \
+  'tar -tzf /snap/<file> >/dev/null &&
+   find /app/backend/data -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf {} + &&
+   tar -xzf /snap/<file> -C /app/backend/data'
+```
+
+## The default-admin check
+
+With `WEBUI_AUTH=true`, a data volume made with login off still holds
+`admin@localhost` with password `admin`, and the login page accepts it.
+`update.sh` guards against this twice:
+
+1. **Before a start.** Each time `update.sh` starts or recreates the stack
+   with `WEBUI_AUTH=true` (update, automatic rollback and `--rollback`), it
+   first reads the volume's database, read-only, in a throwaway container.
+   If it finds `admin@localhost`, it starts llama only, keeps the chat UI
+   stopped, and the run fails with the reason.
+2. **After a start.** After every start or recreate, and before an update that
+   finds the UI already running, it runs `./webui-guard.sh`. The guard waits
+   up to `BONSAI_PRECHECK_TIMEOUT` for the UI, then tries that login. If the
+   login works, it stops the chat UI container and the run fails with the
+   reason. If it cannot stop the container, it says so loudly: the UI is
+   still running and must be stopped by hand.
+
+Fix it with a fresh `open-webui-data` volume. You can run `./webui-guard.sh`
+by hand at any time.
 
 ## Tuning the deadlines
 

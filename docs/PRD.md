@@ -154,7 +154,7 @@ sequenceDiagram
 | Router with one resident model | 24 GB Mac / 8 GB GPU can't hold both + KV cache comfortably; swap is +4–5 s |
 | `BONSAI_CTX=8192` on the 8 GB path | Ternary weights + mmproj are 7.3 GB; KV cache must fit alongside |
 | API key even on loopback-docker | Router binds 0.0.0.0 for the container bridge; key is the only barrier |
-| Loopback-only published ports | Open WebUI runs with `WEBUI_AUTH=false`; LAN exposure must be deliberate |
+| Loopback-only published ports | Open WebUI has no login unless `WEBUI_AUTH=true`; LAN exposure must be deliberate |
 
 ## 7. Success metrics
 

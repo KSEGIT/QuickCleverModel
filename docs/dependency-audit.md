@@ -85,3 +85,41 @@ runtime validation record.
 - [Jinja2 package metadata](https://pypi.org/pypi/jinja2/3.1.6/json),
   [checkout releases](https://github.com/actions/checkout/releases),
   [setup-python releases](https://github.com/actions/setup-python/releases).
+
+## Open WebUI v0.13.4 update (2026-11-23)
+
+| Component | Previous | New |
+| --- | --- | --- |
+| Open WebUI Docker (all three Compose files, `update.sh`) | `v0.11.3` | `v0.13.4` |
+| Open WebUI macOS install instructions | `open-webui==0.11.3` | `open-webui==0.13.4` |
+
+v0.13.4 was published on 2026-11-17, six days before this pin. The tag stays
+a release tag, not a digest, for the same updater reason as above.
+
+Notes from the release notes between v0.11.3 and v0.13.4 that touch this repo:
+
+- v0.12.1, v0.13.0 and v0.13.1 change the database schema. Back up the
+  `open-webui-data` volume first. An image rollback to v0.11.3 does not undo
+  these migrations.
+- v0.13.4 removes direct connections and the `ENABLE_DIRECT_CONNECTIONS`
+  setting, so the TrueNAS Compose file no longer sets it.
+- v0.13.1 changes retrieval defaults (`RAG_TOP_K` 3 to 10, `CHUNK_SIZE` 1000
+  to 1024) and stops preloading attached files with native tool calls.
+  Prompts with knowledge get longer, which matters at `BONSAI_CTX=8192`.
+- v0.12.4 moves the Docker image to Python 3.12. The macOS venv stays on
+  Python 3.11; PyPI lists `>=3.11,<3.13` for 0.13.4.
+- No rename of `WEBUI_AUTH`, `ENABLE_SIGNUP`, `OPENAI_API_BASE_URL(S)`,
+  `OPENAI_API_KEY(S)`, `ENABLE_PERSISTENT_CONFIG` or `WEBUI_SECRET_KEY`.
+
+The Docker Compose files keep `WEBUI_AUTH=false` as the default (login is
+opt-in, on a fresh data volume) and now default to `ENABLE_SIGNUP=false`. In
+v0.13.4 the first account can sign up even with `ENABLE_SIGNUP=false`, and
+becomes the admin. A new `WEBUI_MODEL` value in
+`.env` fixes the chat model through `OPENAI_API_CONFIGS` and `DEFAULT_MODELS`;
+see `.env.example`.
+
+Sources: [release notes](https://github.com/open-webui/open-webui/releases/tag/v0.13.4)
+and the releases before it,
+[sign-up code](https://github.com/open-webui/open-webui/blob/v0.13.4/backend/open_webui/routers/auths.py),
+[Python package metadata](https://pypi.org/pypi/open-webui/0.13.4/json),
+[environment variables](https://docs.openwebui.com/reference/env-configuration).
