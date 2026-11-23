@@ -3522,6 +3522,33 @@ class RollbackBringsTheDataBack(unittest.TestCase):
                          "the whole stack, UI included, was recreated")
         self.assertIn("bad=NEW", body, "the pin must survive the early stop")
 
+    def test_no_rollback_image_means_the_data_stays(self):
+        """With image A pruned, the newer image keeps running, so putting
+        A's data back would only lose the chats since the snapshot."""
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write("sha=SAME\nwebui=sha256:A\nllama=sha256:L\nverified=1\n"
+                         "webui_snapshot=sha256:A /snaps/a.tar.gz\n")
+            setup = (
+                f'STATE={shlex.quote(state)}; '
+                'git() { case "$*" in *"rev-parse HEAD"*) echo SAME;; esac; return 0; }; '
+                'resolve_webui_image() { echo old/webui:1; }; '
+                'webui_container() { echo cid1; }; '
+                'docker() { case "$1 $2" in "inspect cid1") echo sha256:B;; '
+                '"image inspect") case "$3" in sha256:A) return 1;; '
+                'old/webui:1) echo sha256:B;; *) echo sha256:L;; esac;; esac; return 0; }; '
+                'restore_webui_data() { echo RESTORE; return 0; }; '
+                'compose() { return 0; }; wait_for_health() { return 0; }; '
+                'webui_ok() { return 0; }; smoke() { return 0; }; '
+                'run_webui_guard() { return 0; }'
+            )
+            r = run_real(setup, 'do_rollback')
+        out = r.stdout + r.stderr
+        self.assertNotIn("RESTORE", out)
+        self.assertIn("not restoring the open-webui data", out)
+        self.assertIn("rc=1", out)
+
     def test_a_snapshot_of_another_image_is_not_used(self):
         out = self._rollback("sha256:B",
                              "webui_snapshot=sha256:Z /snaps/z.tar.gz\n")
@@ -3611,6 +3638,20 @@ class TheDefaultAdminCheckRunsEveryTime(unittest.TestCase):
         self.assertIn("GUARD", out)
         self.assertIn("Not updating", out)
         self.assertNotIn("COMPOSE", out, "nothing may change after a trip")
+
+    def test_a_guard_that_could_not_stop_says_still_running(self):
+        setup = (
+            'preflight() { :; }; take_lock() { :; }; is_pinned_bad() { return 1; }; '
+            'record_rollback_point() { :; }; wait_for_health() { return 0; }; '
+            'smoke() { return 0; }; webui_ok() { return 0; }; '
+            'git() { case "$*" in *rev-parse*) echo SAME;; esac; return 0; }; '
+            'run_webui_guard() { return 3; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("could NOT stop it", out)
+        self.assertIn("STILL RUNNING", out)
+        self.assertNotIn("and stopped it", out)
 
     def test_nothing_to_do_still_runs_it(self):
         setup = (

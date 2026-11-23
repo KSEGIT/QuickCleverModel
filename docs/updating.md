@@ -108,6 +108,22 @@ When the merged commit changes `update.sh`, the run hands over to the new
 and, if needed, rolls back. So a fix to the updater works in the same run that
 brings it, not a week later. The lock stays held across the handover.
 
+This needs the RUNNING `update.sh` to know how to hand over. The first update
+that brings the handover is still run by the old `update.sh` to the end, and
+that one takes no data snapshot before the new Open WebUI image starts. Before
+that first update, save the data by hand:
+
+```bash
+docker compose --env-file .env -f docker/compose.linux.yaml stop open-webui
+mkdir -p run/webui-snapshots
+docker run --rm --volumes-from bonsai-webui -v "$PWD/run/webui-snapshots:/snap" \
+  --entrypoint sh "$(docker inspect bonsai-webui --format '{{.Image}}')" -c \
+  'umask 077 && tar -czf /snap/open-webui-data-manual.tar.gz --exclude=./cache -C /app/backend/data .'
+docker compose --env-file .env -f docker/compose.linux.yaml start open-webui
+```
+
+The `docker inspect` part runs tar in the image the UI container runs now.
+
 ## Open WebUI image and data
 
 `update.sh` reads the Open WebUI image from `docker/compose.linux.yaml`
@@ -124,13 +140,15 @@ re-published tag counts as a new image. If the update then rolls back to the
 older image, it puts that snapshot back too. Chats written after the snapshot
 are lost. If the restore fails, the chat UI stays stopped and
 `./update.sh --rollback` tries again. To restore by hand, stop the UI, then
-extract the archive into the volume as root:
+extract the archive into the volume as root. The first command lists the
+archive, so a missing or broken file stops it before anything is deleted:
 
 ```bash
 docker compose --env-file .env -f docker/compose.linux.yaml stop open-webui
 docker run --rm --volumes-from bonsai-webui -v "$PWD/run/webui-snapshots:/snap:ro" \
   --entrypoint sh ghcr.io/open-webui/open-webui:<old tag> -c \
-  'find /app/backend/data -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf {} + &&
+  'tar -tzf /snap/<file> >/dev/null &&
+   find /app/backend/data -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf {} + &&
    tar -xzf /snap/<file> -C /app/backend/data'
 ```
 

@@ -1385,7 +1385,7 @@ this run introduced, because the recorded point predates it"
   [[ -n "$webui_cid" ]] && webui_ran="$(docker inspect "$webui_cid" --format '{{.Image}}' 2>/dev/null)"
   snap="$(snapshot_for_image "$webui")"
 
-  local have current
+  local have current webui_back=0
   have="$(docker image inspect "$ROLLBACK_IMAGE" --format '{{.Id}}' 2>/dev/null)"
   if [[ -z "$have" ]]; then
     warn "no $ROLLBACK_IMAGE to restore; keeping the current llama image"
@@ -1423,11 +1423,13 @@ this run introduced, because the recorded point predates it"
   elif current="$(docker image inspect "$WEBUI_IMAGE" --format '{{.Id}}' 2>/dev/null)" \
        && [[ "$current" == "$webui" ]]; then
     log "$WEBUI_IMAGE already points to the recorded rollback image; leaving it alone"
+    webui_back=1
   elif ! docker tag "$webui" "$WEBUI_IMAGE"; then
     warn "could not restore $WEBUI_IMAGE"
     restored=0
   else
     changed=1
+    webui_back=1
   fi
 
   # Appended after the reset so the pin survives even when the reset failed,
@@ -1444,6 +1446,13 @@ this run introduced, because the recorded point predates it"
   if (( need_restore )) && [[ -z "$snap" ]]; then
     warn "a different open-webui image ran since the rollback point, and no data
 snapshot of ${webui:0:19} was recorded — its database changes stay"
+  elif (( need_restore && ! webui_back )); then
+    # Older data under the newer image would only be migrated again, and the
+    # chats since the snapshot would be gone for nothing. Leave the volume.
+    warn "not restoring the open-webui data: $WEBUI_IMAGE does not point to the
+rollback image ${webui:0:19} (see above), so the newer image keeps running on
+its own data. The snapshot stays at $snap."
+    restored=0
   elif (( need_restore )); then
     if restore_webui_data "$snap" "$webui" "$webui_ran" "$WEBUI_IMAGE"; then
       changed=1
@@ -1697,9 +1706,19 @@ this run as unable to judge the models, not as proof they are dead"
   UI_WAS_UP=$ui_before
   # Before any model verdict can return or exit: a busy router or a rotated
   # key must not let a UI that accepts admin@localhost / admin run on.
-  if (( ui_before )) && ! run_webui_guard 0; then
-    die "webui-guard.sh found the chat UI accepting the old no-login admin
-account and stopped it (see above). Not updating until that is fixed."
+  if (( ui_before )); then
+    local pre_guard=0
+    run_webui_guard 0 || pre_guard=$?
+    case "$pre_guard" in
+      0) ;;
+      1) die "webui-guard.sh found the chat UI accepting the old no-login admin
+account and stopped it (see above). Not updating until that is fixed.";;
+      3) die "webui-guard.sh found the chat UI accepting the old no-login admin
+account and could NOT stop it — it is STILL RUNNING. Stop it by hand now
+(docker stop bonsai-webui). Not updating until that is fixed.";;
+      *) die "webui-guard.sh failed (exit $pre_guard, see above). Not updating
+until that is fixed.";;
+    esac
   fi
 
   case "$models_verdict" in

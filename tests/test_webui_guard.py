@@ -33,6 +33,9 @@ case "$last" in
     fi
     exit 7;;
   */api/v1/auths/signin) printf '%s' "${FAKE_SIGNIN:-400}"; exit 0;;
+  */api/config)
+    [ -n "${FAKE_RUNNING_AUTH:-}" ] || exit 7
+    printf '{"features":{"auth":%s}}' "$FAKE_RUNNING_AUTH"; exit 0;;
 esac
 exit 1
 """
@@ -120,6 +123,28 @@ class GuardTest(unittest.TestCase):
                                   FAKE_SIGNIN=400, args=["--wait", "10"])
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("signin", calls, "it gave up on a UI that was starting")
+
+    def test_a_leading_zero_wait_is_decimal(self):
+        r, calls = self.run_guard(["WEBUI_AUTH=true"], FAKE_UI_UP=1,
+                                  args=["--wait", "08"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("signin", calls)
+
+    def test_the_running_ui_decides_not_dot_env(self):
+        """Compose lets a shell variable beat .env, so the UI can run with
+        login on while .env says off."""
+        r, calls = self.run_guard(["WEBUI_AUTH=false"], FAKE_UI_UP=1,
+                                  FAKE_RUNNING_AUTH="true", FAKE_SIGNIN=200)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("docker stop bonsai-webui", calls)
+
+    def test_a_running_ui_without_login_is_never_probed(self):
+        """A no-login UI signs anyone in as its own admin, by design."""
+        r, calls = self.run_guard(["WEBUI_AUTH=true"], FAKE_UI_UP=1,
+                                  FAKE_RUNNING_AUTH="false", FAKE_SIGNIN=200)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("signin", calls)
+        self.assertNotIn("docker", calls)
 
     def test_without_wait_it_checks_once(self):
         r, calls = self.run_guard(["WEBUI_AUTH=true"], FAKE_UI_UP_AFTER=2)

@@ -41,7 +41,8 @@ WAIT=0
 case "${1:-}" in
   --wait)
     WAIT="${2:-0}"
-    [[ "$WAIT" =~ ^[0-9]+$ ]] || { warn "--wait needs a number of seconds"; exit 2; };;
+    [[ "$WAIT" =~ ^[0-9]{1,6}$ ]] || { warn "--wait needs a number of seconds"; exit 2; }
+    WAIT=$((10#$WAIT));;   # base 10: "08" is not an octal error
   "") ;;
   *) warn "usage: $0 [--wait SECONDS]"; exit 2;;
 esac
@@ -59,14 +60,11 @@ if ! webui_model_ok "${WEBUI_MODEL:-}"; then
   exit 2
 fi
 
-if ! webui_auth_on; then
-  log "WEBUI_AUTH is not true; no login to check"
-  exit 0
-fi
-
 URL="${QCM_WEBUI_URL:-http://${WEBUI_BIND:-127.0.0.1}:9090}"
 CONTAINER="${QCM_WEBUI_CONTAINER:-bonsai-webui}"
 
+# Wait only for a UI that .env says starts with login; otherwise look once.
+webui_auth_on || WAIT=0
 deadline=$(( SECONDS + WAIT ))
 until curl -fsS -m 5 -o /dev/null "$URL/health" 2>/dev/null; do
   if (( SECONDS >= deadline )); then
@@ -75,6 +73,30 @@ until curl -fsS -m 5 -o /dev/null "$URL/health" 2>/dev/null; do
   fi
   sleep 3
 done
+
+# Decide by what the RUNNING UI does, not by .env: compose lets a shell
+# variable override .env, so the UI can run with login on while .env says
+# off. /api/config reports it without a login (features.auth). Only when
+# that cannot be read does .env decide. A no-login UI is never probed: it
+# answers any sign-in with its own admin, by design.
+running_auth="$(curl -s -m 10 "$URL/api/config" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    v = json.load(sys.stdin).get("features", {}).get("auth")
+except Exception:
+    v = None
+print({True: "true", False: "false"}.get(v, ""))' 2>/dev/null)"
+case "$running_auth" in
+  true) ;;
+  false)
+    log "the running chat UI has no login; no login to check"
+    exit 0;;
+  *)
+    if ! webui_auth_on; then
+      log "cannot read the running UI's login mode, and WEBUI_AUTH is not true; nothing to check"
+      exit 0
+    fi;;
+esac
 
 code="$(curl -s -m 15 -o /dev/null -w '%{http_code}' \
   -H 'Content-Type: application/json' \
