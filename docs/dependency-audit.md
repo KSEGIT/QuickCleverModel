@@ -111,9 +111,10 @@ Notes from the release notes between v0.11.3 and v0.13.4 that touch this repo:
 - No rename of `WEBUI_AUTH`, `ENABLE_SIGNUP`, `OPENAI_API_BASE_URL(S)`,
   `OPENAI_API_KEY(S)`, `ENABLE_PERSISTENT_CONFIG` or `WEBUI_SECRET_KEY`.
 
-The Docker Compose files now default to `WEBUI_AUTH=true` and
-`ENABLE_SIGNUP=false`. In v0.13.4 the first account can sign up even with
-`ENABLE_SIGNUP=false`, and becomes the admin. A new `WEBUI_MODEL` value in
+The Docker Compose files keep `WEBUI_AUTH=false` as the default (login is
+opt-in, on a fresh data volume) and now default to `ENABLE_SIGNUP=false`. In
+v0.13.4 the first account can sign up even with `ENABLE_SIGNUP=false`, and
+becomes the admin. A new `WEBUI_MODEL` value in
 `.env` fixes the chat model through `OPENAI_API_CONFIGS` and `DEFAULT_MODELS`;
 see `.env.example`.
 

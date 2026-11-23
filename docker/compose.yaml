@@ -10,7 +10,7 @@ services:
     image: ghcr.io/open-webui/open-webui:v0.13.4
     container_name: bonsai-webui
     ports:
-      # Loopback-only. Never widen this with WEBUI_AUTH=false.
+      # Loopback-only: the UI has no login unless WEBUI_AUTH=true in ../.env.
       - "127.0.0.1:9090:8080"
     environment:
       # The trailing /v1 matters — llama-server serves the OpenAI-compatible API there.
@@ -21,9 +21,10 @@ services:
       # these apply on the first start of a fresh volume only.
       OPENAI_API_CONFIGS: '{"0":{"model_ids":[${WEBUI_MODEL:+"${WEBUI_MODEL}"}]}}'
       DEFAULT_MODELS: "${WEBUI_MODEL:-}"
-      # Login is on by default; see WEBUI_AUTH in ../.env.example. The first
-      # account to sign up becomes the admin, then sign-up stays off.
-      WEBUI_AUTH: "${WEBUI_AUTH:-true}"
+      # Login is off by default. Set WEBUI_AUTH=true in ../.env on a fresh
+      # open-webui-data volume only; see ../.env.example. The first account to
+      # sign up becomes the admin, then sign-up stays off.
+      WEBUI_AUTH: "${WEBUI_AUTH:-false}"
       ENABLE_SIGNUP: "${ENABLE_SIGNUP:-false}"
       ENABLE_OLLAMA_API: "false"   # we are not running Ollama
       # Background generations (title, tags, follow-ups...) decode concurrently

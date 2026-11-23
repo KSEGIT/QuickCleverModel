@@ -89,12 +89,13 @@ ssh -N -L 9090:127.0.0.1:9090 -L 8080:127.0.0.1:8080 user@<box-ip>
 **Option 2 — Tailscale bind (good for daily use).** The box keeps the ports
 open on its Tailscale address, so any machine on your tailnet can connect.
 
-First create the chat UI admin. On the Docker paths the UI asks for a login
-by default (`WEBUI_AUTH=true`), and the first account to sign up becomes the
-admin. Sign up over loopback or the SSH tunnel above, before you bind. After
-that, sign-up is off; the admin adds other users and shares the model with
-them (see `WEBUI_MODEL` in `.env.example`). An install that ran without login
-needs a fresh `open-webui-data` volume before login works (see `.env.example`).
+The chat UI has no login by default. Before you bind it on a shared
+tailnet, turn login on: set `WEBUI_AUTH=true` in `.env` on a **fresh**
+`open-webui-data` volume (an old no-login volume holds `admin@localhost` /
+`admin`; see `.env.example`). Then create the admin first: the first account
+to sign up becomes the admin, so sign up over loopback or the SSH tunnel
+above, before you bind. After that, sign-up is off; the admin adds other
+users and shares the model with them (see `WEBUI_MODEL` in `.env.example`).
 The native macOS UI (`start-webui.sh`) has no login; do not bind it.
 
 Then, on the box, add this to `.env` (use the box's own Tailscale IP, from

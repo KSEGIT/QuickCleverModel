@@ -62,14 +62,14 @@ services:
     image: ghcr.io/open-webui/open-webui:v0.13.4
     container_name: bonsai-webui
     ports:
-      # Loopback by default. The UI asks for a login by default (WEBUI_AUTH
-      # below). Remote access: set WEBUI_BIND to the machine's Tailscale IP in
-      # .env (tailnet-only exposure), or prefer an ssh -L tunnel and leave this
-      # alone. Create the admin account before you bind beyond loopback.
+      # Loopback by default: the UI has no login unless WEBUI_AUTH=true (below).
+      # Remote access: set WEBUI_BIND to the machine's Tailscale IP in .env
+      # (tailnet-only exposure), or prefer an ssh -L tunnel and leave this
+      # alone. With login on, create the admin before you bind beyond loopback.
       - "${WEBUI_BIND:-127.0.0.1}:9090:8080"
       # Second listener, same idea as LLAMA_BIND2 above. Set WEBUI_BIND2 to
-      # the second tailscaled's IP in .env. Never set WEBUI_AUTH=false while
-      # this is bound beyond your own machines.
+      # the second tailscaled's IP in .env. Set WEBUI_AUTH=true in .env before
+      # exposing this beyond your own machines.
       - "${WEBUI_BIND2:-127.0.0.2}:9090:8080"
     environment:
       # The trailing /v1 matters — llama-server serves the OpenAI-compatible API there.
@@ -93,13 +93,14 @@ services:
       # https://docs.openwebui.com/reference/env-configuration#default_models
       OPENAI_API_CONFIGS: '{"0":{"model_ids":[${WEBUI_MODEL:+"${WEBUI_MODEL}"}]}}'
       DEFAULT_MODELS: "${WEBUI_MODEL:-}"
-      # Login is on by default. The first account to sign up becomes the admin.
-      # Sign-up stays off after that: with ENABLE_PERSISTENT_CONFIG=false the
-      # env value wins on every start, so ENABLE_SIGNUP=false is what keeps it
-      # off. The admin adds more users in Admin Panel > Users. Switching
-      # WEBUI_AUTH on or off on an existing install needs a fresh
-      # open-webui-data volume (see .env.example).
-      WEBUI_AUTH: "${WEBUI_AUTH:-true}"
+      # Login is off by default, so existing no-login installs keep working.
+      # Turn it on with WEBUI_AUTH=true in .env, on a FRESH open-webui-data
+      # volume only (see .env.example). The first account to sign up becomes
+      # the admin. Sign-up stays off after that: with
+      # ENABLE_PERSISTENT_CONFIG=false the env value wins on every start, so
+      # ENABLE_SIGNUP=false is what keeps it off. The admin adds more users in
+      # Admin Panel > Users.
+      WEBUI_AUTH: "${WEBUI_AUTH:-false}"
       ENABLE_SIGNUP: "${ENABLE_SIGNUP:-false}"
       ENABLE_OLLAMA_API: "false"   # we are not running Ollama
       # Background generations (title, tags, follow-ups...) decode concurrently
