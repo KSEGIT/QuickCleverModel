@@ -16,9 +16,13 @@ services:
       # The trailing /v1 matters — llama-server serves the OpenAI-compatible API there.
       OPENAI_API_BASE_URL: "http://host.docker.internal:8080/v1"
       OPENAI_API_KEY: "${BONSAI_API_KEY:?set BONSAI_API_KEY in ../.env}"
+      # .env is the only source of truth, as in compose.linux.yaml: without
+      # this, Open WebUI keeps its own copy of these settings in its database
+      # and that copy wins on every later start.
+      # https://docs.openwebui.com/reference/env-configuration#enable_persistent_config
+      ENABLE_PERSISTENT_CONFIG: "false"
       # Fixed chat model from WEBUI_MODEL in .env; empty lists all models.
-      # See ../.env.example. Persistent config is on here (the default), so
-      # these apply on the first start of a fresh volume only.
+      # See ../.env.example.
       OPENAI_API_CONFIGS: '{"0":{"model_ids":[${WEBUI_MODEL:+"${WEBUI_MODEL}"}]}}'
       DEFAULT_MODELS: "${WEBUI_MODEL:-}"
       # Login is off by default. Set WEBUI_AUTH=true in ../.env on a fresh
@@ -26,6 +30,15 @@ services:
       # sign up becomes the admin, then sign-up stays off.
       WEBUI_AUTH: "${WEBUI_AUTH:-false}"
       ENABLE_SIGNUP: "${ENABLE_SIGNUP:-false}"
+      # Session secret. start.sh in the image reads WEBUI_SECRET_KEY, or else
+      # the file named by WEBUI_SECRET_KEY_FILE, and writes a new random key
+      # there when it is missing. Its default file sits OUTSIDE the data
+      # volume, so every container recreate made a new key and signed every
+      # user out. The file now lives in the volume and survives recreates.
+      # Set WEBUI_SECRET_KEY in .env to use your own key instead.
+      # https://github.com/open-webui/open-webui/blob/v0.13.4/backend/start.sh
+      WEBUI_SECRET_KEY: "${WEBUI_SECRET_KEY:-}"
+      WEBUI_SECRET_KEY_FILE: /app/backend/data/.webui_secret_key
       ENABLE_OLLAMA_API: "false"   # we are not running Ollama
       # Background generations (title, tags, follow-ups...) decode concurrently
       # with your reply and steal bandwidth on a single-GPU box — same reasoning

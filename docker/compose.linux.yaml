@@ -102,6 +102,15 @@ services:
       # Admin Panel > Users.
       WEBUI_AUTH: "${WEBUI_AUTH:-false}"
       ENABLE_SIGNUP: "${ENABLE_SIGNUP:-false}"
+      # Session secret. start.sh in the image reads WEBUI_SECRET_KEY, or else
+      # the file named by WEBUI_SECRET_KEY_FILE, and writes a new random key
+      # there when it is missing. Its default file sits OUTSIDE the data
+      # volume, so every container recreate made a new key and signed every
+      # user out. The file now lives in the volume and survives recreates.
+      # Set WEBUI_SECRET_KEY in .env to use your own key instead.
+      # https://github.com/open-webui/open-webui/blob/v0.13.4/backend/start.sh
+      WEBUI_SECRET_KEY: "${WEBUI_SECRET_KEY:-}"
+      WEBUI_SECRET_KEY_FILE: /app/backend/data/.webui_secret_key
       ENABLE_OLLAMA_API: "false"   # we are not running Ollama
       # Background generations (title, tags, follow-ups...) decode concurrently
       # with your reply and steal bandwidth on a single-GPU box — same reasoning

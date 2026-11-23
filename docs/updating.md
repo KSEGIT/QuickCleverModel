@@ -75,7 +75,9 @@ Three failures count as proof the commit is bad:
 - a model cannot answer,
 - the stack never becomes healthy after a clean build and start, or
 - the chat UI stops answering when no new Open WebUI image was pulled — the
-  service is defined in `docker/compose.linux.yaml`, so that is the code.
+  service is defined in `docker/compose.linux.yaml`, so that is the code, or
+- the chat UI stops answering after the commit itself named a different Open
+  WebUI image.
 
 Other failures do not pin. A build that lost the network, or a start that
 lost a race with the second network address, says nothing about the commit.
@@ -98,6 +100,28 @@ To try the same commit again anyway:
 ```bash
 sed -i '/^bad=/d' run/update-state
 ```
+
+## Open WebUI image and data
+
+`update.sh` reads the Open WebUI image from `docker/compose.linux.yaml`
+(`docker compose config --images`), again after each merge. No tag is copied
+into the script, so it always handles the image that compose runs.
+
+A new Open WebUI image migrates its database on first start, and putting the
+old image back does not undo that. So before a different image starts,
+`update.sh` stops the chat UI and saves the `open-webui-data` volume to
+`run/webui-snapshots/` (the newest 2 are kept; only root can read them). If
+the update then rolls back to the older image, it puts that snapshot back too.
+Chats written after the snapshot are lost.
+
+## The default-admin check
+
+With `WEBUI_AUTH=true`, a data volume made with login off still holds
+`admin@localhost` with password `admin`, and the login page accepts it.
+`update.sh` runs `./webui-guard.sh` at the end of every run. If that login
+works, the guard stops the chat UI container and the run fails with the
+reason. Fix it with a fresh `open-webui-data` volume. You can run
+`./webui-guard.sh` by hand at any time.
 
 ## Tuning the deadlines
 

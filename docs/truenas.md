@@ -201,6 +201,8 @@ must remain visible in the results.
 
 ## Add context labels in Open WebUI
 
+Note: these label steps were checked on Open WebUI v0.11.3 only.
+
 Sign in as an administrator, open **Settings**, then **Models** in its
 administrator section (direct path: `/?settings=admin%3Amodels`). Open each
 base model and edit **Model Name**. Append `(64K)` to Qwen9 and `(32K)` to the

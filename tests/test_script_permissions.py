@@ -33,6 +33,7 @@ EXECUTABLE = [
     "setup-codex.sh",
     "claude-bonsai.sh",
     "update.sh",
+    "webui-guard.sh",
     "cache-viz.py",
     "tests/bench/worker.sh",
     "tests/live_image_agent.py",

@@ -73,8 +73,19 @@ ENV_FILE="$ROOT/.env"
 STATE="$ROOT/run/update-state"
 LLAMA_IMAGE="bonsai-llama:cuda"
 ROLLBACK_IMAGE="bonsai-llama:rollback"
-WEBUI_IMAGE="ghcr.io/open-webui/open-webui:v0.13.4"
+# The open-webui image is NOT written here. It is read from the compose file
+# (webui_image_in_file below, then resolve_webui_image after a merge), so the
+# updater always handles the image that compose will really run. A hand-copied
+# tag here once had to be bumped in step with docker/compose.linux.yaml, and a
+# commit that bumped only the compose file would pull and start the new image
+# while this script still snapshotted, compared and restored the old one.
+WEBUI_IMAGE=""
 LLAMA_CONTAINER="bonsai-llama-1"
+# Snapshots of the open-webui-data volume, taken before a different Open WebUI
+# image starts. Its database migrations are one-way: an image rollback alone
+# leaves a database the old image cannot read.
+SNAP_DIR="$ROOT/run/webui-snapshots"
+SNAP_KEEP=2
 
 log()  { printf '%s  %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 warn() { printf '%s  WARN %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -130,6 +141,64 @@ if not isinstance(d, dict):
 for m in d.get("data", []):
     if isinstance(m, dict) and m.get("id"):
         print(m["id"])'
+}
+
+webui_image_in_file() {
+  # The image of the open-webui service, read as text from compose file $1.
+  # Pure on purpose: it runs when this file is sourced, before anything may
+  # call docker, and it is the fallback when `compose config` cannot run.
+  # Service keys sit at two spaces, their fields at four.
+  [[ -f "${1:-}" ]] || return 1
+  awk '
+    /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { svc = $1; sub(/:$/, "", svc); next }
+    /^[^[:space:]#]/ { svc = "" }
+    svc == "open-webui" && /^    image:/ {
+      sub(/^    image:[[:space:]]*/, ""); sub(/[[:space:]]+#.*$/, "")
+      gsub(/["\047]/, ""); print; exit
+    }' "$1"
+}
+
+image_ref_ok() {
+  # A plain image reference: no spaces, no shell or YAML noise.
+  [[ -n "${1:-}" && "$1" =~ ^[A-Za-z0-9._/:@-]+$ ]]
+}
+
+# Model ids go into OPENAI_API_CONFIGS as JSON in docker/compose.linux.yaml.
+# A quote, comma or bracket would break that JSON or add entries, so allow
+# only plain id characters. webui-guard.sh uses the same pattern, and
+# tests/test_webui_guard.py keeps the two equal.
+MODEL_ID_RE='^[A-Za-z0-9._:/-]+$'
+
+webui_model_ok() {
+  [[ -z "${1:-}" || "$1" =~ $MODEL_ID_RE ]]
+}
+
+newest_snapshots_first() {
+  # Snapshot files in $1, newest first. The names carry a UTC timestamp, so
+  # a reverse name sort is a time sort that does not depend on mtimes.
+  [[ -d "${1:-}" ]] || return 0
+  find "$1" -maxdepth 1 -type f -name 'open-webui-data-*.tar.gz' 2>/dev/null \
+    | sort -r
+}
+
+prune_snapshots() {
+  # Keep the newest $2 snapshots in $1 and delete the rest.
+  local keep="${2:-$SNAP_KEEP}" n=0 f
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    n=$((n + 1))
+    (( n > keep )) && rm -f -- "$f"
+  done < <(newest_snapshots_first "${1:-}")
+  return 0
+}
+
+snapshot_for_image() {
+  # The newest snapshot in $STATE taken under image ID $1. A line reads
+  # "webui_snapshot=<image-id> <path>"; the path may contain spaces.
+  [[ -n "${1:-}" ]] || return 0
+  sed -n 's/^webui_snapshot=//p' "$STATE" 2>/dev/null \
+    | awk -v id="$1" '$1 == id { line = $0 } END {
+        if (line != "") { sub(/^[^ ]+ /, "", line); print line } }'
 }
 
 is_pinned_bad_image() {
@@ -367,6 +436,13 @@ smoke() {
   fi
   ids="$(printf '%s' "$ASK_BODY" | parse_model_ids)"
   [[ -n "$ids" ]] || { warn "/v1/models listed no models"; return 2; }
+  # The chat UI lists only WEBUI_MODEL when it is set, without asking the
+  # server. A typo there leaves users with one model that never answers, and
+  # nothing else would say why. A warning only: the models are judged below.
+  if [[ -n "${WEBUI_MODEL:-}" ]] && ! grep -qxF -- "$WEBUI_MODEL" <<< "$ids"; then
+    warn "WEBUI_MODEL=$WEBUI_MODEL is not in $API/v1/models — the chat UI
+offers only that model, so chats will fail. Served: $(tr '\n' ' ' <<< "$ids")"
+  fi
 
   # A whole-sweep deadline, so the systemd budget can be believed. Without it
   # the retry loop multiplies the worst case by three per alias, and a unit
@@ -458,6 +534,10 @@ smoke() {
   (( unknown )) && return 2
   return 0
 }
+
+# The image the checked-out compose file names right now. cmd_update reads it
+# again after the merge, and do_rollback after the reset.
+WEBUI_IMAGE="$(webui_image_in_file "$COMPOSE_FILE")"
 
 # --- run from a copy, never from the file we are about to rewrite -----------
 #
@@ -639,6 +719,96 @@ compose() {
     docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
 }
 
+resolve_webui_image() {
+  # The open-webui image compose will run from the CHECKED-OUT compose file.
+  # `config --images open-webui` also prints the images of its depends_on
+  # services (llama), so that one line is dropped. Anything other than one
+  # plain image reference left over falls back to reading the file as text.
+  local imgs
+  imgs="$(compose config --images open-webui 2>/dev/null | grep -vxF -- "$LLAMA_IMAGE")"
+  if [[ "$(printf '%s\n' "$imgs" | grep -c .)" == "1" ]] && image_ref_ok "$imgs"; then
+    printf '%s' "$imgs"
+    return 0
+  fi
+  imgs="$(webui_image_in_file "$COMPOSE_FILE")"
+  image_ref_ok "$imgs" || return 1
+  warn "compose could not name the open-webui image; read $imgs from $COMPOSE_FILE"
+  printf '%s' "$imgs"
+}
+
+webui_container() {
+  # The open-webui container, running or stopped. Asked of compose, so a
+  # COMPOSE_PROJECT_NAME in .env cannot hide it.
+  compose ps -a -q open-webui 2>/dev/null | head -1
+}
+
+# snapshot_webui_data <image>
+#
+# Copies the open-webui-data volume to $SNAP_DIR as a tar.gz before a
+# different Open WebUI image starts, and records the file in $STATE. <image>
+# is the image to run tar in: the one in use now, so it is already on disk.
+# The container is stopped first, so the SQLite database is copied while
+# nothing writes to it. The archive is made by root inside the container with
+# umask 077: chats and the secret key stay readable by root only.
+snapshot_webui_data() {
+  local img="${1:-}" cid name
+  cid="$(webui_container)"
+  if [[ -z "$cid" ]]; then
+    log "no open-webui container yet, so no data to snapshot"
+    return 0
+  fi
+  [[ -n "$img" ]] || { warn "no image to run the snapshot in"; return 1; }
+  mkdir -p "$SNAP_DIR" || { warn "cannot create $SNAP_DIR"; return 1; }
+  name="open-webui-data-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+  log "stopping open-webui to snapshot its data volume"
+  compose stop open-webui || { warn "could not stop open-webui"; return 1; }
+  if ! docker run --rm --volumes-from "$cid" -v "$SNAP_DIR:/snap" \
+       --entrypoint sh "$img" -c \
+       'umask 077 && tar -czf "/snap/$1.part" -C /app/backend/data .' sh "$name"; then
+    rm -f -- "$SNAP_DIR/$name.part"
+    warn "could not snapshot the open-webui-data volume"
+    return 1
+  fi
+  mv -f -- "$SNAP_DIR/$name.part" "$SNAP_DIR/$name" \
+    || { warn "could not finish $SNAP_DIR/$name"; return 1; }
+  # Recorded with the image it belongs to: do_rollback restores only a
+  # snapshot taken under the image it is returning to.
+  printf 'webui_snapshot=%s %s\n' "$img" "$SNAP_DIR/$name" >> "$STATE" \
+    || { warn "could not record the snapshot in $STATE"; return 1; }
+  prune_snapshots "$SNAP_DIR" "$SNAP_KEEP"
+  log "open-webui data saved to $SNAP_DIR/$name"
+}
+
+# restore_webui_data <snapshot> <image>
+#
+# Puts a snapshot back into the open-webui-data volume. Run by do_rollback
+# when it returns to an older Open WebUI image, because the newer image may
+# already have migrated the database past what the older one can read. Chats
+# made after the snapshot are lost; the warning says so.
+restore_webui_data() {
+  local snap="${1:-}" img="${2:-}" cid
+  [[ -f "$snap" ]] || { warn "snapshot $snap is missing"; return 1; }
+  cid="$(webui_container)"
+  [[ -n "$cid" ]] || { warn "no open-webui container to restore into"; return 1; }
+  warn "restoring open-webui data from $snap — chats made after it are lost"
+  compose stop open-webui || { warn "could not stop open-webui"; return 1; }
+  docker run --rm --volumes-from "$cid" -v "$(dirname "$snap"):/snap:ro" \
+    --entrypoint sh "$img" -c \
+    'find /app/backend/data -mindepth 1 -delete && tar -xzf "/snap/$1" -C /app/backend/data' \
+    sh "$(basename "$snap")"
+}
+
+run_webui_guard() {
+  # webui-guard.sh: with WEBUI_AUTH=true, stops the UI if the old no-login
+  # account admin@localhost / admin can sign in. Exit 0 means all clear.
+  local guard="$ROOT/webui-guard.sh"
+  if [[ ! -f "$guard" ]]; then
+    warn "no $guard — skipping the default-admin check"
+    return 0
+  fi
+  QCM_ENV_FILE="$ENV_FILE" QCM_WEBUI_URL="$WEBUI_URL" bash "$guard"
+}
+
 local_image_digest() {
   # RepoDigests holds the manifest digest the image was pulled by, which is
   # the only local value comparable with a registry digest. .Id is a local
@@ -792,6 +962,9 @@ This is the Linux/Docker path; macOS uses ./stack.sh"
   [[ -f "$COMPOSE_FILE" ]] || die "no compose file at $COMPOSE_FILE"
   [[ -f "$ENV_FILE" ]]     || die "no .env at $ENV_FILE"
   [[ -n "${BONSAI_API_KEY:-}" ]] || die "BONSAI_API_KEY is not set in $ENV_FILE"
+  webui_model_ok "${WEBUI_MODEL:-}" || die "WEBUI_MODEL='${WEBUI_MODEL}' in $ENV_FILE is not a plain model id
+(allowed: letters, digits and . _ : / -). It is written into Open WebUI's
+OPENAI_API_CONFIGS JSON, so anything else could break or change that config."
 
   # The BINARY existing is not the daemon answering. Without this,
   # record_rollback_point still ran: `docker image inspect` returned empty for
@@ -903,8 +1076,9 @@ record_rollback_point() {
     # ui= is written for a human reading run/update-state, not for the script:
   # it records whether the chat UI was answering when this point was taken, so
   # "verified=1 ui=0" reads as "the models were proven, the UI was not up".
-  printf 'sha=%s\nwebui=%s\nllama=%s\nverified=%s\nui=%s\n' \
-      "$sha" "$webui" "$llama" "$verified" "${UI_WAS_UP:-0}" || ok=0
+  # webui_ref= names the tag that webui= was read from, also for a human.
+  printf 'sha=%s\nwebui=%s\nllama=%s\nverified=%s\nui=%s\nwebui_ref=%s\n' \
+      "$sha" "$webui" "$llama" "$verified" "${UI_WAS_UP:-0}" "$WEBUI_IMAGE" || ok=0
     if [[ -n "$pins" ]]; then
       printf '%s\n' "$pins" || ok=0
     fi
@@ -1001,6 +1175,24 @@ this run introduced, because the recorded point predates it"
     fi
   fi
 
+  # The compose file may name a different open-webui image now that the code
+  # moved back; the restore below must tag the one compose will really run.
+  local ref
+  if ref="$(resolve_webui_image)"; then
+    WEBUI_IMAGE="$ref"
+  else
+    warn "cannot tell which open-webui image the restored compose file names; using $WEBUI_IMAGE"
+  fi
+
+  # Which image the open-webui container ran last, read BEFORE anything is
+  # retagged. If it is not the recorded one, a newer image may have migrated
+  # the database, and the snapshot this run took has to come back with the
+  # old image.
+  local webui_cid webui_ran="" snap
+  webui_cid="$(webui_container)"
+  [[ -n "$webui_cid" ]] && webui_ran="$(docker inspect "$webui_cid" --format '{{.Image}}' 2>/dev/null)"
+  snap="$(snapshot_for_image "$webui")"
+
   local have current
   have="$(docker image inspect "$ROLLBACK_IMAGE" --format '{{.Id}}' 2>/dev/null)"
   if [[ -z "$have" ]]; then
@@ -1044,6 +1236,21 @@ this run introduced, because the recorded point predates it"
     restored=0
   else
     changed=1
+  fi
+
+  # Data second: only when the container last ran an image other than the
+  # recorded one. When the new image never started, the data never moved.
+  if [[ -n "$snap" && -n "$webui" && -n "$webui_ran" && "$webui_ran" != "$webui" ]]; then
+    if restore_webui_data "$snap" "$webui"; then
+      changed=1
+    else
+      warn "could not restore the open-webui data from $snap — the older image
+may not start on a database the newer one migrated"
+      restored=0
+    fi
+  elif [[ -z "$snap" && -n "$webui" && -n "$webui_ran" && "$webui_ran" != "$webui" ]]; then
+    warn "a different open-webui image ran since the rollback point, and no data
+snapshot of ${webui:0:19} was recorded — its database changes stay"
   fi
 
   # Appended after the reset so the pin survives even when the reset failed.
@@ -1173,7 +1380,13 @@ UI here and is pinned — not counting that as drift"
 # an already long function.
 chat_ui_failed() {
   local ui_pin=""
-  if [[ -z "$webui_before" || -z "$webui_after" ]]; then
+  if [[ -n "${webui_ref_before:-}" && "$webui_ref_before" != "$WEBUI_IMAGE" ]]; then
+    # The commit itself named a new image. That is the commit's change, even
+    # though the image is new too, so the commit is what gets pinned.
+    ui_pin="$pin_arg"
+    warn "the chat UI at $WEBUI_URL did not answer after this commit changed
+the open-webui image ($webui_ref_before -> $WEBUI_IMAGE)"
+  elif [[ -z "$webui_before" || -z "$webui_after" ]]; then
     # Neither digest is known, so "a new image arrived" is not a claim this
     # run can make. The else branch used to assert it anyway: with both empty
     # it logged a wrong reason and pinned nothing, letting a commit that
@@ -1243,6 +1456,10 @@ cmd_update() {
   # at, so one dead since last week's reboot was unknown to this run and the
   # post-update check blamed the commit for it.
   local head_sha have want verified=0 models_verdict ui_before=0
+  # The open-webui image the checkout names BEFORE any merge — the one that
+  # is running. chat_ui_failed reads it to tell a commit that changed the
+  # image from a registry that changed the tag's contents.
+  local webui_ref_before="$WEBUI_IMAGE"
   head_sha="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   log "checking the current stack before changing anything"
   if wait_for_health "$PRECHECK_TIMEOUT"; then
@@ -1348,6 +1565,8 @@ fix it."
       fi
       if (( verified )); then
         log "already up to date (code ${head_sha:0:12} contains ${target:0:12}, images current) — nothing to do"
+        run_webui_guard || { warn "nothing to update, but the chat UI check
+above failed — see webui-guard.sh"; return 1; }
         return 0
       fi
       if (( models_verdict == 2 )); then
@@ -1447,9 +1666,20 @@ touch the running stack"
     exit 1
   fi
 
+  # The merge may have changed which open-webui image compose runs, so ask
+  # compose again instead of trusting the tag read before the merge.
+  local new_ref
+  if ! new_ref="$(resolve_webui_image)"; then
+    warn "cannot tell which open-webui image the new compose file names — rolling back"
+    do_rollback; exit 1
+  fi
+  WEBUI_IMAGE="$new_ref"
+  [[ "$WEBUI_IMAGE" != "$webui_ref_before" ]] \
+    && log "this commit changes the open-webui image: $webui_ref_before -> $WEBUI_IMAGE"
+
   log "pulling open-webui"
   local webui_before webui_after want_now
-  webui_before="$(local_image_digest "$WEBUI_IMAGE")"
+  webui_before="$(local_image_digest "$webui_ref_before")"
   want_now="$(remote_image_digest "$WEBUI_IMAGE")"
   if [[ -n "$want_now" ]] && is_pinned_bad_image "$want_now"; then
     # The pin was only consulted on the code-is-current path, so a week that
@@ -1463,6 +1693,20 @@ UI here and was rolled back"
     compose pull open-webui || warn "pull failed; keeping the current image"
   fi
   webui_after="$(local_image_digest "$WEBUI_IMAGE")"
+
+  # A different Open WebUI image migrates its database on first start, and
+  # that cannot be undone by swapping the image back. Save the data first.
+  # Compared by image ID: the container runs the recorded ID, and compose will
+  # run whatever $WEBUI_IMAGE names now (pulled on `up` if still missing).
+  local id_before id_after
+  id_before="$(docker image inspect "$webui_ref_before" --format '{{.Id}}' 2>/dev/null)"
+  id_after="$(docker image inspect "$WEBUI_IMAGE" --format '{{.Id}}' 2>/dev/null)"
+  if [[ -n "$id_before" && "$id_before" != "$id_after" ]]; then
+    if ! snapshot_webui_data "$id_before"; then
+      warn "no data snapshot, so the new open-webui image will NOT be started — rolling back"
+      do_rollback; exit 1
+    fi
+  fi
 
   log "restarting stack"
   compose up -d || { warn "compose up failed"; do_rollback; exit 1; }
@@ -1523,6 +1767,13 @@ above, then run ./update.sh --rollback yourself if you want the old version."
     warn "update applied and the models are verified, but the chat UI at
 $WEBUI_URL is still down — it was down before this run too. Start it
 separately; nothing here will fix it."
+    return 1
+  fi
+
+  # Last: a stack that serves can still expose the old no-login admin.
+  if ! run_webui_guard; then
+    warn "update applied and the models are verified, but the chat UI check
+failed — see the webui-guard.sh message above"
     return 1
   fi
 

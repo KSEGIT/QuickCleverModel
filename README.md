@@ -98,6 +98,9 @@ above, before you bind. After that, sign-up is off; the admin adds other
 users and shares the model with them (see `WEBUI_MODEL` in `.env.example`).
 The native macOS UI (`start-webui.sh`) has no login; do not bind it.
 
+Check it: `./webui-guard.sh`. It stops the chat UI if the old no-login
+account still signs in (see [docs/updating.md](docs/updating.md)).
+
 Then, on the box, add this to `.env` (use the box's own Tailscale IP, from
 `tailscale ip -4`):
 

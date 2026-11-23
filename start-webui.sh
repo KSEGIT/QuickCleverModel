@@ -49,6 +49,21 @@ else
   export OPENAI_API_KEY="$BONSAI_API_KEY"
 fi
 export ENABLE_OLLAMA_API=False
+
+# .env settings that only the Docker paths honour. Ignoring one in silence
+# lets someone believe the native UI has a login, or a fixed model, when it
+# has neither. Read BEFORE the forced WEBUI_AUTH=False below.
+case "$(printf '%s' "${WEBUI_AUTH:-}" | tr '[:upper:]' '[:lower:]')" in
+  ""|false) ;;
+  *) echo "WARN: WEBUI_AUTH=${WEBUI_AUTH} is ignored on the native macOS path:" \
+          "this UI runs WITHOUT a login, on 127.0.0.1 only." \
+          "Login works on the Docker paths (docker/compose.yaml)." >&2;;
+esac
+if [[ -n "${WEBUI_MODEL:-}" ]]; then
+  echo "WARN: WEBUI_MODEL=${WEBUI_MODEL} is ignored on the native macOS path:" \
+       "every local model is listed. It works on the Docker paths only." >&2
+fi
+
 # Only valid while the DB has zero users. Open WebUI refuses to start with
 # WEBUI_AUTH=False if any user exists ("You can't turn off authentication because
 # there are existing users"). If you ever create one, either flip this to True or
