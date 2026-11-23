@@ -3376,6 +3376,40 @@ class WebuiDataIsSnapshotted(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.snaps)),
                          sorted(names[2:] + ["keep-me.txt"]))
 
+    def test_the_proven_points_snapshot_survives_pruning(self):
+        """Unverified runs keep an older rollback point, so its snapshot can
+        be older than the newest two — and it is the only usable one."""
+        os.makedirs(self.snaps)
+        names = [f"open-webui-data-2026010{i}T000000Z.tar.gz" for i in range(1, 5)]
+        for n in names:
+            open(os.path.join(self.snaps, n), "w").close()
+        oldest = os.path.join(self.snaps, names[0])
+        with open(self.state, "w") as fh:
+            fh.write(f"sha=x\nwebui=sha256:A\nwebui_snapshot=sha256:A {oldest}\n")
+        r = run_real(f'STATE={shlex.quote(self.state)}',
+                     f'prune_snapshots {shlex.quote(self.snaps)} 2')
+        self.assertIn("rc=0", r.stdout, r.stderr)
+        self.assertEqual(sorted(os.listdir(self.snaps)),
+                         sorted([names[0]] + names[2:]))
+
+    def test_a_republished_tag_still_gets_a_snapshot(self):
+        """Same tag, new image: the pull moves the tag, so the old ID must
+        come from the running container, read before the pull."""
+        setup = (
+            UPDATE_STUBS +
+            'resolve_webui_image() { echo "$WEBUI_IMAGE"; }; '
+            'webui_container() { echo cid1; }; '
+            'docker() { case "$1 $2" in "inspect cid1") echo sha256:A;; '
+            '"image inspect") echo sha256:B;; esac; return 0; }; '
+            'snapshot_webui_data() { echo "SNAPSHOT $1"; }; '
+            'run_webui_guard() { return 0; }; '
+            'compose() { echo "COMPOSE $1"; return 0; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("SNAPSHOT sha256:A", out)
+        self.assertLess(out.index("SNAPSHOT"), out.index("COMPOSE up"))
+
     def test_no_container_means_nothing_to_save(self):
         r = run_real(
             f'SNAP_DIR={shlex.quote(self.snaps)}; STATE={shlex.quote(self.state)}; '
@@ -3454,6 +3488,40 @@ class RollbackBringsTheDataBack(unittest.TestCase):
                              "webui_snapshot=sha256:A /snaps/one.tar.gz\n")
         self.assertNotIn("RESTORE", out)
 
+    def test_a_failed_restore_leaves_the_ui_stopped(self):
+        """Recreating would start the old image on half-restored data, and
+        a recreated container would hide the unfinished restore from the
+        next --rollback."""
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "update-state")
+            with open(state, "w") as fh:
+                fh.write("sha=OLD\nwebui=sha256:A\nllama=sha256:L\nverified=1\n"
+                         "webui_snapshot=sha256:A /snaps/a.tar.gz\n")
+            setup = (
+                f'STATE={shlex.quote(state)}; '
+                'git() { case "$*" in *"rev-parse HEAD"*) echo NEW;; esac; return 0; }; '
+                'stash_local_edits() { return 0; }; '
+                'resolve_webui_image() { echo old/webui:1; }; '
+                'webui_container() { echo cid1; }; '
+                'docker() { case "$1 $2" in "inspect cid1") echo sha256:B;; '
+                '"image inspect") case "$3" in old/webui:1) echo sha256:A;; '
+                '*) echo sha256:L;; esac;; esac; return 0; }; '
+                'restore_webui_data() { return 1; }; '
+                'compose() { echo "COMPOSE $*"; return 0; }; '
+                'wait_for_health() { return 0; }; webui_ok() { return 0; }; '
+                'smoke() { return 0; }'
+            )
+            r = run_real(setup, 'do_rollback pin')
+            out = r.stdout + r.stderr
+            with open(state) as fh:
+                body = fh.read()
+        self.assertIn("rc=1", out)
+        self.assertIn("LEFT STOPPED", out)
+        self.assertIn("COMPOSE up -d --force-recreate llama", out)
+        self.assertNotIn("COMPOSE up -d --force-recreate\n", out,
+                         "the whole stack, UI included, was recreated")
+        self.assertIn("bad=NEW", body, "the pin must survive the early stop")
+
     def test_a_snapshot_of_another_image_is_not_used(self):
         out = self._rollback("sha256:B",
                              "webui_snapshot=sha256:Z /snaps/z.tar.gz\n")
@@ -3518,13 +3586,31 @@ class TheDefaultAdminCheckRunsEveryTime(unittest.TestCase):
             UPDATE_STUBS +
             'resolve_webui_image() { echo "$WEBUI_IMAGE"; }; '
             'docker() { return 0; }; compose() { return 0; }; '
+            'G=0; run_webui_guard() { G=$((G+1)); echo "GUARD $G"; '
+            '[ "$G" = 1 ]; }'
+        )
+        r = run_real(setup, 'cmd_update')
+        out = r.stdout + r.stderr
+        self.assertIn("GUARD 2", out)
+        self.assertIn("stopped the chat UI", out)
+        self.assertIn("rc=1", out)
+        self.assertNotIn("update complete and verified", out)
+
+    def test_it_runs_before_a_model_verdict_can_exit(self):
+        """smoke returning 2 (busy router, rotated key) used to skip the
+        guard on the way out."""
+        setup = (
+            UPDATE_STUBS +
+            'smoke() { return 2; }; '
+            'resolve_webui_image() { echo "$WEBUI_IMAGE"; }; '
+            'docker() { return 0; }; compose() { echo "COMPOSE $1"; return 0; }; '
             'run_webui_guard() { echo GUARD; return 1; }'
         )
         r = run_real(setup, 'cmd_update')
         out = r.stdout + r.stderr
         self.assertIn("GUARD", out)
-        self.assertIn("rc=1", out)
-        self.assertNotIn("update complete and verified", out)
+        self.assertIn("Not updating", out)
+        self.assertNotIn("COMPOSE", out, "nothing may change after a trip")
 
     def test_nothing_to_do_still_runs_it(self):
         setup = (
@@ -3536,10 +3622,12 @@ class TheDefaultAdminCheckRunsEveryTime(unittest.TestCase):
             '*rev-parse*) echo SAME;; esac; return 0; }; '
             'run_webui_guard() { echo GUARD; return 1; }'
         )
+        # die exits, so no rc= line follows.
         r = run_real(setup, 'cmd_update')
         out = r.stdout + r.stderr
         self.assertIn("GUARD", out)
-        self.assertIn("rc=1", out)
+        self.assertIn("Not updating", out)
+        self.assertNotIn("nothing to do", out)
 
     def test_the_real_guard_is_called_with_the_run_settings(self):
         with tempfile.TemporaryDirectory() as d:

@@ -182,10 +182,15 @@ newest_snapshots_first() {
 }
 
 prune_snapshots() {
-  # Keep the newest $2 snapshots in $1 and delete the rest.
-  local keep="${2:-$SNAP_KEEP}" n=0 f
+  # Keep the newest $2 snapshots in $1 and delete the rest — except the one
+  # taken under the image the rollback point names. Runs that cannot prove
+  # themselves keep an older rollback point, so that snapshot can be older
+  # than the newest few, and it is the only one a rollback can use.
+  local keep="${2:-$SNAP_KEEP}" n=0 f protect
+  protect="$(snapshot_for_image "$(sed -n 's/^webui=//p' "$STATE" 2>/dev/null | head -1)")"
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
+    [[ -n "$protect" && "$f" == "$protect" ]] && continue
     n=$((n + 1))
     (( n > keep )) && rm -f -- "$f"
   done < <(newest_snapshots_first "${1:-}")
@@ -794,7 +799,7 @@ restore_webui_data() {
   compose stop open-webui || { warn "could not stop open-webui"; return 1; }
   docker run --rm --volumes-from "$cid" -v "$(dirname "$snap"):/snap:ro" \
     --entrypoint sh "$img" -c \
-    'find /app/backend/data -mindepth 1 -delete && tar -xzf "/snap/$1" -C /app/backend/data' \
+    'tar -tzf "/snap/$1" >/dev/null && find /app/backend/data -mindepth 1 -delete && tar -xzf "/snap/$1" -C /app/backend/data' \
     sh "$(basename "$snap")"
 }
 
@@ -1244,9 +1249,24 @@ this run introduced, because the recorded point predates it"
     if restore_webui_data "$snap" "$webui"; then
       changed=1
     else
-      warn "could not restore the open-webui data from $snap — the older image
-may not start on a database the newer one migrated"
-      restored=0
+      # Do NOT go on to the recreate below: it would start the older image
+      # on data that is half restored, or still migrated by the newer one.
+      # The UI container is left stopped and is not recreated, so it still
+      # names the newer image, and the next --rollback tries the restore
+      # again.
+      warn "could not restore the open-webui data from $snap. The chat UI is
+LEFT STOPPED. Run ./update.sh --rollback again to retry, or restore the
+snapshot by hand (see docs/updating.md)."
+      if [[ "$pin" == "pin" && -n "$bad" && "$bad" != "$sha" ]]; then
+        printf 'bad=%s\n' "$bad" >> "$STATE" \
+          || warn "could not pin the failed commit; it may be retried next week"
+      fi
+      if (( changed )); then
+        compose up -d --force-recreate llama \
+          || warn "compose failed to recreate llama during rollback"
+      fi
+      warn "the previous state was NOT fully restored — see the warnings above"
+      return 1
     fi
   elif [[ -z "$snap" && -n "$webui" && -n "$webui_ran" && "$webui_ran" != "$webui" ]]; then
     warn "a different open-webui image ran since the rollback point, and no data
@@ -1478,6 +1498,12 @@ this run as unable to judge the models, not as proof they are dead"
   fi
   if webui_ok "$PRECHECK_TIMEOUT"; then ui_before=1; fi
   UI_WAS_UP=$ui_before
+  # Before any model verdict can return or exit: a busy router or a rotated
+  # key must not let a UI that accepts admin@localhost / admin run on.
+  if (( ui_before )) && ! run_webui_guard; then
+    die "webui-guard.sh found the chat UI accepting the old no-login admin
+account and stopped it (see above). Not updating until that is fixed."
+  fi
 
   case "$models_verdict" in
     # The MODELS alone, deliberately. A rollback restores code and images, so
@@ -1565,8 +1591,6 @@ fix it."
       fi
       if (( verified )); then
         log "already up to date (code ${head_sha:0:12} contains ${target:0:12}, images current) — nothing to do"
-        run_webui_guard || { warn "nothing to update, but the chat UI check
-above failed — see webui-guard.sh"; return 1; }
         return 0
       fi
       if (( models_verdict == 2 )); then
@@ -1677,6 +1701,17 @@ touch the running stack"
   [[ "$WEBUI_IMAGE" != "$webui_ref_before" ]] \
     && log "this commit changes the open-webui image: $webui_ref_before -> $WEBUI_IMAGE"
 
+  # The image ID that runs now, read BEFORE the pull: a republished tag is
+  # moved by the pull, and reading it afterwards would see the new image on
+  # both sides and skip the data snapshot below. The running container is
+  # the best witness; the tag is the fallback when there is no container.
+  local id_before id_after webui_cid_now
+  webui_cid_now="$(webui_container)"
+  [[ -n "$webui_cid_now" ]] \
+    && id_before="$(docker inspect "$webui_cid_now" --format '{{.Image}}' 2>/dev/null)"
+  [[ -n "${id_before:-}" ]] \
+    || id_before="$(docker image inspect "$webui_ref_before" --format '{{.Id}}' 2>/dev/null)"
+
   log "pulling open-webui"
   local webui_before webui_after want_now
   webui_before="$(local_image_digest "$webui_ref_before")"
@@ -1698,8 +1733,6 @@ UI here and was rolled back"
   # that cannot be undone by swapping the image back. Save the data first.
   # Compared by image ID: the container runs the recorded ID, and compose will
   # run whatever $WEBUI_IMAGE names now (pulled on `up` if still missing).
-  local id_before id_after
-  id_before="$(docker image inspect "$webui_ref_before" --format '{{.Id}}' 2>/dev/null)"
   id_after="$(docker image inspect "$WEBUI_IMAGE" --format '{{.Id}}' 2>/dev/null)"
   if [[ -n "$id_before" && "$id_before" != "$id_after" ]]; then
     if ! snapshot_webui_data "$id_before"; then
@@ -1745,8 +1778,14 @@ separately"
     fi
   fi
 
+  # Again after the restart, before the model verdict can exit: the new
+  # image or a changed .env can expose the old admin account too.
+  local guard_ok=1
+  (( ui_still_down )) || run_webui_guard || guard_ok=0
+
   log "smoke testing every model"
   smoke; local verdict=$?
+  (( guard_ok )) || warn "webui-guard.sh stopped the chat UI after the update (see above)"
   if (( verdict == 2 )); then
     # We could not ask. Tearing down a stack we failed to interrogate would
     # turn our own broken credentials or network into a real outage.
@@ -1770,10 +1809,9 @@ separately; nothing here will fix it."
     return 1
   fi
 
-  # Last: a stack that serves can still expose the old no-login admin.
-  if ! run_webui_guard; then
-    warn "update applied and the models are verified, but the chat UI check
-failed — see the webui-guard.sh message above"
+  if (( ! guard_ok )); then
+    warn "update applied and the models are verified, but webui-guard.sh
+stopped the chat UI — see its message above"
     return 1
   fi
 
