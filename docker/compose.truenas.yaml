@@ -47,12 +47,15 @@ services:
       BONSAI_CACHE_RAM: "256"
       QCM_AGENT_CACHE_RAM: "256"
       LLAMA_ARG_CTX_CHECKPOINTS: "4"
+      # Optional allow-list of preset IDs; empty serves all four.
+      QCM_MODELS: "${QCM_MODELS:-}"
+    # /health needs no key (public in Prism 922be44). Do not add an
+    # Authorization header here: curl's argv, key included, shows in ps.
     healthcheck:
       test:
         - CMD-SHELL
         - >-
           curl --fail --silent --show-error
-          --header "Authorization: Bearer $$BONSAI_API_KEY"
           http://127.0.0.1:8080/health >/dev/null
       interval: 30s
       retries: 5

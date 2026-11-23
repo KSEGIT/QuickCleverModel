@@ -204,6 +204,49 @@ logged no allocation failures, even while the machine was already 12 GB into
 swap. It is not the default only because one-at-a-time leaves more headroom for
 everything else on the box — see [decisions.md](decisions.md).
 
+#### Fixed model set (`QCM_MODELS`)
+
+To serve only some presets, set `QCM_MODELS` in `.env` to a comma list of
+model IDs, for example `QCM_MODELS=bonsai-27b-ternary`. `start-server.sh`
+then drops every other section from `run/models.ini`. The router does not
+list those models and cannot load them, so a request for one gets an error
+and does not evict the main model under `--models-max 1`. Empty (the default)
+serves every preset whose weights exist. Spaces around an ID are fine. These
+stop the start with an error: an ID that is not in the preset, an ID whose
+`model` file is missing (Bonsai presets too), an empty comma item, and a space
+or line break inside an ID. The preset lookup accepts CRLF lines and
+`model=/path` without spaces.
+
+Keep the IDs your clients ask for, or their requests fail:
+
+| client | model ID it uses |
+|---|---|
+| `setup-opencode.sh` | `bonsai-27b-ternary-text` (default model); without `BONSAI_CTX` it asks `/props` of `bonsai-27b-1bit` for the context, else uses 8192 |
+| `claude-bonsai.sh` | `bonsai-27b-ternary-text` (`BONSAI_CLAUDE_MODEL` changes it) |
+| `bench.sh` | `bonsai-27b-ternary` (`-m` changes it) |
+| Open WebUI, `setup-codex.sh`, `update.sh` | whatever `/v1/models` lists |
+
+So `QCM_MODELS=bonsai-27b-ternary` alone drops `bonsai-27b-ternary-text`, and
+opencode and Claude Code then fail. Add it to the list if you use them.
+
+The router also lists and loads models from the llama.cpp download cache. With
+`QCM_MODELS` set, `start-server.sh` points `LLAMA_CACHE` (the first cache
+location Prism `922be44` checks) at `run/empty-model-cache` and empties it on
+every start. This overrides any `LLAMA_CACHE` in `.env`.
+
+Two warnings, which do not stop the start:
+
+- no kept preset has `load-on-startup = true`: nothing loads until the first
+  request;
+- `DEFAULT_MODELS` (Open WebUI's pre-selected models, if it is in the
+  environment) names a model that `QCM_MODELS` drops. Ignore it if another
+  connection serves that model.
+
+Limit: a client with the API key can still call `POST /models` to download a
+Hugging Face model into the cache; no flag turns that route off at `922be44`.
+The router serves that model until the next start empties the cache. Keep the
+key away from users.
+
 ### Adding another model
 
 `models.ini.in` is the committed template; `start-server.sh` interpolates `@ROOT@`
@@ -301,16 +344,44 @@ Re-verified against the router:
 /models/load           no-key 401      (the load/unload control endpoint)
 ```
 
-The key is enforced once, at the router. Children bind `127.0.0.1` and are
-stripped of it (`unset_reserved_args`), so it is not duplicated per model —
-confirmed absent from the unauthenticated `/v1/models` response.
+The key never goes on a command line, where any local user could read it with
+`ps` or `/proc/<pid>/cmdline`. `start-server.sh` writes it to
+`run/api-key.<PID>` (mode 0400), starts the router with `--api-key-file`, and
+removes `BONSAI_API_KEY` from the environment before `exec`, so the router and
+its children do not inherit it. As with `--api-key`, a comma in
+`BONSAI_API_KEY` separates several keys; each goes on its own line. These stop
+the start: a key that starts with `#` (the file format skips `#` lines, so it
+would silently not count), an empty comma item, a line break, and a double
+quote (`--api-key` read quotes as CSV quoting; the file does not).
 
-Two endpoints are public by upstream design, not by regression:
-`/health` and `/v1/models` both return 200 without a key
-(`tools/server/tests/unit/test_security.py` asserts this). On a `0.0.0.0` bind
-that means anyone on your LAN can read the model list, **including each child's
-full command line and absolute weight paths**. No credentials leak, but if that
-bothers you, put the box behind a firewall rule rather than relying on the key.
+The key file must stay in place while the server runs: each child reads it
+when it starts. The `<PID>` is the script's own PID, which the server keeps
+after `exec`, so each server has its own file. Running `start-server.sh` again
+while a server runs writes a new file and never changes the keys that server
+uses. At start, the script removes `run/api-key.<PID>` files whose process is
+gone. Restart the server to change the key.
+
+Children bind `127.0.0.1`. At Prism `922be44` the router strips `--api-key`
+from the children it spawns, but not `--api-key-file` (upstream fixed this in
+`982a3329af`, #28938). So each child gets the file path, never the key, and
+checks the key too. Proxied requests keep their `Authorization` header, so
+clients see no change. Known effect: the router makes two calls of its own to
+a child without a key, and the child answers 401:
+
+- `POST /v1/streams/lookup` (stream resume lookup) returns no streams.
+- `DELETE /v1/stream` (stop a stream) still answers 204 to the client, but the
+  stop never reaches the child: **stop requests through the router do not work
+  at this SHA**. The launcher cannot fix this; the upstream fix above does.
+
+No QCM client uses these routes (the Prism web UI is not built).
+
+On Docker, `BONSAI_API_KEY` is still in the container config (`docker inspect`)
+because the entrypoint needs it. Members of the `docker` group can read it.
+
+Only `/health` and `/v1/health` are public at Prism `922be44`
+(`get_public_endpoints` in `tools/server/server-http.cpp`). Every other route,
+`/v1/models` included, needs the key: on a live router, `/v1/models` answers
+401 without it.
 
 On the Linux/NVIDIA path, **both ports are loopback-only by default**
 (`127.0.0.1:8080` / `:9090`) — the webui runs with `WEBUI_AUTH=false` by
