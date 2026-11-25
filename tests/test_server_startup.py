@@ -9,6 +9,11 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# A test key holds this marker, and the marker is in nothing else the launcher
+# prints or runs. If it shows up in stdout, stderr or argv, a key leaked.
+MARKER = "leakmarker-5b1d9e"
+TEST_KEY = f"fixture-{MARKER}"
+
 
 class ServerStartup(unittest.TestCase):
     def setUp(self):
@@ -24,13 +29,14 @@ class ServerStartup(unittest.TestCase):
         binary.write_text('#!/bin/sh\n'
                           'dir=$(dirname "$0")\n'
                           'printf "%s\\n" "$@" > "$dir/args"\n'
+                          'ps -o args= -p $$ > "$dir/argv"\n'
                           'env > "$dir/env"\n'
                           'exit 0\n')
         binary.chmod(0o755)
         self.bin_dir = binary.parent
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("BONSAI_", "QCM_"))}
-        self.env["BONSAI_API_KEY"] = "fixture-only"
+        self.env["BONSAI_API_KEY"] = TEST_KEY
 
     def run_launcher(self, **overrides):
         return subprocess.run(["bash", str(self.root / "start-server.sh")],
@@ -111,14 +117,16 @@ class ServerStartup(unittest.TestCase):
         result = self.run_launcher()
         self.assertEqual(result.returncode, 0, result.stderr)
         args = self.server_args()
-        self.assertNotIn("fixture-only", "\n".join(args))
+        self.assertNotIn(MARKER, "\n".join(args))
+        self.assertNotIn(MARKER, (self.bin_dir / "argv").read_text())
+        self.assertNotIn(MARKER, result.stdout + result.stderr)
         self.assertNotIn("--api-key", args)
         key_file = self.key_file()
         self.assertEqual(key_file.parent, self.root / "run")
         self.assertRegex(key_file.name, r"^api-key\.[0-9]+$")
-        self.assertEqual(key_file.read_text(), "fixture-only\n")
+        self.assertEqual(key_file.read_text(), TEST_KEY + "\n")
         self.assertEqual(key_file.stat().st_mode & 0o777, 0o400)
-        self.assertNotIn("fixture-only", (self.bin_dir / "env").read_text())
+        self.assertNotIn(MARKER, (self.bin_dir / "env").read_text())
         self.assertEqual(self.key_files(), [key_file.name])
 
     def test_second_run_leaves_a_live_server_key_file_alone(self):
@@ -155,27 +163,135 @@ class ServerStartup(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.key_file().read_text(), "fixture-one\nfixture-two\n")
         self.assertNotIn("fixture-two", "\n".join(self.server_args()))
+        self.assertNotIn("fixture-two", (self.bin_dir / "argv").read_text())
 
     def test_key_the_file_format_would_change_fails_before_start(self):
         # '#' lines are comments in --api-key-file: with no other key the
         # server would run with no auth. A line break would add a key. An
         # empty comma item is almost surely a typo. A double quote was CSV
         # quoting for --api-key, but is literal in the file.
-        for key in ("#fixture", "fixture,#second", "fixture\nsecond", "fixture\rx",
-                    ",fixture", "fixture,", "fixture,,second",
-                    '"fixture"', 'fix"ture', 'fixture,"second,third"'):
+        m = MARKER
+        for key in (f"#{m}", f"{m},#second", f"{m}\nsecond", f"{m}\rx",
+                    f",{m}", f"{m},", f"{m},,second",
+                    f'"{m}"', f'{m}"x', f'{m},"second,third"'):
             with self.subTest(key=key):
                 result = self.run_launcher(BONSAI_API_KEY=key)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("BONSAI_API_KEY", result.stderr)
-                self.assertNotIn("fixture", result.stderr)
+                self.assertNotIn(MARKER, result.stdout + result.stderr)
                 self.assertFalse((self.bin_dir / "args").exists())
                 self.assertEqual(self.key_files(), [])
 
     def test_double_quote_error_names_the_cause(self):
-        result = self.run_launcher(BONSAI_API_KEY='fix"ture')
+        result = self.run_launcher(BONSAI_API_KEY=f'{MARKER}"x')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("double quote", result.stderr)
+        self.assertNotIn(MARKER, result.stdout + result.stderr)
+
+    def test_xtrace_never_prints_the_key(self):
+        # `bash -x` and SHELLOPTS=xtrace trace every expansion, key included.
+        for how in ("flag", "shellopts"):
+            for key in (TEST_KEY, f"{MARKER}-one,{MARKER}-two", f'{MARKER}"x', f"#{MARKER}"):
+                with self.subTest(how=how, key=key):
+                    env = dict(self.env, BONSAI_API_KEY=key)
+                    cmd = ["bash", str(self.root / "start-server.sh")]
+                    if how == "flag":
+                        cmd.insert(1, "-x")
+                    else:
+                        env["SHELLOPTS"] = "xtrace"
+                    result = subprocess.run(cmd, env=env, text=True, capture_output=True)
+                    self.assertNotIn(MARKER, result.stdout + result.stderr)
+                    if key == TEST_KEY:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        # Tracing is back on after the key code.
+                        self.assertIn("+ exec ", result.stderr)
+
+    def test_xtrace_never_prints_a_key_that_comes_from_dot_env(self):
+        # The normal install keeps BONSAI_API_KEY in .env, which the script
+        # sources. Tracing must be off before that line.
+        (self.root / ".env").write_text(
+            f"BONSAI_API_KEY={TEST_KEY}\nOTHER_SECRET=other-{MARKER}\n")
+        self.env.pop("BONSAI_API_KEY")
+        for how in ("flag", "shellopts"):
+            with self.subTest(how=how):
+                env = dict(self.env)
+                cmd = ["bash", str(self.root / "start-server.sh")]
+                if how == "flag":
+                    cmd.insert(1, "-x")
+                else:
+                    env["SHELLOPTS"] = "xtrace"
+                result = subprocess.run(cmd, env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn(MARKER, result.stdout + result.stderr)
+                self.assertIn("+ exec ", result.stderr)
+                self.assertEqual(self.key_file().read_text(), TEST_KEY + "\n")
+
+    def test_model_allowlist_rejects_a_trailing_empty_model_line(self):
+        model = self.root / "models/alpha.gguf"
+        model.parent.mkdir(parents=True)
+        model.touch()
+        self.write_preset("[*]\njinja = true\n\n"
+                          "[alpha]\nmodel = @ROOT@/models/alpha.gguf\nmodel =\n")
+        result = self.run_launcher(QCM_MODELS="alpha")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no model line", result.stderr)
+
+    def test_stale_temp_files_and_the_legacy_key_file_are_removed(self):
+        run = self.root / "run"
+        run.mkdir()
+        old = run / ".api-key-tmp.OLDOLD"
+        old.write_text("fixture-old\n")
+        os.utime(old, (1, 1))
+        legacy = run / "api-key"
+        legacy.write_text("fixture-legacy\n")
+        legacy.chmod(0o400)
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(old.exists())
+        self.assertFalse(legacy.exists())
+        self.assertEqual(self.key_files(), [self.key_file().name])
+
+    def test_a_fresh_temp_file_may_belong_to_a_running_start(self):
+        run = self.root / "run"
+        run.mkdir()
+        fresh = run / ".api-key-tmp.FRESH1"
+        fresh.write_text("fixture-fresh\n")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(fresh.exists())
+
+    def test_cleanup_never_follows_or_removes_symlinks(self):
+        run = self.root / "run"
+        run.mkdir()
+        target = self.root / "precious"
+        target.write_text("keep me\n")
+        old_tmp = run / ".api-key-tmp.LINK01"
+        old_tmp.symlink_to(target)
+        os.utime(old_tmp, (1, 1), follow_symlinks=False)
+        legacy = run / "api-key"
+        legacy.symlink_to(target)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        stale_link = run / f"api-key.{dead.pid}"
+        stale_link.symlink_to(target)
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_text(), "keep me\n")
+        for link in (old_tmp, legacy, stale_link):
+            self.assertTrue(link.is_symlink(), link)
+
+    def test_a_pid_that_exists_for_another_user_keeps_its_key_file(self):
+        # PID 1 always exists. For a normal user, `kill -0 1` fails with
+        # "Operation not permitted" (EPERM), not "No such process". As root it
+        # succeeds. Either way the file must stay.
+        run = self.root / "run"
+        run.mkdir()
+        other = run / "api-key.1"
+        other.write_text("fixture-other-user\n")
+        other.chmod(0o400)
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(other.read_text(), "fixture-other-user\n")
 
     BONSAI_WEIGHTS = {
         "bonsai-27b-ternary": "Ternary-Bonsai-27B-gguf/Ternary-Bonsai-27B-PQ2_0.gguf",
@@ -252,6 +368,55 @@ class ServerStartup(unittest.TestCase):
         result = self.run_launcher(QCM_MODELS="beta")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("beta.gguf", result.stderr)
+
+    def preset_text(self):
+        return (self.root / "run/models.ini").read_text()
+
+    def test_model_allowlist_reads_a_section_name_followed_by_a_comment(self):
+        for name in ("alpha", "beta"):
+            model = self.root / f"models/{name}.gguf"
+            model.parent.mkdir(parents=True, exist_ok=True)
+            model.touch()
+        self.write_preset("[*]\njinja = true\n\n"
+                          "[alpha] ;a comment\nmodel = @ROOT@/models/alpha.gguf\n\n"
+                          "[beta]   # another\nmodel = @ROOT@/models/beta.gguf\n")
+        result = self.run_launcher(QCM_MODELS="alpha")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = self.preset_text()
+        self.assertIn("alpha.gguf", text)
+        self.assertNotIn("beta", text)
+
+    def test_model_allowlist_with_a_duplicate_section_keeps_or_drops_both(self):
+        for name in ("alpha", "beta"):
+            model = self.root / f"models/{name}.gguf"
+            model.parent.mkdir(parents=True, exist_ok=True)
+            model.touch()
+        self.write_preset("[*]\njinja = true\n\n"
+                          "[alpha]\nmodel = @ROOT@/models/alpha.gguf\n\n"
+                          "[beta]\nmodel = @ROOT@/models/beta.gguf\n\n"
+                          "[alpha]\nc = 4096\n\n"
+                          "[beta]\nc = 1024\n")
+        result = self.run_launcher(QCM_MODELS="alpha")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = self.preset_text()
+        self.assertEqual(text.count("[alpha]"), 2)
+        self.assertIn("c = 4096", text)
+        self.assertNotIn("beta", text)
+        self.assertNotIn("c = 1024", text)
+
+    def test_model_allowlist_with_a_duplicate_section_checks_every_model_line(self):
+        # The second [alpha] names weights that do not exist. If the check
+        # looked only at the first section, the router could start with a
+        # preset whose model is missing.
+        model = self.root / "models/alpha.gguf"
+        model.parent.mkdir(parents=True)
+        model.touch()
+        self.write_preset("[*]\njinja = true\n\n"
+                          "[alpha]\nmodel = @ROOT@/models/alpha.gguf\n\n"
+                          "[alpha]\nmodel = @ROOT@/models/missing.gguf\n")
+        result = self.run_launcher(QCM_MODELS="alpha")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing.gguf", result.stderr)
 
     def test_model_allowlist_rejects_bonsai_without_weights(self):
         # The weight filter never drops Bonsai sections; the allow-list check

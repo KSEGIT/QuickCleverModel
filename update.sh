@@ -1145,7 +1145,20 @@ undo_handover_merge() {
   local old="${1:-}" target="${2:-}"
   [[ -n "$old" ]] || { warn "no old commit in the handoff; cannot undo the merge"; return 1; }
   if ! stash_local_edits; then
-    warn "leaving the checkout on ${target:0:12} to preserve uncommitted work"
+    # The checkout keeps the merged code, and nothing is built from it. A
+    # later update.sh run would see the code as current and say "already up
+    # to date", so the operator must act.
+    local q_root q_old
+    q_root="$(printf '%q' "$ROOT")"; q_old="$(printf '%q' "$old")"
+    warn "the update did NOT finish, and the merge was NOT undone:
+the checkout is on ${target:0:12} (the new code, not rebuilt),
+and it holds uncommitted changes that could not be stashed.
+To go back to ${old:0:12}, run these two commands. The first saves your
+changes in a stash ('git stash pop' brings them back); the second moves the
+checkout back:
+  git -C $q_root -c user.name=qcm -c user.email=qcm@localhost stash push -u -m 'before undoing the update'
+  git -C $q_root reset --hard $q_old
+Then run update.sh again."
     return 1
   fi
   git -C "$ROOT" reset --hard "$old" >/dev/null 2>&1 \

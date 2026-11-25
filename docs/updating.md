@@ -108,6 +108,13 @@ When the merged commit changes `update.sh`, the run hands over to the new
 and, if needed, rolls back. So a fix to the updater works in the same run that
 brings it, not a week later. The lock stays held across the handover.
 
+If the new `update.sh` cannot start, it undoes the merge. It first stashes
+uncommitted changes. If that stash fails (for example, no git identity), the
+merge stays in place and nothing is built. `update.sh` then prints the commit
+the checkout is on and the commands to run, and exits 1. Stash or commit your
+changes, run `git reset --hard <old commit>` as printed, then run `update.sh`
+again.
+
 This needs the RUNNING `update.sh` to know how to hand over. The first update
 that brings the handover is still run by the old `update.sh` to the end, and
 that one takes no data snapshot before the new Open WebUI image starts. Before

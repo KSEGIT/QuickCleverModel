@@ -361,6 +361,25 @@ while a server runs writes a new file and never changes the keys that server
 uses. At start, the script removes `run/api-key.<PID>` files whose process is
 gone. Restart the server to change the key.
 
+Do not share `run/` between containers, or between a container and the host.
+The script asks "is this PID alive?" in its own PID namespace. In another
+namespace the same number is a different process, or none. A live server's key
+file would then look gone and be removed, and its children could not read the
+key when they start. Use one `run/` per PID namespace.
+
+The script also removes, at start, `run/.api-key-tmp.*` files older than one
+minute (left by a start that died) and the old single file `run/api-key`. It
+removes only regular files that its user owns, and never follows or removes a
+symlink. The old file is removed without a check that a server still uses it.
+This matters only on a machine that ran the branch that wrote the single
+`run/api-key` file (commits `c9a98f4` to `418be4a`) and still has that server
+running: restart that server.
+
+`bash -x` and `SHELLOPTS=xtrace` do not print the key: the script turns
+tracing off before it sources `.env` (which holds the key, and may hold other
+secrets) and keeps it off until the key is out of the environment, then
+restores it.
+
 Children bind `127.0.0.1`. At Prism `922be44` the router strips `--api-key`
 from the children it spawns, but not `--api-key-file` (upstream fixed this in
 `982a3329af`, #28938). So each child gets the file path, never the key, and

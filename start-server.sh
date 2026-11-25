@@ -11,6 +11,19 @@
 # restart.
 set -euo pipefail
 
+# `bash -x` and SHELLOPTS=xtrace print every expansion, so a key would land in
+# the trace. Every block that handles a key value turns tracing off first
+# (xtrace_off) and puts it back after (xtrace_restore).
+xtrace_was_on=0
+xtrace_off() {
+  case $- in *x*) xtrace_was_on=1 ;; esac
+  set +x
+}
+xtrace_restore() {
+  if [[ "$xtrace_was_on" == 1 ]]; then set -x; fi
+  return 0
+}
+
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # Use the pinned Prism build. Historical prebuilts cannot read current PQ2_0.
@@ -43,6 +56,9 @@ fi
 
 # .env must be sourced BEFORE the defaults below — it is the one source of
 # truth, so BONSAI_CTX and friends in .env have to win over the defaults.
+# Tracing stays off from here until the key is out of the environment: .env
+# holds BONSAI_API_KEY and may hold other secrets, and xtrace would print them.
+xtrace_off
 [[ -f "$ROOT/.env" ]] && set -a && . "$ROOT/.env" && set +a
 
 validate_setting() {
@@ -234,22 +250,29 @@ if [[ -n "${QCM_MODELS:-}" ]]; then
     [[ -n "$name" ]] || models_error "a comma-separated item is empty"
     [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
       models_error "entry '$name' is not a preset ID; separate IDs with commas"
-    # Prints nothing if there is no [name] section, "found" if the section
-    # has no model line, else "found <model path>".
+    # Prints nothing if there is no [name] section. Else "found", then one
+    # line per model line in every [name] section (a name may appear twice;
+    # the section filter below keeps all of them, so all must be checked).
+    # Text after the closing ] (a comment) is ignored.
     info="$(awk -v want="$name" '
       { sub(/\r$/, "") }
       /^\[/ { inside = substr($0, 2, index($0, "]") - 2) == want
               if (inside) found = 1
               next }
-      inside && model == "" && /^[ \t]*model[ \t]*=/ {
-        sub(/^[ \t]*model[ \t]*=[ \t]*/, ""); sub(/[ \t]+$/, ""); model = $0 }
-      END { if (found) print "found" (model == "" ? "" : " " model) }
+      inside && /^[ \t]*model[ \t]*=/ {
+        sub(/^[ \t]*model[ \t]*=[ \t]*/, ""); sub(/[ \t]+$/, ""); models[++n] = ($0 == "" ? "<empty>" : $0) }
+      END { if (found) { print "found"; for (i = 1; i <= n; i++) print models[i] } }
     ' "$PRESET")"
     [[ -n "$info" ]] || models_error "$name is not in the preset"
-    model="${info#found}"
-    model="${model# }"
-    [[ -n "$model" && -f "$model" ]] ||
-      models_error "$name names weights that are missing: ${model:-no model line}"
+    # An empty `model =` value is printed as <empty>, because command
+    # substitution would drop a trailing empty line.
+    if [[ "$info" == found ]]; then model_lines=""; else model_lines="${info#found?}"; fi
+    [[ -n "$model_lines" ]] ||
+      models_error "$name names weights that are missing: no model line"
+    while IFS= read -r model; do
+      [[ "$model" != "<empty>" && -f "$model" ]] ||
+        models_error "$name names weights that are missing: ${model/<empty>/no model line}"
+    done <<< "$model_lines"
     allowed_models+=("$name")
   done
   [[ ${#allowed_models[@]} -gt 0 ]] || models_error "it lists no model"
@@ -313,14 +336,36 @@ fi
 # the keys a running server's children read. Files of servers that are gone
 # are removed. Only "No such process" counts as gone: a PID owned by another
 # user answers "Operation not permitted" and its file stays.
+#
+# run/ MUST NOT be shared between containers, or between a container and the
+# host. "Is that PID alive?" is asked in this script's own PID namespace. In
+# another namespace the same number is another process (or none), so a live
+# server's key file would look gone and be removed, and its children could no
+# longer read the key when they start. One run/ per PID namespace.
+#
+# Also removed at start, and only if this script owns them (a regular file
+# owned by this user; a symlink is never followed or removed):
+#  - run/.api-key-tmp.*  left by a start that died between mktemp and mv. Only
+#    those older than a minute: a younger one may belong to a start that is
+#    running right now.
+#  - run/api-key  the single key file of the older launcher.
+remove_own_file() {
+  if [[ -f "$1" && ! -L "$1" && -O "$1" ]]; then rm -f -- "$1"; fi
+  return 0
+}
+xtrace_off
 for old_key_file in "$ROOT"/run/api-key.*; do
   old_pid="${old_key_file##*/api-key.}"
   [[ "$old_pid" =~ ^[0-9]+$ && "$old_pid" != "$$" ]] || continue
   if [[ "$(LC_ALL=C kill -0 "$old_pid" 2>&1)" == *"No such process"* ]]; then
-    rm -f -- "$old_key_file"
+    remove_own_file "$old_key_file"
   fi
 done
 unset old_key_file old_pid
+remove_own_file "$ROOT/run/api-key"
+find "$ROOT/run" -maxdepth 1 -type f -name '.api-key-tmp.*' -user "$(id -u)" \
+     -mmin +1 -exec rm -f -- {} + ||
+  echo "WARNING: could not remove old temporary key files in $ROOT/run" >&2
 KEY_FILE="$ROOT/run/api-key.$$"
 key_tmp="$(umask 077 && mktemp "$ROOT/run/.api-key-tmp.XXXXXX")" || {
   echo "cannot create a temporary key file in $ROOT/run" >&2
@@ -333,6 +378,7 @@ if ! printf '%s\n' "${api_keys[@]}" > "$key_tmp" \
   exit 1
 fi
 unset BONSAI_API_KEY BONSAI_SERVER_KEY api_keys
+xtrace_restore
 
 echo "server : $SERVER (router)"
 echo "preset : $PRESET"
