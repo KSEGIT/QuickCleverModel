@@ -370,10 +370,15 @@ key when they start. Use one `run/` per PID namespace.
 The script also removes, at start, `run/.api-key-tmp.*` files older than one
 minute (left by a start that died) and the old single file `run/api-key`. It
 removes only regular files that its user owns, and never follows or removes a
-symlink.
+symlink. The old file is removed without a check that a server still uses it.
+This matters only on a machine that ran the branch that wrote the single
+`run/api-key` file (commits `c9a98f4` to `418be4a`) and still has that server
+running: restart that server.
 
 `bash -x` and `SHELLOPTS=xtrace` do not print the key: the script turns
-tracing off while it handles key values, then restores it.
+tracing off before it sources `.env` (which holds the key, and may hold other
+secrets) and keeps it off until the key is out of the environment, then
+restores it.
 
 Children bind `127.0.0.1`. At Prism `922be44` the router strips `--api-key`
 from the children it spawns, but not `--api-key-file` (upstream fixed this in

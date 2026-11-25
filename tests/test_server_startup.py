@@ -206,6 +206,36 @@ class ServerStartup(unittest.TestCase):
                         # Tracing is back on after the key code.
                         self.assertIn("+ exec ", result.stderr)
 
+    def test_xtrace_never_prints_a_key_that_comes_from_dot_env(self):
+        # The normal install keeps BONSAI_API_KEY in .env, which the script
+        # sources. Tracing must be off before that line.
+        (self.root / ".env").write_text(
+            f"BONSAI_API_KEY={TEST_KEY}\nOTHER_SECRET=other-{MARKER}\n")
+        self.env.pop("BONSAI_API_KEY")
+        for how in ("flag", "shellopts"):
+            with self.subTest(how=how):
+                env = dict(self.env)
+                cmd = ["bash", str(self.root / "start-server.sh")]
+                if how == "flag":
+                    cmd.insert(1, "-x")
+                else:
+                    env["SHELLOPTS"] = "xtrace"
+                result = subprocess.run(cmd, env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn(MARKER, result.stdout + result.stderr)
+                self.assertIn("+ exec ", result.stderr)
+                self.assertEqual(self.key_file().read_text(), TEST_KEY + "\n")
+
+    def test_model_allowlist_rejects_a_trailing_empty_model_line(self):
+        model = self.root / "models/alpha.gguf"
+        model.parent.mkdir(parents=True)
+        model.touch()
+        self.write_preset("[*]\njinja = true\n\n"
+                          "[alpha]\nmodel = @ROOT@/models/alpha.gguf\nmodel =\n")
+        result = self.run_launcher(QCM_MODELS="alpha")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no model line", result.stderr)
+
     def test_stale_temp_files_and_the_legacy_key_file_are_removed(self):
         run = self.root / "run"
         run.mkdir()

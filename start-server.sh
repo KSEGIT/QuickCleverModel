@@ -16,7 +16,7 @@ set -euo pipefail
 # (xtrace_off) and puts it back after (xtrace_restore).
 xtrace_was_on=0
 xtrace_off() {
-  case $- in *x*) xtrace_was_on=1 ;; *) xtrace_was_on=0 ;; esac
+  case $- in *x*) xtrace_was_on=1 ;; esac
   set +x
 }
 xtrace_restore() {
@@ -56,6 +56,9 @@ fi
 
 # .env must be sourced BEFORE the defaults below — it is the one source of
 # truth, so BONSAI_CTX and friends in .env have to win over the defaults.
+# Tracing stays off from here until the key is out of the environment: .env
+# holds BONSAI_API_KEY and may hold other secrets, and xtrace would print them.
+xtrace_off
 [[ -f "$ROOT/.env" ]] && set -a && . "$ROOT/.env" && set +a
 
 validate_setting() {
@@ -123,7 +126,6 @@ CTX_TEXT="${BONSAI_CTX_TEXT:-$CTX}"
 # else on the box, not because two do not fit.
 MODELS_MAX="${BONSAI_MODELS_MAX:-1}"
 
-xtrace_off
 : "${BONSAI_API_KEY:?BONSAI_API_KEY not set — create .env with: BONSAI_API_KEY=bonsai-\$(openssl rand -hex 20)}"
 # The keys reach llama-server through --api-key-file (below), which reads one
 # key per line and skips lines that start with '#'. BONSAI_API_KEY keeps the
@@ -143,7 +145,6 @@ for api_key in "${api_keys[@]}"; do
   [[ "$api_key" != '#'* ]] || key_error "a key must not start with '#'"
 done
 unset api_key
-xtrace_restore
 
 # Render the preset. Paths must be absolute: the children are spawned by the
 # router and inheriting CWD is fragile.
@@ -259,17 +260,18 @@ if [[ -n "${QCM_MODELS:-}" ]]; then
               if (inside) found = 1
               next }
       inside && /^[ \t]*model[ \t]*=/ {
-        sub(/^[ \t]*model[ \t]*=[ \t]*/, ""); sub(/[ \t]+$/, ""); models[++n] = $0 }
+        sub(/^[ \t]*model[ \t]*=[ \t]*/, ""); sub(/[ \t]+$/, ""); models[++n] = ($0 == "" ? "<empty>" : $0) }
       END { if (found) { print "found"; for (i = 1; i <= n; i++) print models[i] } }
     ' "$PRESET")"
     [[ -n "$info" ]] || models_error "$name is not in the preset"
-    model_lines="${info#found}"
-    model_lines="${model_lines#$'\n'}"
+    # An empty `model =` value is printed as <empty>, because command
+    # substitution would drop a trailing empty line.
+    if [[ "$info" == found ]]; then model_lines=""; else model_lines="${info#found?}"; fi
     [[ -n "$model_lines" ]] ||
       models_error "$name names weights that are missing: no model line"
     while IFS= read -r model; do
-      [[ -n "$model" && -f "$model" ]] ||
-        models_error "$name names weights that are missing: ${model:-no model line}"
+      [[ "$model" != "<empty>" && -f "$model" ]] ||
+        models_error "$name names weights that are missing: ${model/<empty>/no model line}"
     done <<< "$model_lines"
     allowed_models+=("$name")
   done
