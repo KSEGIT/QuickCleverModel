@@ -4116,6 +4116,23 @@ class AFailedHandoverNeverStrandsTheMerge(unittest.TestCase):
         self.assertIn("reset --hard OLD", body)
         self.assertNotIn("APPLY", body)
 
+    def test_a_failed_stash_says_where_the_checkout_is_and_what_to_run(self):
+        # The stash can fail (no git identity). The merged code then stays in
+        # place; the operator must be told the state and the exact commands.
+        r, body = self._resume('QCM_RESUME_V=9; preflight() { :; }; '
+                               'stash_local_edits() { return 1; }; ROOT=/srv/qcm; '
+                               'QCM_RESUME_OLD=oldoldoldold1234; '
+                               'QCM_RESUME_TARGET=newnewnewnew5678')
+        self.assertNotIn("rc=0", r.stdout, "it must still exit non-zero")
+        self.assertNotIn("reset --hard", body, "nothing may be rewound")
+        err = r.stderr
+        self.assertIn("newnewnewnew", err)          # where the checkout is now
+        self.assertIn("not rebuilt", err)           # what state that is
+        self.assertIn("uncommitted", err)
+        self.assertIn("git -C /srv/qcm stash push -u", err)
+        self.assertIn("git -C /srv/qcm reset --hard oldoldoldold1234", err)
+        self.assertIn("update.sh", err)             # then run it again
+
     def test_a_good_handoff_does_not_undo(self):
         r, body = self._resume('QCM_RESUME_V=1; preflight() { :; }')
         self.assertIn("APPLY", body)
